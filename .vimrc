@@ -5,7 +5,6 @@ set relativenumber
 set ruler
 set term=xterm-256color
 set expandtab           " enter spaces when tab is pressed
-"set textwidth=120       " break lines when line length increases
 set tabstop=2           " use 4 spaces to represent tab
 set softtabstop=2
 set shiftwidth=2        " number of spaces to use for auto indent
@@ -24,6 +23,8 @@ Plug 'neoclide/coc.nvim', {'branch': 'release'}
 "fzf install
 Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
 Plug 'junegunn/fzf.vim'
+"Airline install
+Plug 'vim-airline/vim-airline'
 call plug#end()
 
 "Coc configuration
@@ -121,29 +122,5 @@ inoremap {<CR> {<CR>}<Esc>ko<tab>
 inoremap [<CR> [<CR>]<Esc>ko<tab>
 inoremap (<CR> (<CR>)<Esc>ko<tab>
 
-"Code folding
-"setlocal foldmethod=syntax
-
-"Statusline configuration
-set laststatus=2
-set statusline=
-set statusline+=%{FugitiveStatusline()}
-set statusline+=%= 
-set statusline+=%f 
-set statusline+=\ %{&fileencoding?&fileencoding:&encoding}
-set statusline+=\[%{&fileformat}\]
-set statusline+=\ %p%%
-set statusline+=\ %l:%c
-"set statusline+=%#PmenuSel#
-"set statusline=%{FugitiveStatusline()}
-"set statusline+=%#LineNr#
-"set statusline+=\ %f
-"set statusline+=%m\
-"set statusline+=%=
-"set statusline+=%#CursorColumn#
-"set statusline+=\ %y
-"set statusline+=\ %{&fileencoding?&fileencoding:&encoding}
-"set statusline+=\[%{&fileformat}\]
-"set statusline+=\ %p%%
-"set statusline+=\ %l:%c
-"set statusline+=\
+"Airline overrides
+let g:airline#extensions#tabline#enabled = 1
