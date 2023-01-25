@@ -19,6 +19,8 @@ set mouse=a
 "Coc install
 call plug#begin()
 Plug 'neoclide/coc.nvim', {'branch': 'release'}
+"Ledger plugin
+Plug 'ledger/vim-ledger'
 
 "fzf install
 Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
