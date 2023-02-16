@@ -19,8 +19,6 @@ set mouse=a
 "Coc install
 call plug#begin()
 Plug 'neoclide/coc.nvim', {'branch': 'release'}
-"Ledger plugin
-Plug 'ledger/vim-ledger'
 
 "fzf install
 Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
@@ -28,6 +26,12 @@ Plug 'junegunn/fzf.vim'
 "Airline install
 Plug 'vim-airline/vim-airline'
 call plug#end()
+"ledger install
+Plug 'ledger/vim-ledger'
+"EasyMotion install
+Plug 'easymotion/vim-easymotion'
+"Install for CoPilot
+Plug 'github/copilot.vim'
 
 "Coc configuration
 set encoding=utf-8
