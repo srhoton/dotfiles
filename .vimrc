@@ -15,6 +15,8 @@ set expandtab
 set backspace=indent,eol,start
 set showcmd
 set mouse=a
+set splitright
+set clipboard=unnamed
 
 "Coc install
 call plug#begin()
@@ -25,13 +27,15 @@ Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
 Plug 'junegunn/fzf.vim'
 "Airline install
 Plug 'vim-airline/vim-airline'
-call plug#end()
 "ledger install
 Plug 'ledger/vim-ledger'
 "EasyMotion install
 Plug 'easymotion/vim-easymotion'
 "Install for CoPilot
 Plug 'github/copilot.vim'
+"Install Ghost Text support
+"Plug 'raghur/vim-ghost', {'do': ':GhostInstall'}
+call plug#end()
 
 "Coc configuration
 set encoding=utf-8
