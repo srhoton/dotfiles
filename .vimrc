@@ -4,6 +4,8 @@ set number
 set relativenumber
 set ruler
 set term=xterm-256color
+set t_Co=256
+set cursorline
 set expandtab           " enter spaces when tab is pressed
 set tabstop=2           " use 4 spaces to represent tab
 set softtabstop=2
@@ -35,6 +37,12 @@ Plug 'easymotion/vim-easymotion'
 Plug 'github/copilot.vim'
 "Install Ghost Text support
 "Plug 'raghur/vim-ghost', {'do': ':GhostInstall'}
+"gruvbox install
+"Plug 'morhetz/gruvbox'
+"Onehalf install
+Plug 'sonph/onehalf', { 'rtp': 'vim' }
+"Terraform syntax support
+Plug 'hashivim/vim-terraform'
 call plug#end()
 
 "Coc configuration
@@ -134,3 +142,8 @@ inoremap (<CR> (<CR>)<Esc>ko<tab>
 
 "Airline overrides
 let g:airline#extensions#tabline#enabled = 1
+"gruvbox configuration
+"autocmd vimenter * ++nested colorscheme gruvbox
+"onehalf configuration
+colorscheme onehalflight
+let g:airline_theme='onehalfdark'
