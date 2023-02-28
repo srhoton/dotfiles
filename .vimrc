@@ -147,3 +147,9 @@ let g:airline#extensions#tabline#enabled = 1
 "onehalf configuration
 colorscheme onehalflight
 let g:airline_theme='onehalfdark'
+"CoPilot configuration
+let g:copilot_filetypes = {
+    \ 'gitcommit': v:true,
+    \ 'markdown': v:true,
+    \ 'yaml': v:true
+    \ }
