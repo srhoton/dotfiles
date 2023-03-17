@@ -34,7 +34,7 @@ Plug 'ledger/vim-ledger'
 "EasyMotion install
 Plug 'easymotion/vim-easymotion'
 "Install for CoPilot
-Plug 'github/copilot.vim'
+"Plug 'github/copilot.vim'
 "Install Ghost Text support
 "Plug 'raghur/vim-ghost', {'do': ':GhostInstall'}
 "gruvbox install
@@ -136,9 +136,11 @@ nnoremap <silent><nowait> <space>p  :<C-u>CocListResume<CR>
 
 
 " Automatically closing braces
-inoremap {<CR> {<CR>}<Esc>ko<tab>
-inoremap [<CR> [<CR>]<Esc>ko<tab>
-inoremap (<CR> (<CR>)<Esc>ko<tab>
+"inoremap {<CR> {<CR>}<Esc>ko<tab>
+"inoremap [<CR> [<CR>]<Esc>ko<tab>
+"inoremap (<CR> (<CR>)<Esc>ko<tab>
+let g:coc_global_extensions = ['coc-solargraph', 'coc-tabnine', 'coc-python', 'coc-json']
+
 
 "Airline overrides
 let g:airline#extensions#tabline#enabled = 1
