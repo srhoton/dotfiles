@@ -34,7 +34,7 @@ Plug 'ledger/vim-ledger'
 "EasyMotion install
 Plug 'easymotion/vim-easymotion'
 "Install for CoPilot
-"Plug 'github/copilot.vim'
+Plug 'github/copilot.vim'
 "Install Ghost Text support
 "Plug 'raghur/vim-ghost', {'do': ':GhostInstall'}
 "gruvbox install
@@ -43,6 +43,8 @@ Plug 'easymotion/vim-easymotion'
 Plug 'sonph/onehalf', { 'rtp': 'vim' }
 "Terraform syntax support
 Plug 'hashivim/vim-terraform'
+"install for openai support
+Plug 'madox2/vim-ai', { 'do': './install.sh' }
 call plug#end()
 
 "Coc configuration
