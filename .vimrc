@@ -34,7 +34,7 @@ Plug 'ledger/vim-ledger'
 "EasyMotion install
 Plug 'easymotion/vim-easymotion'
 "Install for CoPilot
-Plug 'github/copilot.vim'
+"Plug 'github/copilot.vim'
 "Install Ghost Text support
 "Plug 'raghur/vim-ghost', {'do': ':GhostInstall'}
 "gruvbox install
@@ -43,8 +43,10 @@ Plug 'github/copilot.vim'
 Plug 'sonph/onehalf', { 'rtp': 'vim' }
 "Terraform syntax support
 Plug 'hashivim/vim-terraform'
-"install for openai support
-Plug 'madox2/vim-ai', { 'do': './install.sh' }
+"Plug for ollama support
+Plug 'gergap/vim-ollama'
+"Install for llama.cpp support
+"Plug 'ggml-org/llama.vim'
 call plug#end()
 
 "Coc configuration
@@ -157,3 +159,7 @@ let g:copilot_filetypes = {
     \ 'markdown': v:true,
     \ 'yaml': v:true
     \ }
+
+"Configuration for Ollama Plug
+let g:ollama_model = 'deepseek-coder-v2:16b-lite-base-q4_0'
+let g:ollama_chat_model = 'llama3'
