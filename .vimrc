@@ -161,5 +161,6 @@ let g:copilot_filetypes = {
     \ }
 
 "Configuration for Ollama Plug
-let g:ollama_model = 'deepseek-coder-v2:16b-lite-base-q4_0'
-let g:ollama_chat_model = 'llama3'
+let g:ollama_model = 'qwen2.5-coder:3b'
+let g:ollama_chat_model = 'qwen2.5:32b'
+let g:ollama_timeout = 60
