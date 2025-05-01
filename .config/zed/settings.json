@@ -25,19 +25,136 @@
     "light": "One Light",
     "dark": "One Dark"
   },
+  "format_on_save": "on",
+  "formatter": "language_server",
   "lsp": {
     "java": {
-      "java.jdt.ls.lombokSupport.enabled:": true,
-      "java.format.settings.url": "https://raw.githubusercontent.com/google/styleguide/gh-pages/eclipse-java-google-style.xml"
+      // Lombok support
+      "java.jdt.ls.lombokSupport.enabled": true,
+      
+      // Code style - Use Google Java Style Guide as specified in rules
+      "java.format.settings.url": "https://raw.githubusercontent.com/google/styleguide/gh-pages/eclipse-java-google-style.xml",
+      "java.format.settings.profile": "GoogleStyle",
+      
+      // Code organization - Support for Single Responsibility Principle
+      "java.cleanup.organize_imports": true,
+      "java.completion.importOrder": ["java", "javax", "org", "com", ""],
+      
+      // Documentation requirements
+      "java.signatureHelp.enabled": true,
+      "java.contentProvider.preferred": "fernflower",
+      
+      // Compiler settings
+      "java.compiler.showWarnings": true,
+      "java.compiler.nullAnalysis.mode": "automatic",
+      
+      // Testing
+      "java.test.editor.enableShortcuts": true,
+      "java.test.config": {
+        "workingDirectory": "${workspaceFolder}"
+      },
+      
+      // Code quality
+      "java.completion.maxResults": 50,
+      "java.codeGeneration.useBlocks": true,
+      "java.codeGeneration.generateComments": true,
+      "java.completion.guessMethodArguments": true,
+      "java.cleanup.actionsOnSave": [
+        "qualifyStaticMethods",
+        "removeUnusedImports", 
+        "addOverride"
+      ],
+      
+      // Security - Code analysis
+      "java.configuration.maven.userSettings": "${env:HOME}/.m2/settings.xml",
+      "java.maven.downloadSources": true
     },
     "terraform-ls": {
       "initialization_options": {
         "experimentalFeatures": {
-          "prefillRequiredFields": true
+          "prefillRequiredFields": true,
+          "validateOnSave": true
+        },
+        // Enforce formatting rules
+        "terraformFormatter": true,
+        "terraformFormatterConfig": {
+          "indentSize": 2,
+          "alignArguments": true,
+          "compactArrays": false
+        },
+        // Enforce validation rules
+        "rootModules": [],
+        "excludeModules": []
+      },
+      "terraform": {
+        // Validation and state rules
+        "validation": {
+          "enabled": true,
+          "runOnSave": true
+        },
+        "linting": {
+          "enable": true
+        },
+        // Security rules
+        "security_scan": {
+          "enable": true
         }
+      }
+    },
+    "gopls": {
+      "use_placeholders": true,
+      "complete_unimported": true,
+      "staticcheck": true,
+      "matcher": "fuzzy",
+      "analyses": {
+        "unusedparams": true,
+        "shadow": true,
+        "nilness": true,
+        "unusedwrite": true,
+        "useany": true
+      },
+      "codelenses": {
+        "generate": true,
+        "test": true,
+        "tidy": true,
+        "upgrade_dependency": true,
+        "vendor": true
+      },
+      "hints": {
+        "assignVariableTypes": true,
+        "compositeLiteralFields": true,
+        "compositeLiteralTypes": true,
+        "constantValues": true,
+        "functionTypeParameters": true,
+        "parameterNames": true,
+        "rangeVariableTypes": true
+      },
+      "formatting": {
+        "gofumpt": true
       }
     }
   },
+  // Enable linting support for all languages
+  "linter": "language_server",
   "preferred_line_length": 80,
-  "soft_wrap": "editor_width"
+  "soft_wrap": "editor_width",
+  
+  // Editor settings to support consistency
+  "tab_size": 2,
+  "ensure_final_newline_on_save": true,
+  "remove_trailing_whitespace_on_save": true,
+  
+  // Project-specific tools integration
+  "projects": {
+    "java": {
+      "default_build_task": "gradle build",
+      "build_task_provider": "gradle"
+    },
+    "terraform": {
+      "default_build_task": "terraform validate"
+    },
+    "go": {
+      "default_build_task": "go build"
+    }
+  }
 }
