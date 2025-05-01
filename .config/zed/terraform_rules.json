@@ -1,0 +1,171 @@
+{
+  "rules": [
+    {
+      "name": "naming_convention",
+      "description": "Follow consistent naming conventions",
+      "guidelines": [
+        "Use snake_case for resource names, variable names, and output names",
+        "Use descriptive names that indicate purpose and context",
+        "Prefix resources with their type (e.g., 'vpc_' for VPC resources)",
+        "For modules, name should reflect functionality provided (e.g., 'network', 'database')"
+      ]
+    },
+    {
+      "name": "code_organization",
+      "description": "Organize code logically and consistently",
+      "guidelines": [
+        "Group related resources together",
+        "Use separate files for variables, outputs, providers, and main resources",
+        "Use modules for reusable components",
+        "Keep root module simple, delegate complexity to child modules",
+        "Follow standard file structure: main.tf, variables.tf, outputs.tf, providers.tf, versions.tf"
+      ]
+    },
+    {
+      "name": "documentation",
+      "description": "Document code thoroughly",
+      "guidelines": [
+        "Include description for all variables, including type, default, and purpose",
+        "Document all outputs with descriptions",
+        "Include README.md for each module explaining purpose, usage, inputs, and outputs",
+        "Add comments for complex logic or non-obvious decisions"
+      ]
+    },
+    {
+      "name": "versioning",
+      "description": "Use explicit versioning for stability",
+      "guidelines": [
+        "Pin provider versions to specific releases",
+        "Use version constraints in the terraform block",
+        "Specify module versions when using remote modules",
+        "Use ~> for minor version updates, >= for minimum versions"
+      ]
+    },
+    {
+      "name": "formatting",
+      "description": "Maintain consistent formatting",
+      "guidelines": [
+        "Run terraform fmt before committing changes",
+        "Use 2-space indentation",
+        "Align equals signs for readability",
+        "Sort resource arguments alphabetically where possible",
+        "Use newlines to separate logical blocks of configuration"
+      ]
+    },
+    {
+      "name": "validation",
+      "description": "Implement validation for variables and resources",
+      "guidelines": [
+        "Use validation blocks for variables to enforce constraints",
+        "Apply clear type constraints to all variables",
+        "Use lifecycle blocks appropriately for resource management",
+        "Implement precondition and postcondition checks where applicable"
+      ]
+    },
+    {
+      "name": "security",
+      "description": "Follow security best practices",
+      "guidelines": [
+        "Never hardcode credentials or sensitive data",
+        "Use variables for sensitive values and mark them as sensitive",
+        "Implement least privilege principle for IAM roles and policies",
+        "Enable encryption for data at rest",
+        "Use security groups with minimal necessary access",
+        "Implement proper network segmentation"
+      ]
+    },
+    {
+      "name": "state_management",
+      "description": "Handle state properly",
+      "guidelines": [
+        "Use remote state with locking",
+        "Employ state workspaces for environment isolation",
+        "Separate state by component or service",
+        "Implement proper backend configuration with encrypted storage"
+      ]
+    },
+    {
+      "name": "resource_dependency",
+      "description": "Handle resource dependencies explicitly",
+      "guidelines": [
+        "Use depends_on where implicit dependencies aren't clear",
+        "Prefer data sources over hardcoded values for resource references",
+        "Use count or for_each instead of standalone duplicate resources",
+        "Consider creation/destruction order for dependent resources"
+      ]
+    },
+    {
+      "name": "testing",
+      "description": "Implement testing practices",
+      "guidelines": [
+        "Write terratest modules for testing infrastructure",
+        "Use terraform validate before applying changes",
+        "Implement plan verification in CI/CD pipelines",
+        "Use terraform-docs to generate documentation"
+      ]
+    },
+    {
+      "name": "linting",
+      "description": "Use linting tools",
+      "guidelines": [
+        "Run tflint to catch potential errors and best practice violations",
+        "Use checkov or tfsec for security scanning",
+        "Implement pre-commit hooks for automated formatting and validation",
+        "Configure and use .tflint.hcl for project-specific rules"
+      ]
+    },
+    {
+      "name": "tagging",
+      "description": "Implement consistent tagging strategy",
+      "guidelines": [
+        "Apply tags to all resources for cost tracking, ownership, and environment",
+        "Use a standardized tagging module or locals for consistency",
+        "Include mandatory tags: Environment, Owner, Project, ManagedBy",
+        "Consider automated tag enforcement with policy-as-code tools"
+      ]
+    },
+    {
+      "name": "conditional_logic",
+      "description": "Use conditional creation and configuration wisely",
+      "guidelines": [
+        "Prefer for_each over count for complex conditional creation",
+        "Use locals for computed values used in multiple places",
+        "Consider ternary operations for simple conditionals",
+        "Use dynamic blocks for repeated nested blocks with variations"
+      ]
+    }
+  ],
+  "examples": {
+    "good_naming": "resource \"aws_vpc\" \"main_vpc\" {\n  cidr_block = var.vpc_cidr\n}",
+    "good_variable_definition": "variable \"vpc_cidr\" {\n  description = \"CIDR block for the main VPC\"\n  type        = string\n  default     = \"10.0.0.0/16\"\n\n  validation {\n    condition     = can(cidrnetmask(var.vpc_cidr))\n    error_message = \"Must be a valid CIDR block.\"\n  }\n}",
+    "good_module_use": "module \"network\" {\n  source  = \"terraform-aws-modules/vpc/aws\"\n  version = \"3.14.0\"\n\n  name = \"${var.project}-${var.environment}\"\n  cidr = var.vpc_cidr\n\n  azs             = var.availability_zones\n  private_subnets = var.private_subnet_cidrs\n  public_subnets  = var.public_subnet_cidrs\n\n  tags = local.common_tags\n}"
+  },
+  "tools": {
+    "recommended": [
+      {
+        "name": "terraform fmt",
+        "description": "Built-in formatting tool to ensure consistent style"
+      },
+      {
+        "name": "tflint",
+        "description": "Linter for detecting errors and enforcing best practices"
+      },
+      {
+        "name": "terraform-docs",
+        "description": "Documentation generator for Terraform modules"
+      },
+      {
+        "name": "checkov",
+        "description": "Static code analysis for security and compliance best practices"
+      },
+      {
+        "name": "tfsec",
+        "description": "Security scanner for Terraform code"
+      },
+      {
+        "name": "infracost",
+        "description": "Cloud cost estimates for Terraform"
+      }
+    ]
+  }
+}
