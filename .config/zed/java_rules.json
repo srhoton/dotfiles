@@ -1,0 +1,199 @@
+{
+  "rules": [
+    {
+      "name": "build_system",
+      "description": "Use Gradle exclusively as the build system",
+      "guidelines": [
+        "Implement the Gradle Wrapper for consistent build environment",
+        "Use version catalogs for dependency management",
+        "Keep Gradle version updated to latest stable release"
+      ],
+      "example": "plugins {\n    id 'java'\n    id 'io.quarkus'\n    id 'com.diffplug.spotless' version '6.22.0'\n}"
+    },
+    {
+      "name": "framework",
+      "description": "Default to Quarkus as the primary framework",
+      "guidelines": [
+        "Leverage Quarkus extensions ecosystem for additional functionality",
+        "Use Quarkus native compilation for production deployments when possible",
+        "Follow Quarkus best practices for configuration and dependency injection"
+      ],
+      "example": "@Path(\"/items\")\n@Produces(MediaType.APPLICATION_JSON)\n@Consumes(MediaType.APPLICATION_JSON)\npublic class ItemResource {\n\n    @Inject\n    ItemService service;\n    \n    @GET\n    public List<Item> getAll() {\n        return service.findAll();\n    }\n}"
+    },
+    {
+      "name": "code_style_linting",
+      "description": "Use Spotless for linting and formatting",
+      "guidelines": [
+        "Configure with Google Java Style Guide rules",
+        "Enforce consistent code formatting across the project",
+        "Run Spotless checks as part of CI/CD pipeline"
+      ],
+      "example": "spotless {\n    java {\n        googleJavaFormat()\n        importOrder 'java', 'javax', 'org', 'com', ''\n        removeUnusedImports()\n        trimTrailingWhitespace()\n        endWithNewline()\n    }\n}"
+    },
+    {
+      "name": "naming_conventions",
+      "description": "Follow standard Java naming conventions",
+      "guidelines": [
+        "CamelCase for class names",
+        "camelCase for method and variable names",
+        "UPPER_SNAKE_CASE for constants",
+        "lowerCamelCase for package names",
+        "Use descriptive and meaningful names",
+        "Avoid abbreviations except for standard ones (e.g., HTTP, URL)"
+      ]
+    },
+    {
+      "name": "code_organization",
+      "description": "Organize code following best practices",
+      "guidelines": [
+        "Organize packages by feature, not by layer",
+        "Keep classes focused on single responsibility (SRP)",
+        "Limit class size to maximum 500 lines",
+        "Limit method size to maximum 50 lines",
+        "Use interfaces for defining contracts"
+      ]
+    },
+    {
+      "name": "documentation",
+      "description": "Document code thoroughly",
+      "guidelines": [
+        "Add Javadoc for all public classes and methods",
+        "Document non-obvious behavior and edge cases",
+        "Include meaningful examples in documentation when appropriate",
+        "Keep documentation updated when code changes"
+      ],
+      "example": "/**\n * Processes a payment transaction.\n * \n * @param paymentRequest The payment details\n * @return A transaction receipt with status information\n * @throws PaymentException If the payment processing fails\n */\npublic TransactionReceipt processPayment(PaymentRequest paymentRequest) throws PaymentException {\n    // Implementation\n}"
+    },
+    {
+      "name": "logging",
+      "description": "Implement proper logging practices",
+      "guidelines": [
+        "Use SLF4J as logging facade",
+        "Configure appropriate log levels (ERROR, WARN, INFO, DEBUG, TRACE)",
+        "Include contextual information in log messages",
+        "Use structured logging for machine-parseable logs",
+        "Don't log sensitive information"
+      ],
+      "example": "private static final Logger logger = LoggerFactory.getLogger(PaymentService.class);\n\npublic void processPayment(PaymentRequest request) {\n    logger.info(\"Processing payment for order={} with amount={}\", \n                request.getOrderId(), \n                request.getAmount());\n    \n    try {\n        // Process payment\n        logger.debug(\"Payment processed successfully\");\n    } catch (Exception e) {\n        logger.error(\"Payment processing failed for order={}\", request.getOrderId(), e);\n        throw e;\n    }\n}"
+    },
+    {
+      "name": "testing",
+      "description": "Comprehensive testing strategy",
+      "guidelines": [
+        "Write unit tests for all business logic",
+        "Use JUnit 5 for testing framework",
+        "Employ AssertJ for fluent assertions",
+        "Use Mockito for mocking dependencies",
+        "Aim for minimum 80% code coverage",
+        "Implement integration tests for external dependencies",
+        "Use test containers for database and service testing"
+      ],
+      "example": "@QuarkusTest\npublic class ItemResourceTest {\n\n    @InjectMock\n    ItemService itemService;\n\n    @Test\n    public void testGetAllItems() {\n        // Given\n        List<Item> expectedItems = Arrays.asList(new Item(1L, \"Test Item\"));\n        when(itemService.findAll()).thenReturn(expectedItems);\n        \n        // When/Then\n        given()\n          .when().get(\"/items\")\n          .then()\n             .statusCode(200)\n             .body(\"size()\", is(1))\n             .body(\"[0].name\", is(\"Test Item\"));\n    }\n}"
+    },
+    {
+      "name": "exception_handling",
+      "description": "Handle exceptions properly",
+      "guidelines": [
+        "Create custom exceptions for domain-specific errors",
+        "Use unchecked exceptions for unrecoverable errors",
+        "Implement global exception handlers for REST APIs",
+        "Avoid catching generic Exception class",
+        "Don't swallow exceptions without proper handling"
+      ],
+      "example": "@Provider\npublic class GlobalExceptionHandler implements ExceptionMapper<Exception> {\n\n    private static final Logger logger = LoggerFactory.getLogger(GlobalExceptionHandler.class);\n\n    @Override\n    public Response toResponse(Exception exception) {\n        if (exception instanceof EntityNotFoundException) {\n            return Response.status(Response.Status.NOT_FOUND)\n                    .entity(new ErrorResponse(\"Entity not found\", exception.getMessage()))\n                    .build();\n        }\n        \n        logger.error(\"Unhandled exception\", exception);\n        return Response.status(Response.Status.INTERNAL_SERVER_ERROR)\n                .entity(new ErrorResponse(\"Internal server error\", \"An unexpected error occurred\"))\n                .build();\n    }\n}"
+    },
+    {
+      "name": "security",
+      "description": "Implement security best practices",
+      "guidelines": [
+        "Follow OWASP Top 10 guidelines",
+        "Implement proper input validation",
+        "Use parameterized queries for database access",
+        "Never store sensitive data in plain text",
+        "Use secure hashing for passwords (Argon2, bcrypt)",
+        "Implement proper authentication and authorization",
+        "Use HTTPS for all communications",
+        "Implement request throttling and rate limiting",
+        "Regularly scan dependencies for vulnerabilities"
+      ],
+      "example": "// Input validation example\npublic void processUserInput(String userInput) {\n    if (userInput == null || !userInput.matches(\"[a-zA-Z0-9_]+\")) {\n        throw new IllegalArgumentException(\"Invalid input format\");\n    }\n    \n    // Process validated input\n}\n\n// Password hashing example\n@Inject\nPasswordEncoder passwordEncoder;\n\npublic void registerUser(UserRegistration registration) {\n    User user = new User();\n    user.setUsername(registration.getUsername());\n    user.setPasswordHash(passwordEncoder.encode(registration.getPassword()));\n    userRepository.save(user);\n}"
+    },
+    {
+      "name": "performance",
+      "description": "Optimize application performance",
+      "guidelines": [
+        "Optimize database queries",
+        "Use caching appropriately",
+        "Implement pagination for large data sets",
+        "Use asynchronous processing for long-running tasks",
+        "Profile and optimize critical paths"
+      ],
+      "example": "@Path(\"/items\")\npublic class ItemResource {\n\n    @Inject\n    ItemService service;\n    \n    @GET\n    public List<Item> getAll(@QueryParam(\"page\") @DefaultValue(\"0\") int page,\n                             @QueryParam(\"size\") @DefaultValue(\"20\") int size) {\n        return service.findAllPaginated(page, size);\n    }\n}"
+    },
+    {
+      "name": "concurrency",
+      "description": "Handle concurrency correctly",
+      "guidelines": [
+        "Use Java concurrency utilities instead of low-level threading",
+        "Leverage CompletableFuture for asynchronous operations",
+        "Be careful with shared mutable state",
+        "Use thread-safe collections when needed",
+        "Consider using reactive programming for high-concurrency scenarios"
+      ]
+    },
+    {
+      "name": "dependency_management",
+      "description": "Manage dependencies effectively",
+      "guidelines": [
+        "Keep dependencies updated",
+        "Use version catalogs in Gradle",
+        "Explicitly specify versions for better control",
+        "Regularly check for security vulnerabilities",
+        "Limit transitive dependencies"
+      ],
+      "example": "dependencies {\n    // Use version catalog\n    implementation(libs.quarkus.core)\n    implementation(libs.quarkus.resteasy.reactive)\n    \n    // Testing\n    testImplementation(libs.junit.jupiter)\n    testImplementation(libs.assertj.core)\n    testImplementation(libs.quarkus.test)\n}"
+    }
+  ],
+  "tools": [
+    {
+      "name": "Gradle",
+      "purpose": "Build automation"
+    },
+    {
+      "name": "Spotless",
+      "purpose": "Code formatting and linting"
+    },
+    {
+      "name": "SonarQube",
+      "purpose": "Code quality and security analysis"
+    },
+    {
+      "name": "JaCoCo",
+      "purpose": "Code coverage"
+    },
+    {
+      "name": "Quarkus Dev Mode",
+      "purpose": "Live code reloading"
+    },
+    {
+      "name": "OWASP Dependency Check",
+      "purpose": "Security vulnerability scanning"
+    },
+    {
+      "name": "JUnit 5",
+      "purpose": "Testing framework"
+    },
+    {
+      "name": "AssertJ",
+      "purpose": "Fluent assertions"
+    },
+    {
+      "name": "Mockito",
+      "purpose": "Mocking framework"
+    },
+    {
+      "name": "Testcontainers",
+      "purpose": "Integration testing with containers"
+    }
+  ]
+}
