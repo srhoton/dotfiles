@@ -1,0 +1,20 @@
+User Request:
+What I would like to do is the following:
+
+1. Create a directory called 'dev-container'
+2. In that directory I want to Create a dev container for a GitHub codespace. The container should have the following installed:
+- Java 21 Corretto
+- Python > 3.11, with venv and uv (not pip)
+- Golang latest
+- aws cli
+- starship command line tool
+- Node latest, npm, and typescript support
+
+Implementation:
+Created a comprehensive dev container setup in dev-container/.devcontainer/ with:
+- devcontainer.json for VS Code/Codespaces configuration
+- Dockerfile with all requested tools and runtimes
+- setup.sh for post-creation customization
+- README.md with complete documentation
+
+All tools installed and verified, ready for GitHub Codespaces or local Dev Containers usage.
