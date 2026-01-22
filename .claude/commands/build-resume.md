@@ -21,7 +21,7 @@ Read the plan document and resume execution from where it left off:
    - Retry components marked as "Failed" (reset retry count)
    - Continue with components marked as "Pending" or "In Progress"
 3. **If in Review phase**:
-   - Continue review loops for the current component
+   - Continue review loops for the current component (functional → quality → ADR)
    - If a component was mid-review, restart that component's review from functional review
 4. **If in Commit phase**:
    - Skip commits that have already been created
