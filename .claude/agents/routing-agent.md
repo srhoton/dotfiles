@@ -108,6 +108,8 @@ REPEAT (max 3 iterations):
 
 **Important**: Code quality and ADR compliance issues require re-running functional review after fixes, as changes may affect functional correctness.
 
+Once ALL components have passed all three review loops, immediately proceed to Phase 4. Do not ask the user for confirmation — you are authorized to commit and push.
+
 ### Phase 4: Commit and PR
 
 1. **Commit Each Component**
@@ -123,6 +125,75 @@ REPEAT (max 3 iterations):
 3. **Push and Create PR**
    - Push the branch to remote: `git push -u origin <branch-name>`
    - Create a pull request using GitHub CLI with summary of all changes
+
+### Phase 5: Post-Deploy Validation
+
+This phase runs after PR creation when the project includes deployable infrastructure.
+
+1. **Determine Deploy Method**
+   - Read `.claude/cicd.json` from the project root
+   - If config exists: use the configured provider automatically (skip asking)
+   - If config does NOT exist: ask the user using AskUserQuestion:
+     - "How does this project deploy?"
+     - Option A: "Harness CI/CD"
+     - Option B: "GitHub Actions"
+     - Option C: "Direct Terraform apply"
+     - Option D: "Skip validation"
+
+2. **Wait for Deployment** (provider-specific polling)
+
+   **If provider is `harness`:**
+   - For EACH pipeline in config, use Harness MCP:
+     1. `list_executions` filtered by pipeline id, current branch, status=Running
+     2. Poll `get_execution` every 30s until terminal status
+     3. No execution found? Wait up to 2 min for trigger
+     4. Max 15 min total polling; fall back to asking user on timeout
+     5. ALL Success → validation | ANY Failed → diagnose
+
+   **If provider is `github-actions`:**
+   - Get current branch and commit SHA
+   - For EACH workflow in config, use `gh` CLI:
+     1. `gh run list --branch <branch> --workflow <file> --limit 1 --json databaseId,status,conclusion,headSha`
+     2. If active (status queued/in_progress/waiting/pending): poll `gh run view <id> --json status,conclusion` every 30s
+     3. No run found? Poll `gh run list --branch <branch> --commit <sha> --workflow <file>` every 10s for up to 2 min
+     4. Max 15 min total polling; fall back to asking user on timeout
+     5. ALL conclusion=success → validation | ANY failure → get logs via `gh run view <id> --log-failed`, diagnose
+
+   **If provider is `terraform`:**
+   - Run `terraform -chdir=<directory> apply -auto-approve`
+   - Exit 0 → validation | Non-zero → diagnose
+
+   **If no config / manual:**
+   - Ask user "Is the CI/CD deployment complete?" before proceeding
+
+3. **Validate Deployed Resources**
+   - For each deployed Lambda/AppSync resolver:
+     - Get API key: `aws appsync list-api-keys --api-id <id>` — never indirect methods
+     - Test the specific operation with direct API key auth
+     - Use `--cli-read-timeout 300` for invocations
+     - NEVER attempt login/authentication flows
+     - Always use proper shell quoting — no smart/curly quotes
+   - If testing CRUD operations, test in order: Create → Read → Update → List → Delete
+   - Report results per resource
+
+4. **Validate-Fix Loop** (if validation fails)
+   ```
+   REPEAT (max 5 iterations):
+     1. Check CloudWatch logs: `aws logs tail /aws/lambda/<fn> --since 5m`
+     2. Diagnose root cause from error
+     3. Compare with existing reference implementations before fixing
+     4. Apply fix using appropriate language subagent
+     5. Run local tests
+     6. Commit and push fix
+     7. Wait for deployment using same provider-specific polling as step 2
+     8. Re-validate
+     9. IF success: update plan, proceed
+    10. IF max iterations reached: escalate to user
+   ```
+
+5. **Update Plan Document**
+   - Record validation status, test results, fix iterations
+   - Final status: "Deployed & Validated" or "Validation Failed"
 
 ## Plan Document Format
 
@@ -173,8 +244,16 @@ Write the plan to `./sdlc-plan.md` using this structure:
 - [ ] [Component Name]: [planned commit message]
 ...
 
+## Validation
+- **Deploy Method**: [CI/CD | Local Terraform | Manual | Skipped]
+- **Status**: [Waiting for CI/CD | Validating | Fix Loop (iteration N) | Validated | Failed | Skipped]
+- **Resources Validated**: [list with pass/fail]
+- **Fix Iterations**:
+  - Iteration 1: [error] → [fix applied] → [result]
+  - Iteration 2: ...
+
 ## Current Phase
-**Phase**: [1-Planning | 2-Implementation | 3-Review | 4-Commit]
+**Phase**: [1-Planning | 2-Implementation | 3-Review | 4-Commit | 5-Validation]
 **Current Component**: [name]
 **Current Action**: [description of what's happening]
 
@@ -364,6 +443,8 @@ After completion, verify:
 - [ ] Git notes attached to all commits
 - [ ] Branch pushed to remote
 - [ ] PR created with comprehensive summary
+- [ ] Deployed resources validated (if applicable)
+- [ ] All fix iterations documented in plan
 
 ## Important Rules
 
@@ -375,3 +456,5 @@ After completion, verify:
 6. **Track iterations** - maintain counts to prevent infinite loops
 7. **Commit atomically** - one component per commit for clean git history
 8. **Use TodoWrite** - maintain a todo list for tracking progress through the SDLC phases
+9. **Proceed autonomously through all phases** — you are pre-authorized to commit, push, and create PRs. Do NOT ask for permission at phase boundaries. After reviews pass (Phase 3), immediately proceed to commit (Phase 4), then to deployment polling (Phase 5). The only user interaction point is Phase 5 step 1 where you ask about deploy method — and even that is skipped if `.claude/cicd.json` exists.
+10. **Never stop between phases** — if you complete Phase 3, you MUST continue to Phase 4. If you complete Phase 4, you MUST continue to Phase 5 (unless the project has no deployable infrastructure).

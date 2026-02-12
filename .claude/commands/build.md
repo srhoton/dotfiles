@@ -14,5 +14,6 @@ The routing-agent will orchestrate the complete SDLC flow:
 5. Run functional and code quality reviews with retry loops
 6. Commit each component with git notes
 7. Push and create a PR
+8. Post-deploy validation with validate-fix loop (optional, for deployable infrastructure)
 
 Wait for the routing-agent to complete and report back with the results.
