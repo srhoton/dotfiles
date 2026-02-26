@@ -169,7 +169,8 @@ This phase runs after PR creation when the project includes deployable infrastru
 3. **Validate Deployed Resources**
    - For each deployed Lambda/AppSync resolver:
      - Get API key: `aws appsync list-api-keys --api-id <id>` — never indirect methods
-     - Test the specific operation with direct API key auth
+     - **For AppSync**: Test the specific operation with direct API key auth
+     - **For *-svc REST endpoints**: use `fb-jwt <service-name>` for JWT Bearer auth
      - Use `--cli-read-timeout 300` for invocations
      - NEVER attempt login/authentication flows
      - Always use proper shell quoting — no smart/curly quotes

@@ -4,7 +4,8 @@ This command assumes the code has already been deployed via CI/CD (or locally).
 Follow this validate-fix loop:
 
 1. **Validate**: Test the deployed resource following deploy-test rules:
-   - Get API key via `aws appsync list-api-keys --api-id <id>` — never indirect methods
+   - **For AppSync endpoints**: Get API key via `aws appsync list-api-keys --api-id <id>` — never indirect methods
+   - **For *-svc REST endpoints (JWT-authenticated)**: Get a JWT via `fb-jwt <service-name>` and use as `Authorization: Bearer <token>`. If inside a *-svc repo, just run `fb-jwt` with no arguments to auto-detect the audience.
    - Test ONLY the specific operation — never login/authentication flows
    - Use `--cli-read-timeout 300` for Lambda invocations
    - Always use proper shell quoting — no smart/curly quotes
