@@ -5,7 +5,10 @@ Rules:
    try indirect approaches (Terraform state, env vars, etc.)
 2. Test ONLY the specific mutation/query/endpoint named above — NEVER attempt
    login/authentication flows unless explicitly asked
-3. Use direct API key auth for AppSync, or JWT from ~/git/tmp/passbf.json if instructed
+3. **Authentication method depends on the service type:**
+   - **AppSync endpoints**: Use direct API key auth (from rule 1)
+   - **\*-svc REST endpoints (JWT-authenticated)**: Get a JWT via `fb-jwt <service-name>` and use as `Authorization: Bearer <token>`. If inside a *-svc repo, just run `fb-jwt` with no arguments.
+   - Example: `curl -H "Authorization: Bearer $(fb-jwt act-account-svc)" https://act-account-svc.lb.fb/act/accounts`
 4. Use `--cli-read-timeout 300` for any Lambda invocations or long-running operations
 5. On failure, immediately check CloudWatch logs:
    `aws logs tail /aws/lambda/<function-name> --since 5m`
