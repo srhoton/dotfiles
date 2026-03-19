@@ -172,6 +172,34 @@ If runtime data is available from Step 4, compare `MaxMemoryUsed` to configured 
 - Flag blocking calls in reactive endpoints (`Uni`/`Multi` pipelines with `.await()`)
 - Check for proper use of `@Blocking` vs `@NonBlocking` annotations
 
+**X-Ray instrumentation audit:**
+
+_Infrastructure enablement:_
+- Check Terraform/SAM/CDK for `tracing_config { mode = "Active" }` (or `PassThrough`) on the Lambda resource — if missing, X-Ray is disabled at infra level
+- Check API Gateway (if present) for X-Ray tracing enabled (`xray_tracing_enabled = true`)
+
+_Application-level instrumentation (Quarkus):_
+- Check for `quarkus-opentelemetry` extension in `build.gradle` — this is the preferred Quarkus approach for distributed tracing
+- If using OpenTelemetry, verify `quarkus.otel.exporter.otlp.traces.endpoint` is configured, or that the AWS X-Ray ADOT layer is configured as the collector
+- Alternatively, check for `aws-xray-recorder-sdk-*` dependencies (direct X-Ray SDK usage)
+- If neither OTel nor X-Ray SDK is present → flag as **missing instrumentation** — the service has no distributed tracing
+
+_Custom subsegments:_
+- Check if downstream calls (DynamoDB, HTTP clients, SQS) are instrumented with subsegments/spans
+- For AWS SDK v2 clients: verify the X-Ray interceptor is registered (`TracingInterceptor` or OTel instrumentation)
+- For HTTP clients: check for trace context propagation headers (`X-Amzn-Trace-Id` or W3C `traceparent`)
+- Flag "fire and forget" calls (async SQS sends, SNS publishes) that lack trace propagation — these break the trace chain
+
+_What to flag:_
+- **Critical**: No tracing at all (no infra config + no SDK/OTel) — recommend enabling as a baseline for observability
+- **High**: Infra enabled but no application instrumentation — Lambda auto-instruments the handler but downstream calls are opaque black boxes
+- **Medium**: Instrumentation present but missing subsegments on key downstream calls
+- **Low**: Tracing present and functional but could add custom attributes/annotations for better filtering
+
+_Cross-reference with runtime data:_
+- If Step 4 X-Ray query returned no traces, check whether it's because infra tracing is disabled (fixable) vs X-Ray not being available in the region
+- If traces exist but show no subsegments, that confirms the "infra enabled but no app instrumentation" finding from code review
+
 ### Step 8: Infrastructure Performance (if Terraform/SAM/CDK files present)
 
 - Lambda memory configuration — too low = slow (less CPU), too high = wasteful
@@ -217,6 +245,12 @@ _Omit this section if runtime data was not available._
 - Memory: configured [X]MB / avg used [Y]MB / max used [Z]MB ([utilization]%)
 - Errors: [rate]% / Throttles: [count]
 - X-Ray: [enabled/not enabled] — [key subsegment findings]
+
+### X-Ray Instrumentation Assessment
+- Infrastructure tracing: Active / PassThrough / Not configured
+- Application instrumentation: OpenTelemetry / X-Ray SDK / None
+- Downstream call coverage: [list of instrumented vs uninstrumented downstream services]
+- Recommendations: [specific steps to complete instrumentation]
 
 ### Cold Start Assessment
 - Estimated cold start risk: LOW / MEDIUM / HIGH
