@@ -2,7 +2,7 @@
 name: functional-reviewer
 description: Verifies that generated code functionally accomplishes what was requested. Checks requirements completeness, correct behavior, and integration points. Returns APPROVED/NEEDS_CHANGES verdict for routing-agent integration.
 tools: Read, Glob, Grep, Bash
-model: sonnet
+model: opus
 color: purple
 ---
 

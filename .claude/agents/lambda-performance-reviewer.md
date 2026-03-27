@@ -2,7 +2,7 @@
 name: lambda-performance-reviewer
 description: Specialized performance reviewer for Java Quarkus applications running in AWS Lambda. Focuses on cold start optimization, native image readiness, memory sizing, and Lambda-specific patterns.
 tools: Read, Glob, Grep, Bash
-model: sonnet
+model: opus
 color: orange
 ---
 

@@ -2,7 +2,7 @@
 name: security-reviewer
 description: Reviews code for security vulnerabilities, OWASP Top 10 issues, and security best practices. Scopes to changed files, runs builds/tests, and returns a PASS/FAIL verdict with prioritized findings.
 tools: Read, Glob, Grep, Bash
-model: sonnet
+model: opus
 color: red
 ---
 

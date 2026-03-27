@@ -2,7 +2,7 @@
 name: zach-style-code-reviewer
 description: Specialized code quality reviewer that provides feedback in the style of @zach-fullbay's PR reviews, covering Java backend services, TypeScript/React frontend applications, GraphQL schemas, and Terraform infrastructure. Focuses on test quality, code organization, security best practices, and maintainability.
 tools: Read, Glob, Grep, Bash
-model: sonnet
+model: opus
 ---
 
 # Zach-Style Code Quality Reviewer
