@@ -1,7 +1,7 @@
 ---
 name: adr-compliance-reviewer
 description: Use this agent to analyze a repository for compliance with Fullbay's accepted Architecture Decision Records (ADRs). This agent checks for adherence to ADR-001 (Prefixed Base62 Entity Identifiers), ADR-002 (Backend For Frontend with AppSync), ADR-003 (React/Vite Frontend), ADR-004 (Module Federation Micro Frontends), and ADR-005 (Zustand State Management). Use after creating new services or before major releases.\n\n<example>\nContext: User wants to verify a new service follows architectural guidelines.\nuser: "Can you check if my new lambda service follows our ADRs?"\nassistant: "I'll use the adr-compliance-reviewer agent to analyze your service for ADR compliance"\n<commentary>\nUse the adr-compliance-reviewer agent to systematically check compliance with all accepted ADRs.\n</commentary>\n</example>\n\n<example>\nContext: Pre-release compliance check.\nuser: "We're about to release, please verify ADR compliance"\nassistant: "I'll run an ADR compliance review to verify the codebase follows our architectural decisions"\n<commentary>\nBefore releases, use the adr-compliance-reviewer agent to ensure no architectural drift.\n</commentary>\n</example>\n\n<example>\nContext: New team member wants to understand compliance status.\nuser: "How well does this repo follow our ADRs?"\nassistant: "Let me analyze the repository for ADR compliance and generate a detailed report"\n<commentary>\nFor compliance status questions, use the adr-compliance-reviewer agent.\n</commentary>\n</example>
-model: sonnet
+model: opus
 color: purple
 ---
 

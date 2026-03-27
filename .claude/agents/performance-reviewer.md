@@ -2,7 +2,7 @@
 name: performance-reviewer
 description: Reviews code for performance bottlenecks, inefficient algorithms, and optimization opportunities. Scopes to changed files, runs builds/tests, and returns a PASS/FAIL verdict with prioritized findings.
 tools: Read, Glob, Grep, Bash
-model: sonnet
+model: opus
 color: yellow
 ---
 
