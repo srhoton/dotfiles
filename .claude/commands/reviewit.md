@@ -50,7 +50,11 @@ Dispatch **five Task calls in a single message** so they run simultaneously:
 
 **Task C — adr-compliance-reviewer subagent:**
 - Provide the list of changed files (paths only)
-- Instruct: "Analyze ONLY the changed files listed below for compliance with Fullbay's accepted ADRs: ADR-001 (Prefixed Base62 Entity Identifiers), ADR-002 (Backend For Frontend with AppSync), ADR-003 (React/Vite Frontend), ADR-004 (Module Federation Micro Frontends), ADR-005 (Zustand State Management). For each violation found, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (which ADR is violated and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
+- Instruct: "Analyze ONLY the changed files listed below for compliance with Fullbay's accepted ADRs. Load ADRs dynamically from ~/git/architecture-decisions. For each violation found, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (which ADR is violated and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
+
+**Task D — performance-reviewer subagent:**
+- Provide the list of changed files (paths only)
+- Instruct: "Review ONLY the changed files listed below for performance bottlenecks, inefficient algorithms, and optimization opportunities. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what the performance issue is and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
 
 **Task D — performance-reviewer subagent:**
 - Provide the list of changed files (paths only)
