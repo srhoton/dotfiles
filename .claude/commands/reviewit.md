@@ -37,7 +37,7 @@ gh pr checkout $ARGUMENTS
 
 ## Step 2: Run Reviews in Parallel
 
-Dispatch **three Task calls in a single message** so they run simultaneously:
+Dispatch **five Task calls in a single message** so they run simultaneously:
 
 **Task A — functional-reviewer subagent:**
 - Provide the PR title and body as "the user's stated requirements / intent"
@@ -52,22 +52,30 @@ Dispatch **three Task calls in a single message** so they run simultaneously:
 - Provide the list of changed files (paths only)
 - Instruct: "Analyze ONLY the changed files listed below for compliance with Fullbay's accepted ADRs: ADR-001 (Prefixed Base62 Entity Identifiers), ADR-002 (Backend For Frontend with AppSync), ADR-003 (React/Vite Frontend), ADR-004 (Module Federation Micro Frontends), ADR-005 (Zustand State Management). For each violation found, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (which ADR is violated and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
 
+**Task D — performance-reviewer subagent:**
+- Provide the list of changed files (paths only)
+- Instruct: "Review ONLY the changed files listed below for performance bottlenecks, inefficient algorithms, resource misuse, and scalability concerns. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what the performance issue is, its estimated impact, and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
+
+**Task E — security-reviewer subagent:**
+- Provide the list of changed files (paths only)
+- Instruct: "Review ONLY the changed files listed below for security vulnerabilities, OWASP Top 10 issues, insecure patterns, and missing protections. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what the security issue is, the OWASP/CWE reference if applicable, and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
+
 ---
 
 ## Step 3: Aggregate and Filter
 
-Once all three reviews return:
+Once all five reviews return:
 
-1. Parse findings from all three reviewers
+1. Parse findings from all five reviewers
 2. Separate into two buckets:
    - **Actionable** = CRITICAL and HIGH severity findings
    - **Informational** = MEDIUM and LOW severity findings
-3. Deduplicate: if multiple reviewers flagged the same file:line, merge into one finding and mark source as the combination (e.g. "quality+adr")
+3. Deduplicate: if multiple reviewers flagged the same file:line, merge into one finding and mark source as the combination (e.g. "quality+adr", "quality+performance", "quality+security")
 4. For each actionable finding, prepare an inline comment with:
    - `file`: relative path
    - `line`: line number
    - `body`: the finding description + suggested fix
-   - `source`: "functional" / "quality" / "adr" / combination (e.g. "quality+adr")
+   - `source`: "functional" / "quality" / "adr" / "performance" / "security" / combination (e.g. "quality+adr")
 
 Display the MEDIUM/LOW findings in the terminal as an informational summary (not proposed as PR comments).
 
@@ -106,7 +114,7 @@ gh api repos/{owner}/{repo}/pulls/{number}/comments \
 
 **Suggested fix:** <suggestion>
 
-_Reviewed by Claude (functional-reviewer + code-quality-reviewer + adr-compliance-reviewer)_" \
+_Reviewed by Claude (functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + performance-reviewer + security-reviewer)_" \
   -f path="<file>" \
   -F line=<line> \
   -f commit_id="<head_sha>" \
@@ -122,7 +130,7 @@ gh pr comment $ARGUMENTS --body "**[SEVERITY]** \`file:line\`
 
 **Suggested fix:** <suggestion>
 
-_Reviewed by Claude (functional-reviewer + code-quality-reviewer + adr-compliance-reviewer)_"
+_Reviewed by Claude (functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + performance-reviewer + security-reviewer)_"
 ```
 
 ---
