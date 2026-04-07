@@ -24,5 +24,11 @@
 ### Spec-Driven Implementation
 - When implementing from a spec/plan file, read the entire spec first and present a summary plan before making code changes. Make reasonable assumptions and note them rather than asking clarifying questions interactively.
 
+## Code Quality
+- Prefer correct, complete implementations over minimal ones.
+- Use appropriate data structures and algorithms — don't brute-force what has a known better solution.
+- When fixing a bug, fix the root cause, not the symptom.
+- If something I asked for requires error handling or validation to work reliably, include it without asking.
+
 ### Pattern Discovery
 - Before making changes, search the codebase for existing examples of the pattern being implemented. Show 2-3 examples of how it is currently done, then follow the same conventions. Do not invent new patterns.
