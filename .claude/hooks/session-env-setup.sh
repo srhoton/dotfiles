@@ -6,12 +6,26 @@
 # across all Bash tool calls in the session.
 #
 
+# ---------------------------------------------------------------------------
+# 0. tmux pane title — show this is a Claude pane and which project.
+#    Runs regardless of CLAUDE_ENV_FILE state so tmux integration is robust.
+# ---------------------------------------------------------------------------
+if [ -n "$TMUX" ]; then
+  PROJECT=$(basename "$PWD")
+  tmux select-pane -T "● claude: $PROJECT" 2>/dev/null
+  tmux set -g pane-border-status top 2>/dev/null
+  tmux set -g pane-border-format "#{pane_index}: #{pane_title}" 2>/dev/null
+fi
+
 [ -z "$CLAUDE_ENV_FILE" ] && exit 0
 
 # ---------------------------------------------------------------------------
 # 1. Homebrew shell environment (PATH, HOMEBREW_PREFIX, etc.)
 #    Write only simple export lines — CLAUDE_ENV_FILE doesn't support eval.
+#    Truncate first to prevent unbounded growth on repeated session starts.
 # ---------------------------------------------------------------------------
+: > "$CLAUDE_ENV_FILE"
+
 if [ -x /opt/homebrew/bin/brew ]; then
   cat >> "$CLAUDE_ENV_FILE" <<'BREW'
 export HOMEBREW_PREFIX="/opt/homebrew"

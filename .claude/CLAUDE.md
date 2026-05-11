@@ -21,8 +21,19 @@
 ### Environment Configuration
 - Always use the established IDP config library with flat UPPER_SNAKE_CASE keys. Do not create custom YAML config readers or use camelCase/nested YAML structures.
 
+### Terraform Conventions
+- Never use `count = 0` together with `moved` blocks on the same resource — this causes plan errors.
+- Do not change DMS `MaxFullLoadSubTasks` above the current value without explicit approval (known OOM risk).
+- Always run `terraform validate` and `terraform plan` before suggesting a commit.
+- Do not modify IAM roles tagged with governance policies — flag for human approval instead of attempting the change.
+
 ### Spec-Driven Implementation
 - When implementing from a spec/plan file, read the entire spec first and present a summary plan before making code changes. Make reasonable assumptions and note them rather than asking clarifying questions interactively.
+
+## Communication Style
+
+- When the user asks for an investigation, write-up, or findings document, document the findings — do not attempt fixes unless explicitly asked.
+- Avoid interactive clarifying questions during plan-writing phases; make a reasonable assumption and note it instead.
 
 ## Code Quality
 - Prefer correct, complete implementations over minimal ones.
