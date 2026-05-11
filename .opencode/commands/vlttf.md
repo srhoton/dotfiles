@@ -1,0 +1,5 @@
+---
+description: Format, lint, validate Terraform code and check AWS best practices and security
+---
+
+Ok. Make sure your code is formatted and linted, and validated properly. Follow all the rules in your memory for terraform. Using your awslabs.terraform-mcp-server mcp server, make sure you code follows AWS best practices and passes security checks. Ultrathink.
