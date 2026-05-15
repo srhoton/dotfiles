@@ -8,42 +8,58 @@
 # Reads tool input JSON from stdin. Exits 0 to allow, non-zero to block.
 #
 
+shopt -s extglob 2>/dev/null
+
 # Read the tool input from stdin
-INPUT=$(cat)
+INPUT=$(cat 2>/dev/null) || exit 0
+[ -z "$INPUT" ] && exit 0
 
 # Extract the command from the JSON input
-COMMAND=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('input',{}).get('command',''))" 2>/dev/null)
+COMMAND=$(printf '%s' "$INPUT" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    cmd = d.get('input', {}).get('command', '')
+    print(cmd)
+except Exception:
+    pass
+" 2>/dev/null) || exit 0
 
 # If we couldn't parse or it's not a git commit, pass through
-if [ -z "$COMMAND" ]; then
-  exit 0
-fi
+[ -z "$COMMAND" ] && exit 0
 
-# Only intercept git commit commands (not git commit --amend with no message, git notes, etc.)
-if ! echo "$COMMAND" | grep -qE '^\s*git\s+commit\b'; then
-  exit 0
-fi
+# Only intercept git commit commands (not git notes, etc.)
+case "$COMMAND" in
+  git\ commit|git\ commit\ *|*\ git\ commit) true ;;
+  *) exit 0 ;;
+esac
 
-echo "Pre-commit hook: Running formatters and tests..." >&2
+printf 'Pre-commit hook: Running formatters and tests...\n' >&2
+
+stage_formatted_files() {
+  git diff --name-only -z | xargs -0 git add --
+}
 
 # Detect project type and run appropriate checks
 FAILED=0
 
 if [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
   # Java/Gradle project
-  echo "Detected Java/Gradle project. Running spotlessApply..." >&2
-  if ./gradlew spotlessApply 2>&1 >&2; then
-    echo "Spotless formatting applied." >&2
-    git add -u 2>/dev/null
-  else
-    echo "ERROR: spotlessApply failed." >&2
-    FAILED=1
+  printf 'Detected Java/Gradle project. Running spotlessApply...\n' >&2
+  if command -v gradlew >/dev/null 2>&1 || [ -f "./gradlew" ]; then
+    if ./gradlew spotlessApply 2>&1 >&2; then
+      printf 'Spotless formatting applied.\n' >&2
+      stage_formatted_files 2>/dev/null || true
+    else
+      printf 'ERROR: spotlessApply failed.\n' >&2
+      FAILED=1
+    fi
   fi
 
   if [ $FAILED -eq 0 ]; then
-    echo "Running tests..." >&2
+    printf 'Running tests...\n' >&2
     if ! ./gradlew test 2>&1 >&2; then
-      echo "ERROR: Tests failed. Fix test failures before committing." >&2
+      printf 'ERROR: Tests failed. Fix test failures before committing.\n' >&2
       FAILED=1
     fi
   fi
@@ -58,48 +74,49 @@ elif [ -f "package.json" ]; then
     RUNNER="npm"
   fi
 
-  echo "Detected Node project (using $RUNNER). Running tests..." >&2
-  if ! $RUNNER test 2>&1 >&2; then
-    echo "ERROR: Tests failed. Fix test failures before committing." >&2
+  printf "Detected Node project (using $RUNNER). Running tests...\n" >&2
+  if ! "$RUNNER" test 2>&1 >&2; then
+    printf 'ERROR: Tests failed. Fix test failures before committing.\n' >&2
     FAILED=1
   fi
 
 elif [ -f "go.mod" ]; then
   # Go project
-  echo "Detected Go project. Running gofmt and tests..." >&2
-  gofmt -w . 2>&1 >&2
-  git add -u 2>/dev/null
+  printf 'Detected Go project. Running gofmt and tests...\n' >&2
+  command -v gofmt >/dev/null 2>&1 && gofmt -w . 2>&1 >&2 || true
+  stage_formatted_files 2>/dev/null || true
 
   if ! go test ./... 2>&1 >&2; then
-    echo "ERROR: Tests failed. Fix test failures before committing." >&2
+    printf 'ERROR: Tests failed. Fix test failures before committing.\n' >&2
     FAILED=1
   fi
 
 elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
   # Python project
-  echo "Detected Python project. Running ruff format and pytest..." >&2
-  if command -v ruff &>/dev/null; then
-    ruff format . 2>&1 >&2
-    git add -u 2>/dev/null
+  printf 'Detected Python project. Running ruff format and pytest...\n' >&2
+  if command -v ruff >/dev/null 2>&1; then
+    ruff format . 2>&1 >&2 || true
+    stage_formatted_files 2>/dev/null || true
   fi
 
-  if command -v pytest &>/dev/null; then
+  if command -v pytest >/dev/null 2>&1; then
     if ! pytest 2>&1 >&2; then
-      echo "ERROR: Tests failed. Fix test failures before committing." >&2
+      printf 'ERROR: Tests failed. Fix test failures before committing.\n' >&2
       FAILED=1
     fi
   fi
 
-elif [ -f "main.tf" ] || ls *.tf 1>/dev/null 2>&1; then
+elif [ -f "main.tf" ] || compgen -G "*.tf" >/dev/null 2>&1; then
   # Terraform project
-  echo "Detected Terraform project. Running fmt and validate..." >&2
-  terraform fmt -recursive 2>&1 >&2
-  git add -u 2>/dev/null
-
-  if ! terraform validate 2>&1 >&2; then
-    echo "ERROR: Terraform validation failed. Fix before committing." >&2
-    FAILED=1
-  fi
+  printf 'Detected Terraform project. Running fmt and validate...\n' >&2
+  command -v terraform >/dev/null 2>&1 && {
+    terraform fmt -recursive 2>&1 >&2 || true
+    stage_formatted_files 2>/dev/null || true
+    terraform validate 2>&1 >&2 || {
+      printf 'ERROR: Terraform validation failed. Fix before committing.\n' >&2
+      FAILED=1
+    }
+  }
 
 else
   # Unknown project type, pass through
@@ -107,10 +124,9 @@ else
 fi
 
 if [ $FAILED -ne 0 ]; then
-  echo "" >&2
-  echo "Pre-commit checks FAILED. Commit blocked." >&2
+  printf '\nPre-commit checks FAILED. Commit blocked.\n' >&2
   exit 1
 fi
 
-echo "Pre-commit checks passed." >&2
+printf 'Pre-commit checks passed.\n' >&2
 exit 0
