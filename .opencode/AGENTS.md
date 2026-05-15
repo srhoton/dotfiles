@@ -19,6 +19,13 @@ When working with specific languages, load the corresponding rules file:
 
 ### Pull Requests
 - When creating PRs, check if a referenced PR number is still open. Never update a closed PR -- create a new one.
+- For multiline PR bodies, prefer `gh pr create --body-file <tmpfile>` over inline heredocs. Heredocs containing backticks corrupt PR content.
+- Same rule applies to multiline commit messages: write to a tempfile and use `git commit -F <tmpfile>` rather than `-m "$(cat <<EOF ...`.
+
+### Git State Verification
+- Before claiming a file or commit doesn't exist, run `git fetch origin && git log origin/<branch> --oneline -20` to confirm the local clone is current. Local clones drift.
+- When asked about a specific commit SHA, check if it's a squash-merge of a PR (`git log --format='%s' -1 <sha>` — look for a `(#NN)` suffix) before treating it as standalone work.
+- If a user pastes a GitHub URL that disagrees with your local view, trust the URL and `git fetch` to reconcile — do not assume the user is mistaken.
 
 ### Environment Configuration
 - Always use the established IDP config library with flat UPPER_SNAKE_CASE keys. Do not create custom YAML config readers or use camelCase/nested YAML structures.
@@ -32,10 +39,25 @@ When working with specific languages, load the corresponding rules file:
 ### Spec-Driven Implementation
 - When implementing from a spec/plan file, read the entire spec first and present a summary plan before making code changes. Make reasonable assumptions and note them rather than asking clarifying questions interactively.
 
+## Deployment Workflow
+
+- Standard end-to-end flow: implement → tests pass → self-review (`/review`) → commit with git notes → push → open PR → address review → ship through dev/stage/prod/demo via Port.io (`/shipit`).
+- **Port.io cache flicker**: action runs can oscillate between IN_PROGRESS and SUCCESS during polling. Poll the same state 2-3 times before reporting a final terminal state.
+- **Stale SHAs in deploys**: before triggering a deploy or terraform apply, confirm the target entity's `short_sha` matches the expected commit on origin. If misaligned, wait 30s and re-fetch — do not fire the action against a stale entity.
+- **Approval gate polling**: treat `approval_status = null` as pending, not failed. Retry up to 5x with 20s backoff before assuming the gate is broken.
+
 ## Communication Style
 
 - When the user asks for an investigation, write-up, or findings document, document the findings — do not attempt fixes unless explicitly asked.
 - Avoid interactive clarifying questions during plan-writing phases; make a reasonable assumption and note it instead.
+
+### Output Token Discipline
+
+- Keep chat responses concise. Avoid restating large file contents or full diffs back to the user — they can read the files.
+- Summarize work using bullet lists with `file:line` references, not pasted code blocks.
+- For multi-file refactors, show only key snippets in the final summary, not every change.
+- For deploy/pipeline polling, report state changes as a compact table — not narrative prose.
+- This applies to user-visible output. Internal reasoning depth should remain high per the Thinking Depth section.
 
 ## Code Quality
 - Prefer correct, complete implementations over minimal ones.
