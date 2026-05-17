@@ -54,15 +54,25 @@ For each claim, run the appropriate verification:
 
 | Claim type | Verification |
 |---|---|
-| Service / module referenced | `grep -r '<service-name>' --include='*.{ts,java,tf}' .` |
+| Service / module referenced | LSP workspace symbols (if available); otherwise `grep -r '<service-name>' --include='*.{ts,java,tf}' .` |
 | File exists at path | `Read` or `Glob` |
-| Function / class / variable exists | `grep -rn 'fn <name>\|class <name>\|<name>(' .` |
+| Function / class / variable exists | LSP find-references / workspace-symbols (if available); otherwise `grep -rn 'fn <name>\|class <name>\|<name>(' .` |
 | Commit exists / is what user thinks | `git log --format='%H %s' <ref>`, check for squash-merge `(#NN)` suffix |
 | Library version has field | `npm view <pkg>@<ver>` or `aws codeartifact get-package-version-asset` |
 | PR state | `gh pr view <N> --json state,title,headRefName` |
-| Pattern X is used in codebase | Grep for representative tokens; sample 2-3 hits |
+| Pattern X is used in codebase | LSP workspace-symbols + find-references (if available); otherwise grep for representative tokens, sample 2–3 hits |
 
 If the claim depends on origin state, run `git fetch` first to ensure the local clone is current.
+
+#### LSP-first when available
+
+When verifying a symbol-level claim (function, class, method, variable, type) in a language with an active LSP, **prefer LSP capabilities over grep** for higher accuracy:
+
+- **Java** (jdtls): find-references and workspace-symbols handle overloads, inheritance, and interface implementations that grep can't disambiguate.
+- **TypeScript** (typescript-lsp): find-references distinguishes `foo()` vs `obj.foo()` vs imported `foo` — critical for refactor verification.
+- **Python** (pyright): workspace-symbols + go-to-definition.
+
+If no LSP is active for the file type (e.g., Terraform, shell), or the LSP returns zero results that contradict grep, **fall back to grep** and note the discrepancy in your AMBIGUOUS bucket. Never silently prefer one over the other when they disagree — surface the conflict so the caller can investigate.
 
 ### Step 3: Report structured findings
 

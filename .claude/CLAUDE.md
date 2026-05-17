@@ -81,6 +81,7 @@ Adhere to the following guidelines when using tools:
 
 - Always use a **Research-First approach**: Before using any tool, conduct thorough research to understand the context and requirements. This ensures that you use the most appropriate tool for the task at hand. Never use an Edit-First approach. You should prefer making surgical edits to the codebase instead of rewriting whole files or doing large, sweeping changes.
 - Use **Reasoning Loops** very frequently. Don't be lazy and skip them. Reasoning loops are essential for ensuring the quality and accuracy of your work.
+- **LSP-first for symbol-level questions**: when working in a file type with an active LSP (Java via jdtls, TypeScript via typescript-lsp, Python via pyright), prefer LSP capabilities — find-references, go-to-definition, workspace-symbols, diagnostics — over grep + build cycles. LSPs distinguish overloads, inheritance, and imported vs local symbols where grep can't. Keep grep for text/comment/config searches and for languages without an active LSP (Terraform, shell, YAML).
 
 ### Thinking Depth
 
