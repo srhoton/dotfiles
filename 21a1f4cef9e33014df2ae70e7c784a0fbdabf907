@@ -1,0 +1,4 @@
+Session prompts:
+- "Review .opencode/agents/react-agent.md, compare it to the one in the .claude folder, and update it as appropriate."
+- "ok. copy to those changes to the same location in ~/.opencode."
+- "ok. Please commit your work, add prompts in this session to the commit via git notes, push it, and using your github mcp integration, create a PR."
