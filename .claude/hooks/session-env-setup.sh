@@ -17,15 +17,18 @@ if [ -n "$TMUX" ]; then
   tmux set -g pane-border-format "#{pane_index}: #{pane_title}" 2>/dev/null
 fi
 
+# Register this pane in the agent mailbox so other Claude sessions can
+# tmux-send-keys notifications here. No-op outside tmux.
+if [ -n "$TMUX" ] && [ -x "$HOME/.claude/bin/agent-msg" ]; then
+  "$HOME/.claude/bin/agent-msg" register >/dev/null 2>&1 || true
+fi
+
 [ -z "$CLAUDE_ENV_FILE" ] && exit 0
 
 # ---------------------------------------------------------------------------
 # 1. Homebrew shell environment (PATH, HOMEBREW_PREFIX, etc.)
 #    Write only simple export lines — CLAUDE_ENV_FILE doesn't support eval.
-#    Truncate first to prevent unbounded growth on repeated session starts.
 # ---------------------------------------------------------------------------
-: > "$CLAUDE_ENV_FILE"
-
 if [ -x /opt/homebrew/bin/brew ]; then
   cat >> "$CLAUDE_ENV_FILE" <<'BREW'
 export HOMEBREW_PREFIX="/opt/homebrew"

@@ -1,0 +1,159 @@
+#!/bin/bash
+#
+# agent-msg — inter-Claude mailbox CLI.
+#
+# Standardizes message-passing between Claude Code sessions running in
+# different repos. Messages are durable markdown files; tmux send-keys is
+# the (optional) notification channel. See ~/.claude/plans/is-there-a-better-crispy-sparrow.md
+# for the full design.
+#
+# Usage:
+#   agent-msg post <to-repo> <subject> [body-file|-|<literal-string>]
+#   agent-msg list [--repo <name>]
+#   agent-msg register [<repo-name>]
+
+set -euo pipefail
+
+MAILBOX_ROOT="$HOME/.claude/agent-mailbox"
+PANES_FILE="$MAILBOX_ROOT/_panes.json"
+
+ensure_mailbox() {
+  mkdir -p "$MAILBOX_ROOT"
+  [ -f "$PANES_FILE" ] || printf '{}\n' > "$PANES_FILE"
+}
+
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g' \
+    | cut -c1-40
+}
+
+panes_get() {
+  local repo="$1"
+  REPO="$repo" PANES_FILE="$PANES_FILE" python3 - <<'PY' 2>/dev/null || true
+import json, os
+try:
+    with open(os.environ["PANES_FILE"]) as f:
+        d = json.load(f)
+    print(d.get(os.environ["REPO"], ""))
+except Exception:
+    pass
+PY
+}
+
+panes_set() {
+  local repo="$1" target="$2"
+  REPO="$repo" TARGET="$target" PANES_FILE="$PANES_FILE" python3 - <<'PY'
+import json, os
+path = os.environ["PANES_FILE"]
+try:
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+d[os.environ["REPO"]] = os.environ["TARGET"]
+with open(path, "w") as f:
+    json.dump(d, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+}
+
+cmd_register() {
+  if [ -z "${TMUX:-}" ]; then
+    echo "agent-msg register: \$TMUX not set; nothing to register" >&2
+    return 1
+  fi
+  local repo="${1:-$(basename "$PWD")}"
+  local target
+  target="$(tmux display-message -p '#S:#I.#P')"
+  ensure_mailbox
+  panes_set "$repo" "$target"
+  echo "registered $repo -> $target"
+}
+
+cmd_list() {
+  local repo
+  if [ "${1:-}" = "--repo" ]; then
+    repo="${2:?--repo requires a value}"
+  else
+    repo="$(basename "$PWD")"
+  fi
+  local inbox="$MAILBOX_ROOT/$repo/inbox"
+  if [ ! -d "$inbox" ]; then
+    echo "(empty)"
+    return 0
+  fi
+  local count
+  count="$(find "$inbox" -maxdepth 1 -type f -name '*.md' | wc -l | tr -d ' ')"
+  if [ "$count" = "0" ]; then
+    echo "(empty)"
+    return 0
+  fi
+  (cd "$inbox" && ls -1 *.md 2>/dev/null)
+}
+
+cmd_post() {
+  local to="${1:?usage: post <to-repo> <subject> [body-file|-|literal]}"
+  local subject="${2:?usage: post <to-repo> <subject> [body-file|-|literal]}"
+  local body_src="${3:-}"
+
+  local sender ts ts_iso slug inbox file body
+  sender="$(basename "$PWD")"
+  ts="$(date -u +%Y-%m-%dT%H-%M-%SZ)"
+  ts_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  slug="$(slugify "$subject")"
+  [ -z "$slug" ] && slug="msg"
+  inbox="$MAILBOX_ROOT/$to/inbox"
+  file="$inbox/${ts}-${sender}-${slug}.md"
+
+  ensure_mailbox
+  mkdir -p "$inbox"
+
+  if [ -z "$body_src" ]; then
+    body=""
+  elif [ "$body_src" = "-" ]; then
+    body="$(cat)"
+  elif [ -f "$body_src" ]; then
+    body="$(cat "$body_src")"
+  else
+    body="$body_src"
+  fi
+
+  {
+    printf -- '---\n'
+    printf 'from: %s\n' "$sender"
+    printf 'to: %s\n' "$to"
+    printf 'subject: %s\n' "$subject"
+    printf 'ts: %s\n' "$ts_iso"
+    printf -- '---\n\n'
+    printf '%s\n' "$body"
+  } > "$file"
+
+  echo "$file"
+
+  local target
+  target="$(panes_get "$to")"
+  if [ -n "$target" ] && tmux list-panes -t "$target" >/dev/null 2>&1; then
+    tmux send-keys -t "$target" "/inbox  # new from ${sender}: ${subject}" Enter 2>/dev/null || true
+  fi
+}
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  agent-msg post <to-repo> <subject> [body-file|-|literal-string]
+  agent-msg list [--repo <name>]
+  agent-msg register [<repo-name>]
+EOF
+}
+
+case "${1:-}" in
+  post)     shift; cmd_post "$@" ;;
+  list)     shift; cmd_list "$@" ;;
+  register) shift; cmd_register "$@" ;;
+  -h|--help|help) usage; exit 0 ;;
+  *) usage; exit 2 ;;
+esac
