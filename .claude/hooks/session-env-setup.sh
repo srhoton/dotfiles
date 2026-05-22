@@ -17,10 +17,24 @@ if [ -n "$TMUX" ]; then
   tmux set -g pane-border-format "#{pane_index}: #{pane_title}" 2>/dev/null
 fi
 
-# Register this pane in the agent mailbox so other Claude sessions can
-# tmux-send-keys notifications here. No-op outside tmux.
-if [ -n "$TMUX" ] && [ -x "$HOME/.claude/bin/agent-msg" ]; then
-  "$HOME/.claude/bin/agent-msg" register >/dev/null 2>&1 || true
+# Register this pane with the micro-status-mcp server so other Claude
+# sessions can tmux-send-keys notifications here. No-op outside tmux or
+# if the server isn't running. We resolve the binary explicitly because
+# the PATH-augmenting block below doesn't take effect until the next
+# session.
+if [ -n "$TMUX" ]; then
+  MSM_BIN=""
+  if command -v micro-status-mcp >/dev/null 2>&1; then
+    MSM_BIN="$(command -v micro-status-mcp)"
+  elif [ -x "$HOME/go/bin/micro-status-mcp" ]; then
+    MSM_BIN="$HOME/go/bin/micro-status-mcp"
+  fi
+  if [ -n "$MSM_BIN" ]; then
+    "$MSM_BIN" register \
+      --repo "$(basename "$PWD")" \
+      --pane "$(tmux display-message -p '#S:#I.#P')" \
+      >/dev/null 2>&1 || true
+  fi
 fi
 
 [ -z "$CLAUDE_ENV_FILE" ] && exit 0
