@@ -111,6 +111,10 @@
       "env": {
         "KAGI_API_KEY": "5ZrJZMBybQz3XDq93B_nVKNAWvm7Ru9BbIyJAnBjc2c.SoGOe8ghHE1fhXLhMlV4p9HGdBskLfEeoNOr6UqP7O0"
       }
+    },
+    "micro-status": {
+      "type": "http",
+      "url": "http://127.0.0.1:7878/mcp"
     }
   },
   "projects": {
@@ -2075,7 +2079,7 @@
             "1": {
               "id": 1,
               "type": "text",
-              "content":""
+              "content": ""
             }
           }
         },
