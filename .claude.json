@@ -50,59 +50,6 @@
         "GITHUB_PERSONAL_ACCESS_TOKEN": ""
       }
     },
-    "awslabs.terraform-mcp-server": {
-      "command": "uvx",
-      "args": [
-        "awslabs.terraform-mcp-server@latest"
-      ],
-      "env": {
-        "FASTMCP_LOG_LEVEL": "ERROR"
-      },
-      "disabled": false,
-      "autoApprove": []
-    },
-    "awslabs.aws-documentation-mcp-server": {
-      "command": "uvx",
-      "args": [
-        "awslabs.aws-documentation-mcp-server@latest"
-      ],
-      "env": {
-        "FASTMCP_LOG_LEVEL": "ERROR",
-        "AWS_DOCUMENTATION_PARTITION": "aws"
-      },
-      "disabled": false,
-      "autoApprove": []
-    },
-    "aws-knowledge-mcp-server": {
-      "command": "npx",
-      "args": [
-        "mcp-remote",
-        "https://knowledge-mcp.global.api.aws"
-      ]
-    },
-    "awslabs.aws-api-mcp-server": {
-      "command": "uvx",
-      "args": [
-        "awslabs.aws-api-mcp-server@latest"
-      ],
-      "env": {
-        "AWS_REGION": "us-east-1"
-      },
-      "disabled": false,
-      "autoApprove": []
-    },
-    "awslabs.cloudwatch-mcp-server": {
-      "autoApprove": [],
-      "disabled": false,
-      "command": "uvx",
-      "args": [
-        "awslabs.cloudwatch-mcp-server@latest"
-      ],
-      "env": {
-        "FASTMCP_LOG_LEVEL": "ERROR"
-      },
-      "transportType": "stdio"
-    },
     "Kagi": {
       "command": "uvx",
       "args": [
