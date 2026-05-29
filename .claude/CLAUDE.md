@@ -37,12 +37,21 @@
 ### Spec-Driven Implementation
 - When implementing from a spec/plan file, read the entire spec first and present a summary plan before making code changes. Make reasonable assumptions and note them rather than asking clarifying questions interactively.
 
+### Premise Verification
+- Before drafting any plan that names a service, file, library version, or commit SHA you don't already know exists in this repo, run `/verify-premise` (or invoke the `premise-verifier` agent directly). If the referenced target is not actually present or current, stop and report — do not build a plan against a phantom target.
+- Mandatory for: cross-service/cross-repo features, "look at how X uses Y" exploration that quotes a specific symbol, integration plans referencing a service the current repo has no obvious dependency on, and any task quoting a published library version or commit SHA.
+- Optional but encouraged: same check inside `/build-from-file` when reading a spec that references external services.
+
 ## Deployment Workflow
 
 - Standard end-to-end flow: implement → tests pass → self-review (`/review`) → commit with git notes → push → open PR → address review → ship through dev/stage/prod/demo via Port.io (`/shipit`).
 - **Port.io cache flicker**: action runs can oscillate between IN_PROGRESS and SUCCESS during polling. Poll the same state 2-3 times before reporting a final terminal state.
 - **Stale SHAs in deploys**: before triggering a deploy or terraform apply, confirm the target entity's `short_sha` matches the expected commit on origin. If misaligned, wait 30s and re-fetch — do not fire the action against a stale entity.
 - **Approval gate polling**: treat `approval_status = null` as pending, not failed. Retry up to 5x with 20s backoff before assuming the gate is broken.
+
+### New Lambda Repos
+- Every new Node/TypeScript Lambda project must include a `.npmrc` configured for the @fullbay AWS CodeArtifact registry before the first PR is opened. Missing this file is the single most common CI failure pattern (`npm install` returns 404 for `@fullbay/*` packages and the pipeline fails at the install step).
+- Any build/scaffold skill that creates a new Node-based Lambda must either generate the `.npmrc` or refuse to commit until one exists in the project root.
 
 ## Communication Style
 
@@ -56,6 +65,7 @@
 - For multi-file refactors, show only key snippets in the final summary, not every change.
 - For deploy/pipeline polling, report state changes as a compact table — not narrative prose.
 - This applies to user-visible output. Internal reasoning depth should remain high per the Thinking Depth section.
+- For any single output that would exceed roughly 150 lines or include large code/diff/log blocks (review findings, migration plans, scraped log dumps, multi-file refactor diffs): write the full content to `~/.claude/scratch/<repo-basename>/<topic>-<ISO8601>.md` (`mkdir -p` on demand) and post only a 3-bullet summary in chat with the path. Hard output-token caps have killed prior sessions mid-task; the scratch file is the durable artifact, chat is the index. Applies especially to reviewer output, deployment plans, and long log analyses.
 
 ## Code Quality
 - Prefer correct, complete implementations over minimal ones.
@@ -82,6 +92,7 @@ Adhere to the following guidelines when using tools:
 - Always use a **Research-First approach**: Before using any tool, conduct thorough research to understand the context and requirements. This ensures that you use the most appropriate tool for the task at hand. Never use an Edit-First approach. You should prefer making surgical edits to the codebase instead of rewriting whole files or doing large, sweeping changes.
 - Use **Reasoning Loops** very frequently. Don't be lazy and skip them. Reasoning loops are essential for ensuring the quality and accuracy of your work.
 - **LSP-first for symbol-level questions**: when working in a file type with an active LSP (Java via jdtls, TypeScript via typescript-lsp, Python via pyright), prefer LSP capabilities — find-references, go-to-definition, workspace-symbols, diagnostics — over grep + build cycles. LSPs distinguish overloads, inheritance, and imported vs local symbols where grep can't. Keep grep for text/comment/config searches and for languages without an active LSP (Terraform, shell, YAML).
+- **WebSearch / WebFetch for unfamiliar territory**: when debugging an error message you don't recognize, working with an unfamiliar library API, or looking up AWS service behavior, use WebSearch followed by WebFetch on the most authoritative result. Prefer official docs over Stack Overflow. The `/docs <topic>` skill wraps this pattern.
 
 ### Thinking Depth
 
