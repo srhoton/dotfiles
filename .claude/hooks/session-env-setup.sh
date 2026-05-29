@@ -37,6 +37,13 @@ if [ -n "$TMUX" ]; then
   fi
 fi
 
+# Refresh origin so `git log origin/<branch>` is current. Backgrounded so
+# session start isn't blocked on slow network. Silent on failure (no
+# remote, no network, not a repo).
+if git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  ( git -C "$PWD" fetch origin --quiet --prune 2>/dev/null & disown ) || true
+fi
+
 [ -z "$CLAUDE_ENV_FILE" ] && exit 0
 
 # ---------------------------------------------------------------------------

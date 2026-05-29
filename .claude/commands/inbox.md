@@ -17,3 +17,5 @@ For each message in the response (`messages[]`), in order (oldest first; the lis
 3. After you have handled the message (whether by acting on it or by acknowledging it), call the `mark_read` tool with the message's `id` so it does not appear in future `/inbox` runs.
 
 If the MCP server is unreachable, tell the user to start it with `micro-status-mcp serve` — do not fall back to reading files from `~/.claude/agent-mailbox/`.
+
+**Ack-style replies** (subject starts with `refresh complete` or `refresh blocked`): these are informational acks from a `/refresh-other` request this session sent earlier. Do not try to act on the SHA or run any git commands. Summarize the reply in one line to the user (e.g., "repo-b is now at main @ a1b2c3d" or "repo-b refused: dirty tree at src/foo.py"), then `mark_read` and continue.
