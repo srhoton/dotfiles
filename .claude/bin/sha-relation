@@ -1,0 +1,51 @@
+#!/bin/bash
+#
+# sha-relation — classify env SHAs against a base (dev) SHA using local git.
+#
+# Output, one per line (tab-separated): "<label>\t<sha>\t<RELATION>"
+#   MATCHES  — same commit as dev
+#   BEHIND   — ancestor of dev (normal pre-ship lag)
+#   AHEAD    — dev is an ancestor of it (env has commits dev lacks)
+#   DIVERGED — neither is an ancestor of the other
+#   UNKNOWN  — a SHA could not be resolved in the local repo
+#
+# Exit 0 always — this is a read-only classifier, never a blocker.
+#
+# Usage: sha-relation <dev_sha> <label:sha> [<label:sha> ...]
+
+set -uo pipefail
+DEV="${1:-}"; shift || true
+[ -z "$DEV" ] && exit 0
+
+# Outside a git repo, everything is UNKNOWN (but still emit rows so callers
+# get a complete table).
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  for p in "$@"; do
+    printf '%s\t%s\tUNKNOWN\n' "${p%%:*}" "${p#*:}"
+  done
+  exit 0
+fi
+
+# Best-effort fetch so 7-char short_shas resolve. Never block on it.
+git fetch origin --quiet --tags 2>/dev/null || true
+
+resolve() { git rev-parse --verify --quiet "${1}^{commit}" 2>/dev/null; }
+DEV_C="$(resolve "$DEV")"
+
+for pair in "$@"; do
+  label="${pair%%:*}"
+  sha="${pair#*:}"
+  c="$(resolve "$sha")"
+  if [ -z "$DEV_C" ] || [ -z "$c" ]; then
+    rel="UNKNOWN"
+  elif [ "$c" = "$DEV_C" ]; then
+    rel="MATCHES"
+  elif git merge-base --is-ancestor "$c" "$DEV_C" 2>/dev/null; then
+    rel="BEHIND"
+  elif git merge-base --is-ancestor "$DEV_C" "$c" 2>/dev/null; then
+    rel="AHEAD"
+  else
+    rel="DIVERGED"
+  fi
+  printf '%s\t%s\t%s\n' "$label" "$sha" "$rel"
+done
