@@ -2,6 +2,8 @@ You are a deployment pipeline orchestrator. Your job is to deploy stack `$ARGUME
 
 **IMPORTANT: Use Port.io MCP tools for ALL operations. Do NOT use Bash or other tools.**
 
+**Exception (Step 0.5 only):** the environment-drift pre-flight may additionally call local git via `~/.claude/bin/sha-relation` for read-only commit-ancestry classification. All deploy, promote, terraform, and approval operations remain MCP-only.
+
 Follow these steps exactly:
 
 ---
@@ -19,6 +21,31 @@ Deploying: {stack}
 SHA:       {TARGET_SHA}
 Pipeline:  QA → Promote → TF QA → Stage → TF Stage → Prod (auto-approve) → TF Prod → TF Demo
 ```
+
+---
+
+## Step 0.5: Environment Drift Pre-flight
+
+Before deploying, check where every environment currently sits relative to dev, and flag anything that isn't simply behind.
+
+1. Using `list_entities` on `stack_environment_status`, read the `short_sha` of `{stack}-qa`, `{stack}-stage`, `{stack}-prod`, `{stack}-demo` (Step 0 already captured `{stack}-dev` as `TARGET_SHA`). Skip any env entity that doesn't exist.
+2. Classify each against dev with the local git helper (this is the one allowed non-MCP call — see the exception above):
+   ```bash
+   ~/.claude/bin/sha-relation {TARGET_SHA} qa:<qa_sha> stage:<stage_sha> prod:<prod_sha> demo:<demo_sha>
+   ```
+   Each line is `<label>\t<sha>\t<RELATION>` where RELATION ∈ `MATCHES | BEHIND | AHEAD | DIVERGED | UNKNOWN`.
+3. Always display the drift table:
+   ```
+   Env drift (dev @ {TARGET_SHA}):
+   | Env   | short_sha | vs dev          |
+   |-------|-----------|-----------------|
+   | qa    | <sha>     | BEHIND dev      |
+   | stage | <sha>     | MATCHES         |
+   | prod  | <sha>     | ⚠ AHEAD of dev  |
+   | demo  | <sha>     | BEHIND dev      |
+   ```
+4. **Flag rule:** any env whose SHA != dev is drifted. `BEHIND` is the normal pre-ship state (that's why you're shipping) — note it and continue.
+5. **Pause rule:** if ANY env is `AHEAD` or `DIVERGED`, STOP before Step 1 and ask the user to confirm. An env ahead of dev means dev is missing a commit that's already live there — you may be about to ship the wrong baseline. Require an explicit "yes" to proceed. `UNKNOWN` (git couldn't resolve a SHA) → warn but do not hard-block; mention the clone may be behind.
 
 ---
 
