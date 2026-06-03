@@ -1,0 +1,66 @@
+#!/bin/bash
+#
+# stale-prs — list open PRs in the current repo that are being ignored.
+#
+# Prints open PRs that are:
+#   - not drafts
+#   - not authored by the current gh user
+#   - stale: no activity (updatedAt) in more than N days (default 3)
+#
+# One line per PR: "#<num> <title> — <age>d stale, @<author> — <url>".
+# Silent (no output) and exit 0 on any error condition: gh missing, not a
+# repo, not authenticated, or nothing qualifying. This makes it safe to
+# call from a hook — it can never disrupt a session.
+#
+# Usage: stale-prs [DAYS]
+
+set -euo pipefail
+DAYS="${1:-3}"
+
+command -v gh >/dev/null 2>&1 || exit 0
+# Must be inside a GitHub repo with a resolvable remote.
+gh repo view --json nameWithOwner >/dev/null 2>&1 || exit 0
+
+ME="$(gh api user --jq .login 2>/dev/null || true)"
+
+PRS_JSON="$(gh pr list --state open --limit 100 \
+  --json number,title,author,updatedAt,isDraft,url 2>/dev/null || true)"
+[ -z "$PRS_JSON" ] && exit 0
+
+DAYS="$DAYS" ME="$ME" python3 - "$PRS_JSON" <<'PY'
+import sys, json, os, datetime
+
+try:
+    data = json.loads(sys.argv[1] or "[]")
+except (ValueError, IndexError):
+    sys.exit(0)
+
+me = os.environ.get("ME", "")
+try:
+    days = int(os.environ.get("DAYS", "3"))
+except ValueError:
+    days = 3
+
+now = datetime.datetime.now(datetime.timezone.utc)
+threshold = now - datetime.timedelta(days=days)
+
+rows = []
+for pr in data:
+    if pr.get("isDraft"):
+        continue
+    login = (pr.get("author") or {}).get("login", "")
+    if me and login == me:
+        continue
+    try:
+        updated = datetime.datetime.fromisoformat(pr["updatedAt"].replace("Z", "+00:00"))
+    except (KeyError, ValueError):
+        continue
+    if updated >= threshold:
+        continue
+    age = (now - updated).days
+    rows.append((age, pr.get("number"), pr.get("title", ""), login, pr.get("url", "")))
+
+rows.sort(reverse=True)  # most-stale first
+for age, num, title, login, url in rows:
+    print(f"  #{num} {title} — {age}d stale, @{login} — {url}")
+PY
