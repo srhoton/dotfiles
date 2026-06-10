@@ -1,1 +1,1 @@
-ok. Please commit your work, add prompts in this session to the commit via git notes, push it, and using your github mcp integration, create a PR.
+ok. Please commit your work, add prompts in this session to the commit via git notes, push it, and using your github cli tool, create a PR. Make sure the README for the PR accurately describes the changes made from a full diff from the branch you are merging into.

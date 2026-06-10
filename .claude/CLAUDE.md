@@ -14,6 +14,8 @@
 - Always run the full test suite before committing. If tests fail, fix them before proceeding.
 - For Java/Quarkus: run `./gradlew spotlessApply` before committing.
 - Before modifying dependencies (Gradle/npm), verify compatibility with current project versions. Do not move runtime dependencies to compileOnly without confirming they are not needed at build/augmentation time.
+- Before claiming a dependency or version doesn't exist, verify against the actual registry. A 404/failed install for `@fullbay/*` packages is almost always a stale CodeArtifact/SSO token, not a missing package — refresh the token and retry first.
+- Never suggest skipping or bypassing pre-commit hooks (`--no-verify`) to get around a failing install or check. Fix the underlying cause.
 
 ### Pull Requests
 - When creating PRs, check if a referenced PR number is still open. Never update a closed PR -- create a new one.
@@ -27,6 +29,12 @@
 
 ### Environment Configuration
 - Always use the established IDP config library with flat UPPER_SNAKE_CASE keys. Do not create custom YAML config readers or use camelCase/nested YAML structures.
+
+### AWS Commands
+- Before running any AWS CLI command against an environment, confirm the active SSO profile/account matches the intended target (`aws sts get-caller-identity` or check `AWS_PROFILE`, e.g. fb-demo-us-prod/Admin). Never assume the default profile is the right one.
+
+### Debugging
+- When diagnosing 401s/auth failures or other distributed-system errors, consider consumer-side causes (cold-start JWKS fetch blocking, concurrency races, client clock skew) in addition to the issuer/server side before settling on a root cause.
 
 ### Terraform Conventions
 - Never use `count = 0` together with `moved` blocks on the same resource — this causes plan errors.
@@ -72,6 +80,10 @@
 - Use appropriate data structures and algorithms — don't brute-force what has a known better solution.
 - When fixing a bug, fix the root cause, not the symptom.
 - If something I asked for requires error handling or validation to work reliably, include it without asking.
+
+### Code Editing Conventions
+- Never use bulk `sed`/regex edits for code changes. Make targeted, type-aware edits (Edit tool or LSP-assisted) instead — bulk text substitution has injected bugs like `, null` into `Collections.emptyList()` and enum/string mismatches.
+- After any multi-file change, run the build (and tests where fast) before moving on, so mechanical errors surface immediately rather than at commit time.
 
 ### Pattern Discovery
 - Before making changes, search the codebase for existing examples of the pattern being implemented. Show 2-3 examples of how it is currently done, then follow the same conventions. Do not invent new patterns.

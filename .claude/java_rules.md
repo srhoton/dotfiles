@@ -132,6 +132,14 @@ public void processPayment(PaymentRequest request) {
 - Implement integration tests for external dependencies
 - Use test containers for database and service testing
 
+### Test Naming Conventions
+
+- **Use `@DisplayName` annotation for descriptive test names** in the three-part format:
+  - `methodUnderTest - scenario - expectedBehavior`
+  - This provides flexibility for spaces and special characters
+- Test method names should be descriptive but don't need to follow the three-part convention
+- The `@DisplayName` serves as the primary documentation for test intent
+
 ```java
 @QuarkusTest
 public class ItemResourceTest {
@@ -140,11 +148,12 @@ public class ItemResourceTest {
     ItemService itemService;
 
     @Test
-    public void testGetAllItems() {
+    @DisplayName("getAll - valid request with items - should return list of items with 200 status")
+    void getAll_validRequest_returnsItems() {
         // Given
         List<Item> expectedItems = Arrays.asList(new Item(1L, "Test Item"));
         when(itemService.findAll()).thenReturn(expectedItems);
-        
+
         // When/Then
         given()
           .when().get("/items")
@@ -153,6 +162,47 @@ public class ItemResourceTest {
              .body("size()", is(1))
              .body("[0].name", is("Test Item"));
     }
+
+    @Test
+    @DisplayName("getAll - service throws exception - should catch exception and return 500 status")
+    void getAll_serviceException_returns500() {
+        // Given
+        when(itemService.findAll()).thenThrow(new RuntimeException("Database error"));
+
+        // When/Then
+        given()
+          .when().get("/items")
+          .then()
+             .statusCode(500);
+    }
+}
+```
+
+### Test Method Examples
+
+```java
+@Test
+@DisplayName("handleRequest - valid event passed in - should call the service and return null")
+void handleRequest_validEvent_shouldReturnServiceResult() throws Exception {
+    // Test implementation
+}
+
+@Test
+@DisplayName("handleRequest - service layer throws exception - should catch the exception and return null")
+void handleRequest_serviceThrowsException_shouldReturnNull() throws Exception {
+    // Test implementation
+}
+
+@Test
+@DisplayName("tierPayloadToDao() - valid payload - returns mapped PricingTier")
+void tierPayloadToDao_validPayload_returnsMappedPricingTier() {
+    // Test implementation
+}
+
+@Test
+@DisplayName("pricingPayloadToDao() - valid payload with multiple tiers - returns mapped PricingScaleDao")
+void pricingPayloadToDao_validPayloadMultipleTiers_returnsMappedDao() {
+    // Test implementation
 }
 ```
 
