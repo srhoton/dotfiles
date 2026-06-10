@@ -1,5 +1,5 @@
 #!/bin/bash
-# Post-tool-use hook: formats files based on extension after Claude edits them.
+# PostToolUse hook: formats files based on extension after Claude edits them.
 # Reads tool input JSON from stdin. Silent on failure, always exits 0.
 
 shopt -s extglob 2>/dev/null
@@ -11,7 +11,8 @@ FILE_PATH=$(printf '%s' "$INPUT" | python3 -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
-    print(d.get('input', {}).get('file_path', ''))
+    ti = d.get('tool_input') or d.get('input') or {}
+    print(ti.get('file_path', ''))
 except Exception:
     pass
 " 2>/dev/null) || exit 0
@@ -38,7 +39,7 @@ case "$FILE_PATH" in
     command -v terraform &>/dev/null && (cd "$FILE_DIR" && terraform fmt "$FILE_PATH" 2>/dev/null) || true
     ;;
   *.go)
-    gofmt -w "$FILE_PATH" 2>/dev/null || true
+    command -v gofmt &>/dev/null && gofmt -w "$FILE_PATH" 2>/dev/null || true
     ;;
   *.py)
     command -v ruff &>/dev/null && (cd "$FILE_DIR" && ruff format "$FILE_PATH" 2>/dev/null) || true
