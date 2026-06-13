@@ -1,7 +1,7 @@
 ---
 description: Specialized performance reviewer for Java Quarkus applications running in AWS Lambda. Focuses on cold start optimization, native image readiness, memory sizing, and Lambda-specific patterns.
 mode: subagent
-model: anthropic/claude-opus-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 permission:
   edit: deny
   write: deny

@@ -1,7 +1,7 @@
 ---
 description: Analyzes repositories for compliance with Fullbay's accepted Architecture Decision Records (ADRs). Loads ADRs from ~/git/architecture-decisions and checks against target codebase.
 mode: subagent
-model: anthropic/claude-sonnet-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 permission:
   edit: deny
   write: deny

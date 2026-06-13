@@ -1,7 +1,7 @@
 ---
 description: Reviews code quality, ensuring adherence to best practices, linting rules, and testing standards. Used in the SDLC review pipeline after functional review.
 mode: subagent
-model: anthropic/claude-opus-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 permission:
   edit: deny
   write: deny

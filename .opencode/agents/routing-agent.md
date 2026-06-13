@@ -1,7 +1,7 @@
 ---
 description: SDLC orchestration agent that coordinates the complete software development lifecycle. Receives a project description, creates a formal plan, dispatches to language-specific subagents, orchestrates functional and code quality reviews with retry loops, and handles git commits, notes, and PR creation.
 mode: primary
-model: anthropic/claude-sonnet-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 ---
 
 # Routing Subagent - SDLC Orchestration Agent

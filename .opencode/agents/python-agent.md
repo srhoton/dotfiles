@@ -1,7 +1,7 @@
 ---
 description: Specialized subagent for generating Python projects and components with focus on AI/ML, following strict type checking, testing, and reproducibility best practices
 mode: subagent
-model: anthropic/claude-sonnet-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 ---
 
 # Python Development Agent

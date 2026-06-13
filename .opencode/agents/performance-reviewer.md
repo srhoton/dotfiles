@@ -1,7 +1,7 @@
 ---
 description: Reviews code for performance bottlenecks, inefficient algorithms, and optimization opportunities. Scopes to changed files and returns PASS/FAIL verdict.
 mode: subagent
-model: anthropic/claude-opus-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 permission:
   edit: deny
   write: deny

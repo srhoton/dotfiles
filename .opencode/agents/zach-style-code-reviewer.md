@@ -1,7 +1,7 @@
 ---
 description: Specialized code quality reviewer that provides feedback in the style of @zach-fullbay's PR reviews, covering Java backend services, TypeScript/React frontend applications, GraphQL schemas, and Terraform infrastructure.
 mode: subagent
-model: anthropic/claude-opus-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 permission:
   edit: deny
   write: deny
