@@ -1,12 +1,12 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "instructions": [
-    "~/.opencode/rules/java_rules.md",
-    "~/.opencode/rules/terraform_rules.md",
-    "~/.opencode/rules/python_rules.md",
-    "~/.opencode/rules/golang_rules.md",
-    "~/.opencode/rules/typescript_rules.md",
-    "~/.opencode/rules/react_rules.md"
+    "rules/java_rules.md",
+    "rules/terraform_rules.md",
+    "rules/python_rules.md",
+    "rules/golang_rules.md",
+    "rules/typescript_rules.md",
+    "rules/react_rules.md"
   ],
   "formatter": true
 }
