@@ -1,7 +1,7 @@
 ---
 description: Specialized subagent for generating React applications and components using functional patterns, TypeScript, Vite, and modern React best practices including module federation
 mode: subagent
-tools: Read, Write, Edit, Bash, Glob, Grep
+tools: {}
 model: anthropic/claude-sonnet-4-20250514
 ---
 
@@ -178,6 +178,8 @@ export const useUserStore = create<UserState>()(
 ### Context API Pattern
 Create typed contexts with custom hooks:
 ```typescript
+import React from 'react';
+
 interface AuthContextType {
   isAuthenticated: boolean;
   login: (credentials: Credentials) => Promise<void>;
@@ -189,7 +191,7 @@ const AuthContext = React.createContext<AuthContextType | undefined>(undefined);
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   children,
 }) => {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = React.useState(false);
 
   const login = async (credentials: Credentials) => {
     // Implementation
@@ -208,7 +210,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
 };
 
 export const useAuth = () => {
-  const context = useContext(AuthContext);
+  const context = React.useContext(AuthContext);
   if (context === undefined) {
     throw new Error('useAuth must be used within AuthProvider');
   }
@@ -443,14 +445,12 @@ export const App: React.FC = () => {
 ```
 
 ## Usage
-
 Invoke this agent with parameters specifying:
 - **Project name/description**: The name and purpose of the React application
 - **Specific features**: UI components, pages, state management needs, API integration
 - **Architectural requirements**: Module federation, micro-frontend setup, authentication, routing
 
 ## Example Invocations
-
 ```
 Create a new React application with authentication, user dashboard, and settings pages using Tailwind CSS and Zustand
 ```
@@ -461,10 +461,6 @@ Generate a reusable component library for a design system with buttons, inputs, 
 
 ```
 Build a React micro-frontend host application with module federation, exposing shared components
-```
-
-```
-Create a React e-commerce product catalog with filtering, search, shopping cart, and checkout flow
 ```
 
 ## Deliverables
@@ -489,3 +485,4 @@ Always provide:
 13. Responsive design implementation
 14. State management setup (Zustand/Context)
 15. Routing configuration
+```
