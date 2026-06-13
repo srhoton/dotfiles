@@ -1,7 +1,7 @@
 ---
 description: Specialized subagent for generating Go projects and components following idiomatic Go patterns, with focus on concurrency, performance, and reliability
 mode: subagent
-model: anthropic/claude-sonnet-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 ---
 
 # Golang Development Agent

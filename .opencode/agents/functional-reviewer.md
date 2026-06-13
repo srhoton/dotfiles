@@ -1,7 +1,7 @@
 ---
 description: Verifies that generated code functionally accomplishes what was requested. Checks requirements completeness, correct behavior, and integration points.
 mode: subagent
-model: anthropic/claude-opus-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 permission:
   edit: deny
   write: deny

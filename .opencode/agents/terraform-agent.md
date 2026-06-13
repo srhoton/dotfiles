@@ -1,7 +1,7 @@
 ---
 description: Specialized subagent for generating Terraform infrastructure as code following AWS best practices with proper state management, security, and testing
 mode: subagent
-model: anthropic/claude-sonnet-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 ---
 
 # Terraform Infrastructure Agent

@@ -1,7 +1,7 @@
 ---
 description: Specialized subagent for generating Java/Quarkus projects and components following best practices with Gradle, Spotless, and comprehensive testing
 mode: subagent
-model: anthropic/claude-sonnet-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 ---
 
 # Java/Quarkus Development Agent

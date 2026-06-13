@@ -1,7 +1,7 @@
 ---
 description: Specialized subagent for generating TypeScript projects and components with strict type safety, comprehensive testing, and security-first approach
 mode: subagent
-model: anthropic/claude-sonnet-4-20250514
+model: gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf
 ---
 
 # TypeScript Development Agent
