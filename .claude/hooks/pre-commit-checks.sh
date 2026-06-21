@@ -70,10 +70,35 @@ elif [ -f "package.json" ]; then
     RUNNER="npm"
   fi
 
-  echo "Detected Node project (using $RUNNER). Running tests..." >&2
-  if ! "$RUNNER" test 2>&1 >&2; then
-    echo "ERROR: Tests failed. Fix test failures before committing." >&2
-    FAILED=1
+  # TypeScript compile gate — runs before tests since a type error (e.g. TS2741
+  # from a missing field) is a cheaper, earlier signal than a full test run.
+  # Only for actual TS projects (tsconfig.json present); prefer a project script
+  # over a bare tsc so path mappings / project references are respected.
+  if [ -f "tsconfig.json" ]; then
+    echo "Detected TypeScript project. Type-checking..." >&2
+    if grep -q '"typecheck"' package.json; then
+      TS_CMD=("$RUNNER" run typecheck)
+    elif grep -q '"build"' package.json; then
+      TS_CMD=("$RUNNER" run build)
+    elif command -v npx >/dev/null 2>&1; then
+      TS_CMD=(npx --no-install tsc --noEmit)
+    else
+      TS_CMD=()
+    fi
+    if [ "${#TS_CMD[@]}" -gt 0 ]; then
+      if ! "${TS_CMD[@]}" 2>&1 >&2; then
+        echo "ERROR: TypeScript compile (tsc --noEmit) failed. Fix type errors before committing." >&2
+        FAILED=1
+      fi
+    fi
+  fi
+
+  if [ $FAILED -eq 0 ]; then
+    echo "Detected Node project (using $RUNNER). Running tests..." >&2
+    if ! "$RUNNER" test 2>&1 >&2; then
+      echo "ERROR: Tests failed. Fix test failures before committing." >&2
+      FAILED=1
+    fi
   fi
 
 elif [ -f "go.mod" ]; then

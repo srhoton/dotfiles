@@ -13,6 +13,7 @@
 ### Before Committing
 - Always run the full test suite before committing. If tests fail, fix them before proceeding.
 - For Java/Quarkus: run `./gradlew spotlessApply` before committing.
+- For TypeScript: verify `tsc --noEmit` passes (no `TS2741`/type-mismatch errors) before committing — prefer the project's `typecheck`/`build` script. When adding a field to a type/interface, update every companion object and JSON schema fixture (e.g. `*.v1.json`) in the same change so the compile stays green.
 - Before modifying dependencies (Gradle/npm), verify compatibility with current project versions. Do not move runtime dependencies to compileOnly without confirming they are not needed at build/augmentation time.
 - Before claiming a dependency or version doesn't exist, verify against the actual registry. A 404/failed install for `@fullbay/*` packages is almost always a stale CodeArtifact/SSO token, not a missing package — refresh the token and retry first.
 - Never suggest skipping or bypassing pre-commit hooks (`--no-verify`) to get around a failing install or check. Fix the underlying cause.
@@ -32,6 +33,7 @@
 
 ### AWS Commands
 - Before running any AWS CLI command against an environment, confirm the active SSO profile/account matches the intended target (`aws sts get-caller-identity` or check `AWS_PROFILE`, e.g. fb-demo-us-prod/Admin). Never assume the default profile is the right one.
+- Confirm the SSO session isn't expired before starting a long AWS/Terraform task — re-authenticate proactively (`aws sso login --profile <p>`) rather than discovering the expiry mid-run on a rejected call or blocked dependency install.
 
 ### Debugging
 - When diagnosing 401s/auth failures or other distributed-system errors, consider consumer-side causes (cold-start JWKS fetch blocking, concurrency races, client clock skew) in addition to the issuer/server side before settling on a root cause.
@@ -41,6 +43,13 @@
 - Do not change DMS `MaxFullLoadSubTasks` above the current value without explicit approval (known OOM risk).
 - Always run `terraform validate` and `terraform plan` before suggesting a commit.
 - Do not modify IAM roles tagged with governance policies — flag for human approval instead of attempting the change.
+- EventBridge **event-bus** targets reject `retry_policy` and `dead_letter_config` at the `PutTargets` API — omit those blocks for bus-to-bus routing (they're valid only on non-bus targets like Lambda/SQS).
+- Before validating target/permission blocks against AWS, pull the latest state instead of trusting a stale local clone — the API-accepted shape drifts, and a stale clone will generate blocks the live API rejects.
+
+### Descope FGA / Authorization Schemas
+- Validate FGA/ReBAC DSL against the Descope console before considering a schema change done — do not assume the generated syntax is accepted.
+- Common DSL syntax errors to avoid: no bare relation names on the RHS of a relation definition (qualify them), and no `//` comments in the DSL (the parser rejects them).
+- When managing FGA in Terraform, translate the ReBAC requirements into DSL and iterate through console validation rather than trusting a one-shot conversion.
 
 ### Spec-Driven Implementation
 - When implementing from a spec/plan file, read the entire spec first and present a summary plan before making code changes. Make reasonable assumptions and note them rather than asking clarifying questions interactively.
