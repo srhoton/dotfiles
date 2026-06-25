@@ -18,8 +18,14 @@
 - Before claiming a dependency or version doesn't exist, verify against the actual registry. A 404/failed install for `@fullbay/*` packages is almost always a stale CodeArtifact/SSO token, not a missing package — refresh the token and retry first.
 - Never suggest skipping or bypassing pre-commit hooks (`--no-verify`) to get around a failing install or check. Fix the underlying cause.
 
+### Data Validation
+- Validate data-related changes (finance figures, opening balances, parts/order counts, discrepancies) against live data — Athena queries or the relevant live source — before considering the implementation complete. Do not trust the spec's numbers alone.
+- For debugging, the first move is to confirm or refute the reported hypothesis with live evidence (Athena, AppSync/CloudWatch logs, Step Function execution history) before proposing or implementing a fix, and surface that evidence. Refuting a wrong bug report with data is a valid, preferred outcome — never code to a faulty assumption.
+- Reuse the enabled `aws-data-analytics` plugin's `querying-data-lake` (Athena) skill for these queries rather than hand-rolling SQL/CLI.
+
 ### Pull Requests
 - When creating PRs, check if a referenced PR number is still open. Never update a closed PR -- create a new one.
+- Right before opening a PR, merge (or rebase onto) the latest `origin/master`/default branch and re-run the full test suite, so CI breakage from concurrently-merged changes (e.g. strict `toEqual` assertion drift) surfaces locally rather than in the pipeline.
 - For multiline PR bodies, prefer `gh pr create --body-file <tmpfile>` over inline heredocs. Heredocs containing backticks corrupt PR content.
 - Same rule applies to multiline commit messages: write to a tempfile and use `git commit -F <tmpfile>` rather than `-m "$(cat <<EOF ...`.
 
@@ -36,6 +42,7 @@
 - Confirm the SSO session isn't expired before starting a long AWS/Terraform task — re-authenticate proactively (`aws sso login --profile <p>`) rather than discovering the expiry mid-run on a rejected call or blocked dependency install.
 
 ### Debugging
+- Lead with live-data evidence per the Data Validation rule above — confirm or refute the hypothesis before proposing a fix.
 - When diagnosing 401s/auth failures or other distributed-system errors, consider consumer-side causes (cold-start JWKS fetch blocking, concurrency races, client clock skew) in addition to the issuer/server side before settling on a root cause.
 
 ### Terraform Conventions
