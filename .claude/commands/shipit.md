@@ -49,6 +49,22 @@ Before deploying, check where every environment currently sits relative to dev, 
 
 ---
 
+## Step 0.6: Deployment-Freeze / Block Pre-flight
+
+Before deploying, confirm no code freeze or deployment block applies to the target environments (qa, stage, prod, demo). Read-only.
+
+1. Read the stack's scope once: `list_entities` on `stack` for `{stack}`, include `$team` and the `domain` relation — needed to evaluate team/domain-scoped blocks.
+2. `list_entities` on `environment` for identifiers `qa, stage, prod, demo`, include `deployment_freeze`, `is_production`. Flag any target env with `deployment_freeze = true`.
+3. `list_entities` on `deployment_block` where `status` in `[active, scheduled]`. A block **applies** to a target env when ALL of its set scopes match:
+   - `environment` relation is empty OR equals the target env,
+   - `stack` relation is empty OR equals `{stack}`,
+   - `domain` relation is empty OR equals the stack's domain,
+   - `team` is empty OR equals the stack's team,
+   - and for `scheduled` blocks, `starts_at ≤ now ≤ ends_at` (an unset `ends_at` means indefinite).
+4. **Pause rule:** if any target env is frozen (`deployment_freeze = true`) or has an applicable block, STOP before Step 1. Print each: env, block `reason`, window (`starts_at`–`ends_at`), and `created_by`. Require an explicit breakglass "yes" to proceed (this is the breakglass explanation the block expects). If nothing applies, print "No deployment freeze/blocks on target envs" and continue.
+
+---
+
 ## CRITICAL: SHA Verification After Every Deploy Step
 
 Port actions return SUCCESS when the webhook fires, NOT when the Harness pipeline completes. The Harness pipeline runs asynchronously. This means the target environment entity's `short_sha` won't update until the Harness pipeline finishes.
@@ -107,11 +123,7 @@ After action SUCCESS, display: "Step 2/8: Promote Artifacts -- SUCCESS"
 
 Display: "Step 3/8: Terraform Apply QA..."
 
-Poll until complete. During polling, also check for terraform approval gates:
-- Search `deployment` blueprint for entities where `stack` relation contains the stack name, `approval_status = AWAITING_APPROVAL`, and `env = qa`
-- If found, run `approve_pipeline` on each with `{"reason": "Auto-approved via shipit CLI"}`
-
-On failure, stop.
+Poll until complete. During polling, handle any approval gates per the **Approval Gate Handling** section (env = qa). On failure, stop.
 
 ---
 
@@ -140,7 +152,7 @@ After action SUCCESS, verify the SHA landed:
 
 Display: "Step 5/8: Terraform Apply Stage..."
 
-Poll until complete. During polling, check for terraform approval gates (same pattern as Step 3 but with `env = stage`). On failure, stop.
+Poll until complete. During polling, handle any approval gates per the **Approval Gate Handling** section (env = stage). On failure, stop.
 
 ---
 
@@ -157,13 +169,7 @@ This step requires special handling because the Harness pipeline has approval ga
 1. Fire the action and get the run ID
 2. Enter a poll loop (every 30 seconds):
    a. Check `track_action_run` for the run status
-   b. If still IN_PROGRESS, search the `deployment` blueprint for entities where:
-      - `stack` relation contains the stack name
-      - `approval_status` = `AWAITING_APPROVAL`
-      - `env` = `prod`
-   c. For EACH entity found with `approval_status = AWAITING_APPROVAL`, run `approve_pipeline` with:
-      - `{"reason": "Auto-approved via shipit CLI"}`
-   d. There may be multiple approval gates (canary 10%, full traffic 100%) — approve each as they appear
+   b. If still IN_PROGRESS, handle any approval gates per the **Approval Gate Handling** section (env = prod). This surfaces the terraform `plan_summary` before approving and pauses on a destructive prod plan; blue-green canary 10%/100% gates auto-approve.
 3. When the run reaches SUCCESS or FAILURE, exit the loop
 
 After action SUCCESS, verify the SHA landed:
@@ -183,7 +189,7 @@ On failure, stop.
 
 Display: "Step 7/8: Terraform Apply Prod..."
 
-Poll until complete. Check for terraform approval gates (same pattern, `env = prod`). On failure, stop.
+Poll until complete. Handle any approval gates per the **Approval Gate Handling** section (env = prod) — the prod terraform `plan_summary` is shown before approving, and a destructive plan pauses for confirmation. On failure, stop.
 
 ---
 
@@ -195,7 +201,18 @@ Poll until complete. Check for terraform approval gates (same pattern, `env = pr
 
 Display: "Step 8/8: Terraform Apply Demo..."
 
-Poll until complete. Check for terraform approval gates (same pattern, `env = demo`). On failure, stop.
+Poll until complete. Handle any approval gates per the **Approval Gate Handling** section (env = demo). On failure, stop.
+
+---
+
+## Post-Deploy Health Check (read-only)
+
+After the prod SHA is confirmed, verify prod runtime health before declaring success. Best-effort — never blocks or auto-remediates.
+
+1. `list_entities` on `canary` where `relation stack = {stack}`, `environment = prod`, include `health`, `success_percentage`, `last_run_at`.
+2. `list_entities` on `slo` where `relation stack = {stack}`, `environment = prod`, include `slo_status`, `slo_attainment`, `slo_goal`.
+3. If `canary.health = DEGRADED` or `slo.slo_status` in `[BREACHED, BREACHING]`, flag loudly and recommend the `rollback_environment` action (`{"target_sha": <previous known-good SHA>, "reason": ...}`) — present it, do NOT fire it.
+4. If no `canary`/`slo` entities exist for the stack, print "no canary/SLO configured for {stack} — skipping health check" and continue.
 
 ---
 
@@ -219,6 +236,18 @@ shipit complete: {stack} @ {TARGET_SHA}
 ```
 
 ---
+
+## Approval Gate Handling
+
+Whenever a step says to handle approval gates, use the dedicated `pipeline_approval` blueprint (NOT the `deployment` blueprint):
+
+1. `list_entities` on `pipeline_approval` where `relation stack = {stack}`, `environment = {env}`, and `approval_status = AWAITING_APPROVAL`.
+2. For each gate, branch on `approval_type`:
+   - `bluegreen_10pct` / `bluegreen_100pct` → auto-approve: run `approve_pipeline` on that entity with `{"reason": "Auto-approved via shipit CLI"}`.
+   - `terraform_approval` → first DISPLAY the gate's `plan_summary` (e.g. `+3 ~1 -0`) and `pipeline_url`. Then:
+     - If `env = prod` AND the plan shows deletions (the `-N` count is > 0), STOP and require an explicit "yes" from the user before approving — a destructive prod plan must never be auto-approved.
+     - Otherwise run `approve_pipeline` with `{"reason": "Auto-approved via shipit CLI"}`.
+3. A single step may raise multiple gates (e.g. canary 10% then 100%) — re-query and handle each as it appears until the run reaches a terminal state.
 
 ## Polling Rules
 
