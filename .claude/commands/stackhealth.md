@@ -1,6 +1,6 @@
 Report the service-health and ship-readiness of a Port.io stack from its live `stack` entity — coverage, scorecard level, DORA/ops metrics, and dependency drift.
 
-`$ARGUMENTS` is the stack name (e.g. `mig-wor-mg-fun`). If empty, default to `basename "$PWD"`.
+`$ARGUMENTS` is the stack name (e.g. `mig-wor-mg-fun`). If empty, default to `basename "$PWD"`; if that isn't a Port stack, ask the user.
 
 **This is read-only. Use the Port MCP for all reads. Never trigger an action.**
 
@@ -18,4 +18,4 @@ Procedure:
 
 5. Optional current state: `list_entities` on `stack_environment_status` for `<stack>-dev` and `<stack>-prod`, include `promotable`, `integration_test_status`, `short_sha` — so the report shows whether the stack is currently promotable and tests are green.
 
-6. Output a compact table/bullets and a one-line **ship-readiness verdict** (e.g. "Silver; coverage gates green; 5 major-drifted deps, 0 EOL; 0 incidents/30d — safe to ship, drift is non-blocking"). If detail would exceed ~150 lines, write it to `~/.claude/scratch/<stack>/stackhealth-<ISO8601>.md` and post the verdict + path, per the Output Token Discipline rule.
+6. Output a compact table/bullets and a one-line **ship-readiness verdict** (e.g. "Silver; coverage gates green; 5 major-drifted deps, 0 EOL; 0 incidents/30d — safe to ship, drift is non-blocking"). If detail would exceed ~150 lines, write it to `~/.claude/scratch/<stack>/stackhealth-<ISO8601>.md` and post the verdict + path, per the Output Token Discipline rule. (Scratch is scoped by **stack** here — a deliberate override of that rule's `<repo-basename>` default, since this command targets a Port stack, not the cwd repo.)

@@ -19,7 +19,7 @@ Display:
 ```
 Deploying: {stack}
 SHA:       {TARGET_SHA}
-Pipeline:  QA → Promote → TF QA → Stage → TF Stage → Prod (auto-approve) → TF Prod → TF Demo
+Pipeline:  QA → Promote → TF QA → Stage → TF Stage → Prod (canary gates auto-approve; destructive TF pauses) → TF Prod → TF Demo
 ```
 
 ---
@@ -39,11 +39,13 @@ Before deploying, check where every environment currently sits relative to dev, 
    Env drift (dev @ {TARGET_SHA}):
    | Env   | short_sha | vs dev          |
    |-------|-----------|-----------------|
+   | dev   | <sha>     | (base)          |
    | qa    | <sha>     | BEHIND dev      |
    | stage | <sha>     | MATCHES         |
    | prod  | <sha>     | ⚠ AHEAD of dev  |
    | demo  | <sha>     | BEHIND dev      |
    ```
+   (Same format as `/envdrift`, including the `(base)` dev row.)
 4. **Flag rule:** any env whose SHA != dev is drifted. `BEHIND` is the normal pre-ship state (that's why you're shipping) — note it and continue.
 5. **Pause rule:** if ANY env is `AHEAD` or `DIVERGED`, STOP before Step 1 and ask the user to confirm. An env ahead of dev means dev is missing a commit that's already live there — you may be about to ship the wrong baseline. Require an explicit "yes" to proceed. `UNKNOWN` (git couldn't resolve a SHA) → warn but do not hard-block; mention the clone may be behind.
 
@@ -72,10 +74,9 @@ Port actions return SUCCESS when the webhook fires, NOT when the Harness pipelin
 **After every deploy action (Steps 1, 4, 6), you MUST verify the SHA landed before proceeding:**
 
 1. Wait for the Port action run to reach SUCCESS
-2. Then poll the TARGET environment entity (e.g., `{stack}-qa` after deploy to QA) every 30 seconds
+2. Then poll the TARGET environment entity (e.g., `{stack}-qa` after deploy to QA) at the cadence/cap defined in the **Polling Rules** section below
 3. Check if its `short_sha` property matches `TARGET_SHA`
-4. Only proceed to the next step once the SHA matches
-5. Maximum 40 polls (20 minutes) before timing out
+4. Only proceed to the next step once the SHA matches (or the step times out per Polling Rules)
 
 This ensures the Harness pipeline has actually finished and the entity state is updated before subsequent steps read from it.
 
@@ -156,20 +157,20 @@ Poll until complete. During polling, handle any approval gates per the **Approva
 
 ---
 
-## Step 6: Deploy to Prod (with Auto-Approve)
+## Step 6: Deploy to Prod (blue-green; canary gates auto-approve)
 
 - Action: `deploy_to_prod`
 - Entity: `{stack}-stage`
 - Properties: `{"confirm": true, "approval_reason": "Routine deployment via shipit CLI"}`
 
-Display: "Step 6/8: Deploying to Prod (blue-green with auto-approve)..."
+Display: "Step 6/8: Deploying to Prod (blue-green; canary gates auto-approve)..."
 
 This step requires special handling because the Harness pipeline has approval gates:
 
 1. Fire the action and get the run ID
 2. Enter a poll loop (every 30 seconds):
    a. Check `track_action_run` for the run status
-   b. If still IN_PROGRESS, handle any approval gates per the **Approval Gate Handling** section (env = prod). This surfaces the terraform `plan_summary` before approving and pauses on a destructive prod plan; blue-green canary 10%/100% gates auto-approve.
+   b. If still IN_PROGRESS, handle any approval gates per the **Approval Gate Handling** section (env = prod). A `deploy_to_prod` run raises only the blue-green canary gates (`bluegreen_10pct` / `bluegreen_100pct`), which auto-approve. (The destructive-plan pause applies to the `terraform_approval` gate in Step 7, not here.)
 3. When the run reaches SUCCESS or FAILURE, exit the loop
 
 After action SUCCESS, verify the SHA landed:
@@ -212,7 +213,8 @@ After the prod SHA is confirmed, verify prod runtime health before declaring suc
 1. `list_entities` on `canary` where `relation stack = {stack}`, `environment = prod`, include `health`, `success_percentage`, `last_run_at`.
 2. `list_entities` on `slo` where `relation stack = {stack}`, `environment = prod`, include `slo_status`, `slo_attainment`, `slo_goal`.
 3. If `canary.health = DEGRADED` or `slo.slo_status` in `[BREACHED, BREACHING]`, flag loudly and recommend the `rollback_environment` action (`{"target_sha": <previous known-good SHA>, "reason": ...}`) — present it, do NOT fire it.
-4. If no `canary`/`slo` entities exist for the stack, print "no canary/SLO configured for {stack} — skipping health check" and continue.
+4. If `canary.health = UNKNOWN`, or `slo.slo_status` in `[WARNING, INSUFFICIENT_DATA]`, report it as **inconclusive — verify manually** (do not treat as healthy, do not recommend rollback). `HEALTHY`/`OK` → report healthy.
+5. If no `canary`/`slo` entities exist for the stack, print "no canary/SLO configured for {stack} — skipping health check" and continue.
 
 ---
 
