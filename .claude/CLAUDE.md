@@ -41,6 +41,14 @@
 - Before running any AWS CLI command against an environment, confirm the active SSO profile/account matches the intended target (`aws sts get-caller-identity` or check `AWS_PROFILE`, e.g. fb-demo-us-prod/Admin). Never assume the default profile is the right one.
 - Confirm the SSO session isn't expired before starting a long AWS/Terraform task — re-authenticate proactively (`aws sso login --profile <p>`) rather than discovering the expiry mid-run on a rejected call or blocked dependency install.
 
+### AWS Agent Toolkit
+- Prefer the AWS MCP Server (the `aws-core`/`aws-agents`/`aws-data-analytics` plugins) over raw `aws` CLI calls — it gives sandboxed execution, observability, and audit logging. Fall back to the CLI only when the MCP server is unavailable.
+- Skill-first: before an AWS task, load the relevant bundled skill (`retrieve_skill` via the AWS-knowledge MCP, or the `Skill` tool for `aws-core:*`/`aws-data-analytics:*` skills) and follow its guidance rather than reasoning from general knowledge.
+- **Secrets Manager (hard rule):** for any secret/credential/API-key/token/password task, load the `aws-secrets-manager` skill first and follow it. Do NOT call `secretsmanager get-secret-value`/`batch-get-secret-value` or hit the Secrets Manager Agent daemon directly — the secret would enter context. Use the skill's runtime-resolution pattern (`{{resolve:secretsmanager:<secret-id>:SecretString:<json-key>}}`, resolved at deploy/runtime) so the value never lands in context.
+- IaC over ad-hoc mutation: create/modify AWS infrastructure through Terraform (per @~/.claude/terraform_rules.md and the Terraform Conventions above), not one-off CLI mutations. (The AWS toolkit suggests CDK/CloudFormation — we standardize on Terraform.)
+- Do not use em dashes in AWS resource names or descriptions — use hyphens.
+- Keep the AWS plugins current: periodically run `/plugin marketplace update` then `/reload-plugins`. The `agent-toolkit-for-aws` marketplace ships new plugins/skills (e.g. `aws-agents-for-devsecops`) that a stale local clone won't surface.
+
 ### Debugging
 - Lead with live-data evidence per the Data Validation rule above — confirm or refute the hypothesis before proposing a fix.
 - When diagnosing 401s/auth failures or other distributed-system errors, consider consumer-side causes (cold-start JWKS fetch blocking, concurrency races, client clock skew) in addition to the issuer/server side before settling on a root cause.
