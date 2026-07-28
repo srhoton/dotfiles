@@ -8,6 +8,13 @@
 - Typescript coding rules @~/.claude/typescript_rules.md
 - React coding rules @~/.claude/react_rules.md
 
+## Investigation Scope
+
+- When I give you a concrete artifact — a Step Function execution ARN, entity ID, S3 path, file path, PR number, Jira ticket, log line — **start there. Read it and exhaust it before any broad search, grep sweep, or subagent dispatch. The named artifact IS the research.**
+- Do not fan out across sibling repos or spawn discovery subagents until the supplied artifact has been read and proven insufficient. If it is insufficient, say specifically what is missing and ask before widening scope.
+- Subagents for parallel **review** and **counting/aggregation**: fine at any time. Subagents for **discovery/exploration**: only after the supplied artifact is exhausted.
+- When I name a single repo or file, stay in it. Do not go check "how the sibling service does it" unless I ask.
+
 ## Workflow Rules
 
 ### Before Committing
@@ -22,6 +29,7 @@
 - Validate data-related changes (finance figures, opening balances, parts/order counts, discrepancies) against live data — Athena queries or the relevant live source — before considering the implementation complete. Do not trust the spec's numbers alone.
 - For debugging, the first move is to confirm or refute the reported hypothesis with live evidence (Athena, AppSync/CloudWatch logs, Step Function execution history) before proposing or implementing a fix, and surface that evidence. Refuting a wrong bug report with data is a valid, preferred outcome — never code to a faulty assumption.
 - Reuse the enabled `aws-data-analytics` plugin's `querying-data-lake` (Athena) skill for these queries rather than hand-rolling SQL/CLI.
+- Do not infer schema, table names, bucket names, or config placement from git history, closed PRs, or sibling repos — those are frequently stale. Verify against the live source and state the query and its actual result.
 
 ### Pull Requests
 - When creating PRs, check if a referenced PR number is still open. Never update a closed PR -- create a new one.
@@ -79,7 +87,7 @@
 - Standard end-to-end flow: implement → tests pass → self-review (`/review`) → commit with git notes → push → open PR → address review → ship through dev/stage/prod/demo via Port.io (`/shipit`).
 - **Port.io cache flicker**: action runs can oscillate between IN_PROGRESS and SUCCESS during polling. Poll the same state 2-3 times before reporting a final terminal state.
 - **Stale SHAs in deploys**: before triggering a deploy or terraform apply, confirm the target entity's `short_sha` matches the expected commit on origin. If misaligned, wait 30s and re-fetch — do not fire the action against a stale entity.
-- **Approval gate polling**: treat `approval_status = null` as pending, not failed. Retry up to 5x with 20s backoff before assuming the gate is broken.
+- **Approval gate polling**: treat `approval_status = null` as pending, not failed. `commands/shipit.md` is authoritative for the pipeline's backoff, attempt caps, and stale-gate handling — follow it rather than improvising a retry count here.
 
 ### New Lambda Repos
 - Every new Node/TypeScript Lambda project must include a `.npmrc` configured for the @fullbay AWS CodeArtifact registry before the first PR is opened. Missing this file is the single most common CI failure pattern (`npm install` returns 404 for `@fullbay/*` packages and the pipeline fails at the install step).
@@ -89,6 +97,7 @@
 
 - When the user asks for an investigation, write-up, or findings document, document the findings — do not attempt fixes unless explicitly asked.
 - Avoid interactive clarifying questions during plan-writing phases; make a reasonable assumption and note it instead.
+- Raise decisions and clarifying questions **before** implementing, not after. Once work is delivered, do not end the turn with `AskUserQuestion` — close with a short written summary (what changed, evidence, PR/ticket links) plus a bulleted **suggested next steps** list I can pick from.
 
 ### Output Token Discipline
 
@@ -110,13 +119,15 @@
 - After any multi-file change, run the build (and tests where fast) before moving on, so mechanical errors surface immediately rather than at commit time.
 
 ### Pattern Discovery
-- Before making changes, search the codebase for existing examples of the pattern being implemented. Show 2-3 examples of how it is currently done, then follow the same conventions. Do not invent new patterns.
+- **When writing new code that should follow an existing convention**, search for 2-3 existing examples first and follow them rather than inventing a new pattern. This applies to *authoring* code — it does NOT apply to investigating an artifact I named (see Investigation Scope).
+- **Reuse before creating**: before adding a utility or helper, grep for an existing one (e.g. `rg 'normalize|<helper-name>' src/ constants.ts`). Do not create a parallel implementation of something that already exists.
 
 ## Claude Code Behaviour Guidelines
 
 - Avoid ownership-dodging behaviour: if you encounter an issue, take responsibility for it and work towards a solution instead of passing it on to someone else. Don't say things like "not caused by my changes" or say that it's "a pre-existing issue". Instead, acknowledge the problem and take initiative to fix it. Also, don't give up with excuses like "known limitation" and don't mark it for "future work".
 - Avoid premature stopping: if you encounter a problem, don't stop at the first obstacle. Instead, keep pushing forward and find a way to overcome it. Don't say things like "good stopping point" or "natural checkpoint". Instead, keep going until you have a complete solution.
 - Avoid permission-seeking behaviour: if you have the knowledge and capability to solve a problem, push through. Don't say things like "should I continue?" or "want me to keep going?". Instead, take initiative and act towards the solution.
+- **Escalate instead of grinding — these are NOT premature stopping.** Stop and report when: (a) you are blocked on an external approval gate, third-party latency, or expired credentials after a bounded number of attempts — never retry the same failing call in a loop (see the `/shipit` polling budget); (b) live evidence contradicts the ticket, spec, or my stated premise — surface the contradiction instead of coding to a wrong assumption; (c) an action is destructive or irreversible and needs my confirmation. Grinding past these wastes my time. The anti-stopping rule above applies to ordinary obstacles only.
 - Do plan multi-step approaches before acting (plan which files to read and in what order, which tools to use, etc).
 - Do recall and apply project-specific conventions from CLAUDE.md files.
 - Do catch your own mistakes by applying reasoning loops and self-checks, and fix them before committing or asking for help.
@@ -125,15 +136,14 @@
 
 Adhere to the following guidelines when using tools:
 
-- Always use a **Research-First approach**: Before using any tool, conduct thorough research to understand the context and requirements. This ensures that you use the most appropriate tool for the task at hand. Never use an Edit-First approach. You should prefer making surgical edits to the codebase instead of rewriting whole files or doing large, sweeping changes.
-- Use **Reasoning Loops** very frequently. Don't be lazy and skip them. Reasoning loops are essential for ensuring the quality and accuracy of your work.
+- **Research proportionate to uncertainty**: how much you research scales with how unclear the task is. When I have named the artifact, file, or symbol, reading it *is* the research — go there first (see Investigation Scope). Reserve broad exploration for genuinely open-ended questions. Always prefer surgical edits over rewriting whole files or sweeping changes.
 - **LSP-first for symbol-level questions**: when working in a file type with an active LSP (Java via jdtls, TypeScript via typescript-lsp, Python via pyright), prefer LSP capabilities — find-references, go-to-definition, workspace-symbols, diagnostics — over grep + build cycles. LSPs distinguish overloads, inheritance, and imported vs local symbols where grep can't. Keep grep for text/comment/config searches and for languages without an active LSP (Terraform, shell, YAML).
 - **WebSearch / WebFetch for unfamiliar territory**: when debugging an error message you don't recognize, working with an unfamiliar library API, or looking up AWS service behavior, use WebSearch followed by WebFetch on the most authoritative result. Prefer official docs over Stack Overflow. The `/docs <topic>` skill wraps this pattern.
 
 ### Thinking Depth
 
-When working on tasks that require complex problem-solving, always apply the highest **level of thinking depth**.
+Apply deep thinking to genuinely hard problems — ambiguous root causes, architectural trade-offs, subtle correctness questions. Shallow thinking defaults to the cheapest available action, which is how wrong diagnoses happen.
 
-When thinking is shallow, the model outputs to the cheapest action available. We don't want that. We don't mind consuming more tokens if it means a better output. So always apply the highest level of thinking depth.
+Depth means quality of reasoning, not breadth of file reads. Thinking hard about the artifact I gave you beats scanning ten files I didn't ask about.
 
-Never reason from assumptions, always reason from the actual data. You need to read and understand the actual code, publication or documentation in order to make informed decisions. Don't rely on assumptions or guesses, as they can lead to mistakes and misunderstandings.
+Never reason from assumptions, always reason from the actual data. Read and understand the actual code, execution, or documentation before deciding. Don't rely on guesses.

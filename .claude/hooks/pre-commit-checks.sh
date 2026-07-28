@@ -5,7 +5,10 @@
 # Intercepts `git commit` Bash commands and runs formatters + tests
 # before allowing the commit to proceed.
 #
-# Reads tool input JSON from stdin. Exits 0 to allow, non-zero to block.
+# Reads tool input JSON from stdin. Exit 0 allows; **exit 2 blocks**.
+# NOTE: Claude Code only treats exit 2 as blocking for PreToolUse — exit 1 is a
+# non-blocking error and the tool call proceeds anyway. This script used to
+# exit 1, which meant every gate below was silently advisory.
 #
 
 shopt -s extglob 2>/dev/null
@@ -148,7 +151,7 @@ fi
 if [ $FAILED -ne 0 ]; then
   echo "" >&2
   echo "Pre-commit checks FAILED. Commit blocked." >&2
-  exit 1
+  exit 2
 fi
 
 echo "Pre-commit checks passed." >&2

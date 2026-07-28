@@ -244,20 +244,43 @@ shipit complete: {stack} @ {TARGET_SHA}
 Whenever a step says to handle approval gates, use the dedicated `pipeline_approval` blueprint (NOT the `deployment` blueprint):
 
 1. `list_entities` on `pipeline_approval` where `relation stack = {stack}`, `environment = {env}`, and `approval_status = AWAITING_APPROVAL`.
-2. For each gate, branch on `approval_type`:
+2. **Re-fetch immediately before every `approve_pipeline` call** and confirm the gate is *still* `AWAITING_APPROVAL`. Stale gate entities are a real, observed race — approving one that has already moved on produces a spurious failure that looks like a broken gate.
+3. For each gate, branch on `approval_type`:
    - `bluegreen_10pct` / `bluegreen_100pct` → auto-approve: run `approve_pipeline` on that entity with `{"reason": "Auto-approved via shipit CLI"}`.
    - `terraform_approval` → first DISPLAY the gate's `plan_summary` (e.g. `+3 ~1 -0`) and `pipeline_url`. Then:
      - If `env = prod` AND the plan shows deletions (the `-N` count is > 0), STOP and require an explicit "yes" from the user before approving — a destructive prod plan must never be auto-approved.
      - Otherwise run `approve_pipeline` with `{"reason": "Auto-approved via shipit CLI"}`.
-3. A single step may raise multiple gates (e.g. canary 10% then 100%) — re-query and handle each as it appears until the run reaches a terminal state.
+4. A single step may raise multiple gates (e.g. canary 10% then 100%) — re-query and handle each as it appears until the run reaches a terminal state.
+
+### Gate failure classification and attempt budget
+
+Classify every failed/unchanged gate interaction before reacting:
+
+| Class | Meaning | Action |
+|---|---|---|
+| `NOT_READY` | gate absent or `approval_status = null` | keep waiting (backoff below) — this is normal, not a failure |
+| `STALE_ENTITY` | the entity moved on / no longer `AWAITING_APPROVAL` | re-query for a fresh entity, do **not** retry the old one |
+| `APPROVAL_NEEDED` | destructive prod TF plan, per the rule above | ask the user **once**, then wait for their answer |
+| `HARD_FAILURE` | `approve_pipeline` returned an error | count it against the attempt budget |
+
+**Attempt budget — never loop:**
+- **Backoff** between poll cycles: 15s → 30s → 60s, capped at 2 minutes. Do not poll on a fixed tight interval.
+- **Per-gate wall-clock cap: 10 minutes.** On expiry, treat as `HARD_FAILURE`.
+- **After 3 consecutive `HARD_FAILURE` approval attempts on the same gate, STOP.** Print the gate identifier, `approval_type`, `pipeline_url`, the last error verbatim, and the current per-environment SHA table, then ask the user how to proceed. **Never retry the same failing call a fourth time.**
+
+Stopping here is required behavior, not premature stopping — see the escalation exception in CLAUDE.md (Claude Code Behaviour Guidelines). Burning turns on a spinning gate is the failure mode this budget exists to prevent.
 
 ## Polling Rules
+
+This section is **authoritative** for the pipeline's polling behavior (CLAUDE.md defers to it).
 
 - Poll `track_action_run` every 30 seconds for action completion
 - Poll entity `short_sha` every 30 seconds for SHA verification after deploy steps
 - Maximum 40 polls per step (20 minutes) before timing out
+- **Overall run budget: 90 minutes.** If the whole pipeline exceeds it, stop and report which steps landed rather than continuing to poll.
 - On timeout, report the step as TIMED_OUT and stop
-- During prod deploy and terraform steps, also poll for approval gates every cycle
+- During prod deploy and terraform steps, also poll for approval gates every cycle — using the backoff and 3-attempt budget in **Gate failure classification** above, not a tight loop
+- **Report state changes, not every poll.** Emit a line only when something actually changes (status transition, SHA landed, gate appeared); silent cycles need no output.
 
 ## Failure Behavior
 

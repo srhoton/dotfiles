@@ -3,7 +3,7 @@
   "permissions": {
     "defaultMode": "auto"
   },
-  "model": "claude-fable-5[1m]",
+  "model": "opus",
   "hooks": {
     "SessionStart": [
       {
@@ -29,6 +29,21 @@
             "type": "command",
             "command": "bash /Users/steverhoton/.claude/hooks/pre-commit-checks.sh",
             "timeout": 120000
+          },
+          {
+            "type": "command",
+            "command": "bash /Users/steverhoton/.claude/hooks/guard-destructive-git.sh",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "bash /Users/steverhoton/.claude/hooks/guard-aws-sso.sh",
+            "timeout": 15000
+          },
+          {
+            "type": "command",
+            "command": "bash /Users/steverhoton/.claude/hooks/guard-pr-state.sh",
+            "timeout": 15000
           }
         ]
       }
@@ -100,7 +115,8 @@
     "typescript-lsp@claude-plugins-official": true,
     "aws-core@agent-toolkit-for-aws": true,
     "aws-agents@agent-toolkit-for-aws": true,
-    "aws-data-analytics@agent-toolkit-for-aws": true
+    "aws-data-analytics@agent-toolkit-for-aws": true,
+    "gopls-lsp@claude-plugins-official": true
   },
   "extraKnownMarketplaces": {
     "thedotmack": {
@@ -117,6 +133,7 @@
     }
   },
   "alwaysThinkingEnabled": true,
+  "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "theme": "light",
   "verbose": true,
