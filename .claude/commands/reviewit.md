@@ -37,7 +37,7 @@ gh pr checkout $ARGUMENTS
 
 ## Step 2: Run Reviews in Parallel
 
-Dispatch **four Task calls in a single message** so they run simultaneously:
+Dispatch **five Task calls in a single message** so they run simultaneously:
 
 **Task A — functional-reviewer subagent:**
 - Provide the PR title and body as "the user's stated requirements / intent"
@@ -56,13 +56,17 @@ Dispatch **four Task calls in a single message** so they run simultaneously:
 - Provide the list of changed files (paths only)
 - Instruct: "Review ONLY the changed files listed below for performance bottlenecks, inefficient algorithms, and optimization opportunities. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what the performance issue is and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
 
+**Task E — data-side-effects-reviewer subagent:**
+- Provide the list of changed files (paths only)
+- Instruct: "Review ONLY the changed files listed below for blast radius on already-persisted data: changes to hashes / sourceHash / checksums / idempotency keys / dedup keys / ID derivation that would re-key or re-flag already-migrated records; unguarded status or flag overwrites; schema or version bumps whose companion artifacts (JSON schema files, fixtures, contracts) were not updated in the same change; and re-run/backfill safety. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what changes for existing data, the blast radius, and how to fix it). Format each finding as a clearly delimited block so they can be parsed. If the change touches no persistence, identity, status, or schema surface, say so in one line rather than manufacturing findings."
+
 ---
 
 ## Step 3: Aggregate and Filter
 
-Once all four reviews return:
+Once all five reviews return:
 
-1. Parse findings from all four reviewers
+1. Parse findings from all five reviewers
 2. Separate into two buckets:
    - **Actionable** = CRITICAL and HIGH severity findings
    - **Informational** = MEDIUM and LOW severity findings
@@ -71,7 +75,7 @@ Once all four reviews return:
    - `file`: relative path
    - `line`: line number
    - `body`: the finding description + suggested fix
-   - `source`: "functional" / "quality" / "adr" / "performance" / combination (e.g. "quality+performance")
+   - `source`: "functional" / "quality" / "adr" / "performance" / "data-side-effects" / combination (e.g. "quality+performance")
 
 Display the MEDIUM/LOW findings in the terminal as an informational summary (not proposed as PR comments).
 
@@ -110,7 +114,7 @@ gh api repos/{owner}/{repo}/pulls/{number}/comments \
 
 **Suggested fix:** <suggestion>
 
-_Reviewed by Claude (functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + performance-reviewer)_" \
+_Reviewed by Claude (functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + performance-reviewer + data-side-effects-reviewer)_" \
   -f path="<file>" \
   -F line=<line> \
   -f commit_id="<head_sha>" \
@@ -126,7 +130,7 @@ gh pr comment $ARGUMENTS --body "**[SEVERITY]** \`file:line\`
 
 **Suggested fix:** <suggestion>
 
-_Reviewed by Claude (functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + performance-reviewer)_"
+_Reviewed by Claude (functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + performance-reviewer + data-side-effects-reviewer)_"
 ```
 
 ---

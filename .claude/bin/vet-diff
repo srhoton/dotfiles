@@ -1,0 +1,136 @@
+#!/bin/bash
+#
+# vet-diff — deterministic checks on CHANGED code, run before any LLM reviewer.
+#
+# Purpose: catch the mechanically-detectable defect classes at the edit/commit
+# boundary instead of two review rounds later. Deliberately scoped to changed
+# files (and, for the regex check, to ADDED lines) so pre-existing debt in
+# untouched code can never block a commit.
+#
+# Usage:
+#   vet-diff --staged        # staged changes only (commit gate)
+#   vet-diff                 # all changes vs the default branch + working tree
+#   vet-diff --base <ref>    # explicit base ref
+#
+# Checks:
+#   1. eslint (errors only) on changed JS/TS files. SKIPPED, not failed, when
+#      the project has no eslint config — 9 of 40 mig-* repos have none.
+#   2. ReDoS nested-quantifier heuristic (./redos-scan) on ADDED lines. This is
+#      the only ReDoS coverage in the 21 repos lacking eslint-plugin-security;
+#      where that plugin IS installed, check 1 is the real detector.
+#
+# Exit 0 = clean (or nothing applicable). Exit 1 = findings.
+#
+
+set -uo pipefail
+
+MODE="worktree"
+BASE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --staged) MODE="staged"; shift ;;
+    --base)   BASE="${2:-}"; shift 2 ;;
+    *)        shift ;;
+  esac
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+  echo "vet-diff: not a git repo — skipped"; exit 0; }
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$REPO_ROOT" ] || exit 0
+
+# ---- resolve the change set -------------------------------------------------
+if [ -z "$BASE" ]; then
+  BASE="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+  [ -n "$BASE" ] || BASE="master"
+fi
+
+if [ "$MODE" = "staged" ]; then
+  RAW_FILES="$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null)"
+  DIFF_ARGS=(diff --cached --unified=0 --diff-filter=ACM)
+else
+  RAW_FILES="$( { git diff --name-only --diff-filter=ACM 2>/dev/null
+                  git diff --cached --name-only --diff-filter=ACM 2>/dev/null
+                  git diff --name-only --diff-filter=ACM "$BASE"...HEAD 2>/dev/null
+                } | sort -u )"
+  DIFF_ARGS=(diff --unified=0 --diff-filter=ACM "$BASE")
+fi
+
+# JS/TS only, and only files that still exist on disk
+FILES=()
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in
+    *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts|*.mjs|*.cjs) ;;
+    *) continue ;;
+  esac
+  [ -f "$REPO_ROOT/$f" ] || continue
+  FILES+=("$f")
+done <<< "$RAW_FILES"
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+  echo "vet-diff: no changed JS/TS files — nothing to check"
+  exit 0
+fi
+
+echo "vet-diff: ${#FILES[@]} changed JS/TS file(s)"
+cd "$REPO_ROOT" || exit 0
+FAILED=0
+
+# ---- check 1: eslint (errors only) on the changed files --------------------
+HAS_CFG=0
+for c in eslint.config.js eslint.config.mjs eslint.config.cjs eslint.config.ts \
+         .eslintrc .eslintrc.js .eslintrc.cjs .eslintrc.json .eslintrc.yml .eslintrc.yaml; do
+  [ -f "$c" ] && { HAS_CFG=1; break; }
+done
+if [ "$HAS_CFG" -eq 0 ] && [ -f package.json ] && grep -q '"eslintConfig"' package.json 2>/dev/null; then
+  HAS_CFG=1
+fi
+
+if [ "$HAS_CFG" -eq 0 ]; then
+  echo "vet-diff: eslint — SKIPPED (no eslint config in this repo)"
+elif ! command -v npx >/dev/null 2>&1; then
+  echo "vet-diff: eslint — SKIPPED (npx unavailable)"
+else
+  ESLINT_OUT="$(npx --no-install eslint --quiet --format unix "${FILES[@]}" 2>&1)"
+  ES_RC=$?
+  if [ "$ES_RC" -eq 0 ]; then
+    echo "vet-diff: eslint — clean"
+  elif [ "$ES_RC" -ge 2 ]; then
+    # >=2 means eslint itself could not run (missing install, bad config).
+    # That is not a defect in the user's diff — report, do not block.
+    echo "vet-diff: eslint — SKIPPED (eslint could not run; config or install issue)"
+    printf '%s\n' "$ESLINT_OUT" | grep -v '^$' | head -5 | sed 's/^/    /'
+  else
+    echo "vet-diff: eslint — FINDINGS"
+    printf '%s\n' "$ESLINT_OUT" | grep -v '^$' | head -40 | sed 's/^/    /'
+    FAILED=1
+  fi
+fi
+
+# ---- check 2: ReDoS heuristic on ADDED lines -------------------------------
+SCAN="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/redos-scan"
+if [ ! -x "$SCAN" ]; then
+  echo "vet-diff: regex (ReDoS) — SKIPPED (redos-scan not executable at $SCAN)"
+else
+  REDOS_OUT="$(git "${DIFF_ARGS[@]}" -- "${FILES[@]}" 2>/dev/null | "$SCAN" 2>&1)"
+  REDOS_RC=$?
+  if [ "$REDOS_RC" -eq 1 ] && [ -n "$REDOS_OUT" ]; then
+    echo "vet-diff: regex (ReDoS) — FINDINGS"
+    printf '%s\n' "$REDOS_OUT" | sed 's/^/    /'
+    FAILED=1
+  elif [ "$REDOS_RC" -eq 0 ]; then
+    echo "vet-diff: regex (ReDoS) — clean"
+  else
+    # Never report clean on a crash — surface it rather than hiding it.
+    echo "vet-diff: regex (ReDoS) — WARNING, scanner failed (rc=$REDOS_RC)"
+    printf '%s\n' "$REDOS_OUT" | grep -v '^$' | head -5 | sed 's/^/    /'
+  fi
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "vet-diff: FAILED — fix the findings above before committing."
+  exit 1
+fi
+echo "vet-diff: all checks passed"
+exit 0
