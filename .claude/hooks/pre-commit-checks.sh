@@ -81,6 +81,10 @@ elif [ -f "package.json" ]; then
     echo "Detected TypeScript project. Type-checking..." >&2
     if grep -q '"typecheck"' package.json; then
       TS_CMD=("$RUNNER" run typecheck)
+    elif grep -q '"type-check"' package.json; then
+      # Repos here overwhelmingly use the hyphenated name; without this branch
+      # the gate fell through to "build" and ran a full esbuild transpile.
+      TS_CMD=("$RUNNER" run type-check)
     elif grep -q '"build"' package.json; then
       TS_CMD=("$RUNNER" run build)
     elif command -v npx >/dev/null 2>&1; then
@@ -93,6 +97,16 @@ elif [ -f "package.json" ]; then
         echo "ERROR: TypeScript compile (tsc --noEmit) failed. Fix type errors before committing." >&2
         FAILED=1
       fi
+    fi
+  fi
+
+  # Deterministic checks on the staged diff (eslint errors + ReDoS heuristic).
+  # Runs before tests because it is the cheapest signal, and it is scoped to
+  # changed files so pre-existing lint debt elsewhere cannot block a commit.
+  if [ $FAILED -eq 0 ] && [ -x "$HOME/.claude/bin/vet-diff" ]; then
+    if ! "$HOME/.claude/bin/vet-diff" --staged 2>&1 >&2; then
+      echo "ERROR: vet-diff found issues in the staged diff (see above)." >&2
+      FAILED=1
     fi
   fi
 

@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""
+redos-scan — flag catastrophic-backtracking (ReDoS) regex shapes in a unified diff.
+
+Reads `git diff --unified=0` on stdin and inspects only ADDED lines, so
+pre-existing regexes in touched files are never reported.
+
+Detection is deliberately narrow to keep false positives near zero: it flags a
+QUANTIFIED GROUP whose interior is ALSO unbounded-quantified — the classic
+catastrophic shapes (a+)+, (.*)*, (\\w+\\s*)+, (?:a+)+, (\\d{2,})+.
+Bounded repetition like (a+){2} is not flagged; neither is a lone quantifier,
+a quantified group with a literal interior ((abc)+), or a quantifier that is
+escaped or inside a character class ([a+]+, (a\\+)+).
+
+It will MISS subtler cases (notably overlapping alternation like (a|ab)+).
+Where eslint-plugin-security is installed, its detect-unsafe-regex rule is the
+real detector; this is the stopgap for repos that lack it.
+
+Exit 0 = no findings, 1 = findings, 2 = internal error.
+"""
+
+import re
+import sys
+
+UNBOUNDED = ("+", "*")
+BRACE_OPEN = re.compile(r"\{\d*,\d*\}")   # {n,} / {n,m} / {,m} -> open-ended enough
+# JS regex literal: not preceded by an identifier char, ) ] or $ (avoids division)
+LITERAL = re.compile(
+    r"(?<![\w)\]$])/((?:[^/\\\n\[]|\\.|\[(?:[^\]\\]|\\.)*\])+)/[gimsuyd]*"
+)
+# RegExp("...") / RegExp('...') — quote chars via hex escapes to stay shell-safe
+CTOR = re.compile(r"RegExp\(\s*([\x22\x27])((?:[^\\]|\\.)*?)\1")
+HUNK = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)")
+
+
+def skip_class(pat, i):
+    """i points at '['; return index just past the closing ']'."""
+    i += 1
+    if i < len(pat) and pat[i] == "^":
+        i += 1
+    if i < len(pat) and pat[i] == "]":
+        i += 1  # a literal ] may lead the class
+    while i < len(pat):
+        if pat[i] == "\\":
+            i += 2
+            continue
+        if pat[i] == "]":
+            return i + 1
+        i += 1
+    return i
+
+
+def quant_at(pat, i):
+    """Unbounded quantifier starting at i? Return its text, else None."""
+    if i >= len(pat):
+        return None
+    if pat[i] in UNBOUNDED:
+        q = pat[i]
+        if i + 1 < len(pat) and pat[i + 1] in "?+":
+            q += pat[i + 1]
+        return q
+    if pat[i] == "{":
+        m = BRACE_OPEN.match(pat, i)
+        return m.group(0) if m else None   # {n} exact is bounded -> ignore
+    return None
+
+
+def has_inner_quant(interior):
+    i = 0
+    while i < len(interior):
+        c = interior[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[":
+            i = skip_class(interior, i)
+            continue
+        if quant_at(interior, i):
+            return True
+        i += 1
+    return False
+
+
+def nested(pat):
+    """Offending snippets: a quantified group whose interior is also quantified."""
+    out, stack, i = [], [], 0
+    while i < len(pat):
+        c = pat[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "[":
+            i = skip_class(pat, i)
+            continue
+        if c == "(":
+            stack.append(i)
+            i += 1
+            continue
+        if c == ")":
+            if stack:
+                s = stack.pop()
+                q = quant_at(pat, i + 1)
+                if q and has_inner_quant(pat[s + 1:i]):
+                    out.append(pat[s:i + 1] + q)
+            i += 1
+            continue
+        i += 1
+    return out
+
+
+def bodies_in(line):
+    out = [m.group(1) for m in LITERAL.finditer(line)]
+    out += [m.group(2) for m in CTOR.finditer(line)]
+    return out
+
+
+def main():
+    cur, lineno, hits = None, 0, []
+    for raw in sys.stdin:
+        if raw.startswith("+++ "):
+            p = raw[4:].strip()
+            # Strip the diff destination prefix. Normally "b/", but git's
+            # diff.mnemonicPrefix (set in this environment) emits w/ i/ c/ o/.
+            if len(p) > 2 and p[1] == "/" and p[0] in "abciow":
+                p = p[2:]
+            cur = p
+            continue
+        if raw.startswith("--- ") or raw.startswith("diff --git"):
+            continue
+        m = HUNK.match(raw)
+        if m:
+            lineno = int(m.group(1))
+            continue
+        if raw.startswith("+"):
+            line = raw[1:].rstrip("\n")
+            s = line.strip()
+            if not (s.startswith("//") or s.startswith("*") or s.startswith("/*")):
+                for b in bodies_in(line):
+                    if b.startswith("*"):      # block-comment misparse guard
+                        continue
+                    for off in nested(b):
+                        hits.append((cur or "?", lineno, off, s[:100]))
+            lineno += 1
+
+    for f, ln, off, ctx in hits:
+        print("%s:%d: nested quantifier %r - catastrophic backtracking (ReDoS) risk"
+              % (f, ln, off))
+        print("    %s" % ctx)
+    return 1 if hits else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:                      # never fail silently
+        print("redos-scan: internal error: %s" % exc, file=sys.stderr)
+        sys.exit(2)

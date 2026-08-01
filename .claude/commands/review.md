@@ -30,9 +30,28 @@ Display the list of files that will be reviewed.
 
 ---
 
+## Step 1.5: Mechanical Gate (run BEFORE dispatching any reviewer)
+
+Deterministic checks are cheaper, faster, and more reliable than LLM reviewers, and spending reviewer attention on lint/type errors is precisely what lets judgment-level bugs slip to a later round. Run these first and fix what they find before any agent is dispatched.
+
+```bash
+# 1. Type check (whatever the project actually uses)
+#    Node: prefer the project's typecheck/type-check script, else `npx tsc --noEmit`
+#    Java: ./gradlew compileJava    Go: go build ./...    Python: mypy
+# 2. Deterministic diff checks: eslint errors on changed files + ReDoS heuristic
+~/.claude/bin/vet-diff
+```
+
+Report anything they surface as findings **before** Step 2, and fix them first. Notes:
+- `vet-diff` is scoped to changed files (and, for the regex check, added lines only), so pre-existing debt elsewhere never blocks you.
+- It reports `SKIPPED` rather than failing when a repo has no eslint config — that is expected in several repos here, not an error.
+- If the gate is clean, say so in one line and continue to Step 2.
+
+---
+
 ## Step 2: Run Reviews in Parallel
 
-Dispatch **four Task calls in a single message** so they run simultaneously:
+Dispatch **five Task calls in a single message** so they run simultaneously:
 
 **Task A — functional-reviewer subagent:**
 - Provide the list of changed files (paths only)
@@ -52,13 +71,17 @@ Dispatch **four Task calls in a single message** so they run simultaneously:
 - Provide the list of changed files (paths only)
 - Instruct: "Review ONLY the changed files listed below for performance bottlenecks, inefficient algorithms, and optimization opportunities. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what the performance issue is and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
 
+**Task E — data-side-effects-reviewer subagent:**
+- Provide the list of changed files (paths only)
+- Instruct: "Review ONLY the changed files listed below for blast radius on already-persisted data: changes to hashes / sourceHash / checksums / idempotency keys / dedup keys / ID derivation that would re-key or re-flag already-migrated records; unguarded status or flag overwrites; schema or version bumps whose companion artifacts (JSON schema files, fixtures, contracts) were not updated in the same change; and re-run/backfill safety. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what changes for existing data, the blast radius, and how to fix it). Format each finding as a clearly delimited block so they can be parsed. If the change touches no persistence, identity, status, or schema surface, say so in one line rather than manufacturing findings."
+
 ---
 
 ## Step 3: Aggregate and Display
 
-Once all four reviews return:
+Once all five reviews return:
 
-1. Parse findings from all four reviewers
+1. Parse findings from all five reviewers
 2. Separate into two buckets:
    - **Actionable** = CRITICAL and HIGH severity findings
    - **Informational** = MEDIUM and LOW severity findings
@@ -99,9 +122,10 @@ If there are actionable findings, use `AskUserQuestion` with this question:
 If fixes are requested:
 
 1. Apply the selected fixes to the codebase
-2. Run the full test suite to verify fixes don't break anything
-3. Re-run all four reviewers on the changed files (same as Step 2)
-4. Display updated findings
-5. If new CRITICAL/HIGH findings were introduced by fixes, offer to fix again (max 2 total fix iterations)
+2. **Re-run the Step 1.5 mechanical gate first** (typecheck + `~/.claude/bin/vet-diff`). This is the step that catches fix-induced regressions deterministically — a fix that introduces a lint error, a type error, or a ReDoS-shaped regex is caught here in seconds, instead of costing a whole LLM review round to rediscover. Fix anything it reports before continuing.
+3. Run the full test suite to verify fixes don't break anything
+4. Re-run all five reviewers on the changed files (same as Step 2) — the LLM re-review remains the backstop for judgment-level regressions the gate cannot see
+5. Display updated findings
+6. If new CRITICAL/HIGH findings were introduced by fixes, offer to fix again (max 2 total fix iterations)
 
 After the final iteration, display a summary: "Review complete. Fixed N findings across M iterations. K actionable findings remain."
