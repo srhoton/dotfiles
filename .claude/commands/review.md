@@ -121,11 +121,32 @@ If there are actionable findings, use `AskUserQuestion` with this question:
 
 If fixes are requested:
 
-1. Apply the selected fixes to the codebase
-2. **Re-run the Step 1.5 mechanical gate first** (typecheck + `~/.claude/bin/vet-diff`). This is the step that catches fix-induced regressions deterministically — a fix that introduces a lint error, a type error, or a ReDoS-shaped regex is caught here in seconds, instead of costing a whole LLM review round to rediscover. Fix anything it reports before continuing.
-3. Run the full test suite to verify fixes don't break anything
-4. Re-run all five reviewers on the changed files (same as Step 2) — the LLM re-review remains the backstop for judgment-level regressions the gate cannot see
-5. Display updated findings
-6. If new CRITICAL/HIGH findings were introduced by fixes, offer to fix again (max 2 total fix iterations)
+### Fix discipline (applies to every fix, every iteration)
+
+Session evidence shows the review loop's dominant failure modes are fix-side, not review-side. These four rules are mandatory:
+
+- **Class, not site**: when a finding is anchored at one call site, enumerate all sibling sites before fixing (LSP find-references or grep for the symbol/pattern) and fix or explicitly clear each one. The fix recap must list that enumeration ("fixed at X; checked Y, Z — unaffected because …"). Fixing only the reported site is the single most repeated cause of extra review rounds.
+- **One minimal fix per defect**: never ship a second fix for the same defect without first demonstrating the first alone is insufficient. Two fixes bundled for one bug is how pure regressions ship.
+- **Never trade loud for silent**: a fix must not convert a detectable failure into a silently-recorded success (e.g. latching a clean status over an unhandled path). If the choice is between an uncaught error and a quiet wrong answer, keep the error.
+- **Evidence-backed recap**: every CRITICAL/HIGH fix ships with an executed probe — a test or script that failed before the fix and passes after — not a prose claim. Probes must exercise shipped config values; a test whose stubs invert the shipped configuration structurally cannot catch the bug it claims to cover. Reviewers will refute unverified recaps, and that refutation costs a full round.
+
+### Fix loop
+
+1. Record the current diff size before fixing: `git diff --shortstat "$DEFAULT_BRANCH"...HEAD`
+2. Apply the selected fixes following the fix discipline above
+3. **Re-run the Step 1.5 mechanical gate first** (typecheck + `~/.claude/bin/vet-diff`). This is the step that catches fix-induced regressions deterministically — a fix that introduces a lint error, a type error, or a ReDoS-shaped regex is caught here in seconds, instead of costing a whole LLM review round to rediscover. Fix anything it reports before continuing.
+4. Run the full test suite to verify fixes don't break anything
+5. Re-run all five reviewers on the changed files (same as Step 2) — the LLM re-review remains the backstop for judgment-level regressions the gate cannot see
+6. Display updated findings and the new `git diff --shortstat`
+
+### Termination and descope escalation (hard rules — these are enforced, not advisory)
+
+- **Hard cap: 2 fix iterations.** If CRITICAL/HIGH findings remain after the second fix iteration, STOP. Do not fix again, do not start a third iteration on your own authority. Use `AskUserQuestion`:
+  - Question: "The change has failed review N times. How should I proceed?"
+  - Options: **"Ship passing layer"** (keep what passes review; revert/defer the failing parts), **"Revert failing layer"**, **"Split the change"** (separate branch/PR for the contested part), **"Continue fixing"** (grants at most 2 more iterations, once — after which stopping is unconditional).
+  - Stopping here is required behavior, not premature stopping — it falls under CLAUDE.md's "Escalate instead of grinding" rule, same as the `/shipit` retry budget.
+- **Diff-growth tripwire**: compare the `--shortstat` recorded each round. If the net diff has **grown for two consecutive fix iterations**, the loop is redesigning under review, not fixing — trigger the same escalation immediately, regardless of iteration count. Historical sessions grew +2784 → +4124 lines over 11 rounds before a manual descope resolved it in one.
+- **Layer-separation heuristic**: if blocking findings concentrate in one separable layer/feature while the rest of the change passes round after round, proactively propose shipping the passing layer and reverting or deferring the failing one — do not wait for the cap to force it.
+- **Design-failure signal**: a layer that fails successive rounds *for a different structural reason each time* is a design problem, not a bug backlog. Patching it further is waste — route it through the Design Gate in CLAUDE.md (plan-file design + adversarial design review) before any more code.
 
 After the final iteration, display a summary: "Review complete. Fixed N findings across M iterations. K actionable findings remain."

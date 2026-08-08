@@ -77,6 +77,18 @@
 ### Spec-Driven Implementation
 - When implementing from a spec/plan file, read the entire spec first and present a summary plan before making code changes. Make reasonable assumptions and note them rather than asking clarifying questions interactively.
 
+### Design Gate (before code, for design-novel work)
+- When a change introduces a **new mechanism or layer** (not a targeted bug fix) touching durable state, retry/rate-limit/quota logic, migration semantics, or multi-step orchestration: write the design into the plan file and run an **adversarial design review first** — dispatch the `functional-reviewer` against the design doc + spec, instructed to attack failure-path coverage, idempotency, and re-run safety — **before writing code**. One cheap design round replaces several expensive code-review rounds; session history shows design flaws found post-implementation cost 3+ review rounds each and sometimes a full revert.
+- Implement separable layers **separately**, reviewing each before starting the next. Do not interleave a novel layer with routine changes in one diff — interleaving is what makes the eventual revert expensive.
+- A layer that keeps failing review for a *different structural reason each round* is a design problem: revert it and return to this gate rather than continuing to patch it.
+
+### Fix Discipline (fixes made in response to review findings)
+- **Class, not site**: before fixing a defect found at one call site, enumerate all sibling sites (LSP find-references / grep) and fix or explicitly clear each; include the enumeration in the fix recap.
+- **One minimal fix per defect**: never ship a second fix for the same bug without demonstrating the first alone is insufficient.
+- **Never trade loud for silent**: a fix must not convert a detectable failure into a silently-latched success.
+- **Evidence-backed recap**: every CRITICAL/HIGH fix ships with an executed probe (failed before, passes after) that exercises shipped config values — prose recaps are not acceptance evidence.
+- `commands/review.md` Step 5 is authoritative for the fix-loop budget: hard cap of 2 fix iterations, diff-growth tripwire, and descope escalation via `AskUserQuestion`. Stopping at that cap is required behavior under "Escalate instead of grinding" — not premature stopping.
+
 ### Premise Verification
 - Before drafting any plan that names a service, file, library version, or commit SHA you don't already know exists in this repo, run `/verify-premise` (or invoke the `premise-verifier` agent directly). If the referenced target is not actually present or current, stop and report — do not build a plan against a phantom target.
 - Mandatory for: cross-service/cross-repo features, "look at how X uses Y" exploration that quotes a specific symbol, integration plans referencing a service the current repo has no obvious dependency on, and any task quoting a published library version or commit SHA.

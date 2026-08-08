@@ -175,7 +175,11 @@ Generate your report in this exact format:
 | [ADR Title] | [X]% | [emoji] |
 | ... | ... | ... |
 | **Overall** | **[X]%** | |
+
+VERDICT: [PASS | FAIL]
 ```
+
+The report MUST end with exactly one line `VERDICT: PASS` or `VERDICT: FAIL` so orchestrators can branch deterministically. FAIL only when one or more CRITICAL action items exist; MAJOR/MINOR items alone are informational and do not fail the review.
 
 ## Important Guidelines
 
