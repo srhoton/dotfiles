@@ -3,20 +3,59 @@
   "permissions": {
     "defaultMode": "auto"
   },
-  "model": "opus",
+  "model": "fable",
+  "skillOverrides": {
+    "bughunt": "off",
+    "build": "off",
+    "build-resume": "off",
+    "checkdeploy": "off",
+    "docs": "off",
+    "envconfig": "off",
+    "fleet": "off",
+    "java_service": "off",
+    "moveittofb": "off",
+    "post-msg": "off",
+    "refresh-other": "off",
+    "reviewitrob": "off",
+    "reviewitsec": "off",
+    "reviewitzach": "off",
+    "ship-when-clean": "off",
+    "shipit-batch": "off",
+    "terraformitup": "off",
+    "validatewithjwt": "off",
+    "vlt": "off",
+    "vlttf": "off"
+  },
   "hooks": {
-    "SessionStart": [
+    "Notification": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/session-env-setup.sh",
+            "command": "bash /Users/steverhoton/.claude/hooks/tmux-on-notification.sh",
             "timeout": 5000
-          },
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/sessionstart-envdrift.sh",
-            "timeout": 5000
+            "command": "bash /Users/steverhoton/.claude/hooks/format-on-edit.sh",
+            "timeout": 30000
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/steverhoton/.claude/hooks/pr-stale-check.sh",
+            "timeout": 15000
           }
         ]
       }
@@ -44,50 +83,11 @@
             "type": "command",
             "command": "bash /Users/steverhoton/.claude/hooks/guard-pr-state.sh",
             "timeout": 15000
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
+          },
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/format-on-edit.sh",
-            "timeout": 30000
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/pr-stale-check.sh",
-            "timeout": 15000
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/tmux-on-stop.sh",
-            "timeout": 5000
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/tmux-on-notification.sh",
-            "timeout": 5000
+            "command": "bash /Users/steverhoton/.claude/hooks/guard-npm-install.sh",
+            "timeout": 10000
           }
         ]
       }
@@ -102,6 +102,43 @@
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/steverhoton/.claude/hooks/session-env-setup.sh",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "bash /Users/steverhoton/.claude/hooks/sessionstart-envdrift.sh",
+            "timeout": 5000
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash '/Users/steverhoton/.claude/hooks/herdr-agent-state.sh' session",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/steverhoton/.claude/hooks/tmux-on-stop.sh",
+            "timeout": 5000
+          }
+        ]
+      }
     ]
   },
   "statusLine": {
@@ -109,26 +146,26 @@
     "command": "bash /Users/steverhoton/.claude/statusline-command.sh"
   },
   "enabledPlugins": {
-    "jdtls-lsp@claude-plugins-official": true,
-    "pyright-lsp@claude-plugins-official": true,
-    "discord@claude-plugins-official": true,
-    "typescript-lsp@claude-plugins-official": true,
-    "aws-core@agent-toolkit-for-aws": true,
     "aws-agents@agent-toolkit-for-aws": true,
+    "aws-core@agent-toolkit-for-aws": false,
     "aws-data-analytics@agent-toolkit-for-aws": true,
-    "gopls-lsp@claude-plugins-official": true
+    "discord@claude-plugins-official": true,
+    "gopls-lsp@claude-plugins-official": false,
+    "jdtls-lsp@claude-plugins-official": false,
+    "pyright-lsp@claude-plugins-official": false,
+    "typescript-lsp@claude-plugins-official": false
   },
   "extraKnownMarketplaces": {
-    "thedotmack": {
-      "source": {
-        "source": "github",
-        "repo": "thedotmack/claude-mem"
-      }
-    },
     "agent-toolkit-for-aws": {
       "source": {
         "source": "github",
         "repo": "aws/agent-toolkit-for-aws"
+      }
+    },
+    "thedotmack": {
+      "source": {
+        "source": "github",
+        "repo": "thedotmack/claude-mem"
       }
     }
   },

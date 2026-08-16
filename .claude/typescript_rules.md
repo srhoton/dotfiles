@@ -46,6 +46,8 @@ Rules we set beyond the presets:
 const mockRepository = { findById: vi.fn(), save: vi.fn() } satisfies UserRepository;
 ```
 
+Test doubles must be deterministic: no `Math.random`, `Date.now()`, argless `new Date()`, or real timers in stubs/fixtures — CI runs under coverage instrumentation and flakes on them. Use `vi.useFakeTimers()`, fixed seed values, or injected clocks instead.
+
 ## Organization
 
 - Keep files under ~300 lines; barrel exports (`index.ts`) for module boundaries.
