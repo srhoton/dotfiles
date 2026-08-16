@@ -37,7 +37,9 @@ gh pr checkout $ARGUMENTS
 
 ## Step 2: Run Reviews in Parallel
 
-Dispatch **five Task calls in a single message** so they run simultaneously:
+Dispatch **five Task calls in a single message** so they run simultaneously.
+
+**Scope bounds — include in every subagent prompt:** (1) the explicit repo root and the changed-file list are the agent's ENTIRE scope; (2) do not explore sibling repos or spawn further agents; (3) if evidence outside that scope seems needed, report the gap as a note in the findings output instead of expanding scope.
 
 **Task A — functional-reviewer subagent:**
 - Provide the PR title and body as "the user's stated requirements / intent"

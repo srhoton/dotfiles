@@ -60,6 +60,8 @@
 ### Debugging
 - Lead with live-data evidence per the Data Validation rule above — confirm or refute the hypothesis before proposing a fix.
 - When diagnosing 401s/auth failures or other distributed-system errors, consider consumer-side causes (cold-start JWKS fetch blocking, concurrency races, client clock skew) in addition to the issuer/server side before settling on a root cause.
+- Never label a failure "transient" or "one-off" without metric evidence (CloudWatch/Athena/DynamoDB query over the failure window). Quantify blast radius — a measured count of affected entities/records/executions — before proposing a fix.
+- Every root-cause claim must cite a `file:line`, an execution ARN, or a query result. If I push back on a conclusion, re-derive it from primary sources — do not restate it.
 
 ### Terraform Conventions
 - Never use `count = 0` together with `moved` blocks on the same resource — this causes plan errors.
@@ -108,6 +110,7 @@
 ## Communication Style
 
 - When the user asks for an investigation, write-up, or findings document, document the findings — do not attempt fixes unless explicitly asked.
+- When I give a character or word budget for written content (bios, blurbs, PR comments, commit messages), count it and state the actual count in your response. Characters ≠ words.
 - Avoid interactive clarifying questions during plan-writing phases; make a reasonable assumption and note it instead.
 - Raise decisions and clarifying questions **before** implementing, not after. Once work is delivered, do not end the turn with `AskUserQuestion` — close with a short written summary (what changed, evidence, PR/ticket links) plus a bulleted **suggested next steps** list I can pick from.
 
@@ -151,6 +154,7 @@ Adhere to the following guidelines when using tools:
 - **Research proportionate to uncertainty**: how much you research scales with how unclear the task is. When I have named the artifact, file, or symbol, reading it *is* the research — go there first (see Investigation Scope). Reserve broad exploration for genuinely open-ended questions. Always prefer surgical edits over rewriting whole files or sweeping changes.
 - **LSP-first for symbol-level questions**: when working in a file type with an active LSP (Java via jdtls, TypeScript via typescript-lsp, Python via pyright), prefer LSP capabilities — find-references, go-to-definition, workspace-symbols, diagnostics — over grep + build cycles. LSPs distinguish overloads, inheritance, and imported vs local symbols where grep can't. Keep grep for text/comment/config searches and for languages without an active LSP (Terraform, shell, YAML).
 - **WebSearch / WebFetch for unfamiliar territory**: when debugging an error message you don't recognize, working with an unfamiliar library API, or looking up AWS service behavior, use WebSearch followed by WebFetch on the most authoritative result. Prefer official docs over Stack Overflow. The `/docs <topic>` skill wraps this pattern.
+- **Bounded subagents**: every subagent you dispatch gets an explicit repo/directory scope in its prompt, plus the anchor artifact (ARN, file, template) if I supplied one. A subagent that needs more scope must return and ask — never expand on its own.
 
 ### Thinking Depth
 
