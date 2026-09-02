@@ -43,7 +43,7 @@ Report the count and the query that produced it.
 
 ## Step 6: In-Flight Fix Check
 
-Search open PRs (`gh pr list`) in the owning repo and Jira for an existing fix or ticket covering this failure. Do not propose duplicate work.
+Search open PRs (`gh pr list`) in the owning repo, and Jira via the Atlassian MCP (`mcp__claude_ai_Atlassian__searchJiraIssuesUsingJql` on the error signature / entity / state machine name), for an existing fix or ticket covering this failure. If the Atlassian MCP isn't connected this session, note the Jira check as a gap — don't browser-automate it. Do not propose duplicate work.
 
 ## Step 7: Deliver the Diagnosis and STOP
 

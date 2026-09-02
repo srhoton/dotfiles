@@ -6,7 +6,7 @@ This command composes existing assets. Where it says "follow `<file>`", read tha
 
 ## Phase 1: Evidence Plan (ends with a STOP for approval)
 
-1. Read the Jira ticket `$ARGUMENTS`, its epic, and any linked tickets/PRs.
+1. Read the Jira ticket `$ARGUMENTS`, its epic, and any linked tickets/PRs — via the Atlassian MCP tools (`mcp__claude_ai_Atlassian__getJiraIssue`; `getConfluencePage` for linked specs). If the Atlassian MCP server is not connected this session, say so and ask — never fall back to browser automation for Jira/Confluence.
 2. **Premise verification**: dispatch the `premise-verifier` agent against the ticket's factual claims (services, files, symbols, library versions it references). Additionally, validate data claims (counts, rates, schemas) against live sources — Athena via `aws-data-analytics:querying-data-lake`, DynamoDB, S3 — per CLAUDE.md Data Validation. Ticket text and stale git history have both been wrong before; report each claim as CONFIRMED / REFUTED / UNVERIFIABLE with the evidence. If a load-bearing premise is REFUTED, stop and surface it — do not plan against it.
 3. **Scope**: work in the single repo the ticket targets. If implementation appears to require a second repo, STOP and ask before exploring it. Any subagent you dispatch gets an explicit repo/directory scope and must return and ask rather than expand.
 4. **Plan**: write the implementation plan (files to change, approach, test plan) including an explicit **Assumptions** list. If the change introduces a new mechanism or layer touching durable state, retries/rate limits, migration semantics, or multi-step orchestration, it trips the CLAUDE.md **Design Gate**: write the design into the plan file and dispatch the `functional-reviewer` against it to attack failure paths, idempotency, and re-run safety — before any code.
@@ -18,7 +18,7 @@ This command composes existing assets. Where it says "follow `<file>`", read tha
 2. Implement with tests, following the language rules files and existing repo patterns (find 2-3 examples before inventing one).
 3. **Gates** (all must pass before Phase 3):
    - Typecheck + lint + **full test suite** (`tsc --noEmit`/eslint, or `./gradlew build spotlessApply`, per repo).
-   - **Mutation-probe every new/modified test**: temporarily revert the production change **via a file copy in the scratchpad — never `git checkout`/`git restore` on a dirty tree** — confirm the test FAILS against unfixed code, then restore. A test that passes against unfixed code is rewritten and re-probed. Report probe results.
+   - **Mutation-probe every new/modified test** with `~/.claude/bin/mutation-probe --test '<scoped test cmd>' <changed-prod-file>...` (add `--together` for multi-file atomic fixes). It reverts the production change via file copy — never `git checkout`/`git restore` — confirms the test FAILS against unfixed code, and restores. Any test it reports VACUOUS is rewritten and re-probed. Report the probe output.
    - **Deterministic test doubles only**: no `Math.random`, `Date.now()`, argless `new Date()`, or real timers in stubs — CI runs under coverage and flakes on them.
 4. Self-check the diff for scope creep (unrequested layers, cleanup handlers, defensive frameworks) and descope it yourself before review.
 
@@ -30,7 +30,7 @@ Follow `~/.claude/commands/review.md` exactly — mechanical gate, five parallel
 
 1. Merge or rebase onto the latest `origin/<default branch>` and re-run the full test suite, so concurrent-merge breakage surfaces locally (CLAUDE.md PR rules).
 2. Follow `~/.claude/commands/trueup.md`: commit (message via tempfile + `git commit -F`), attach session prompts via git notes, push, and open the PR with `gh pr create --body-file <tmpfile>` — the body describing the full diff against the target branch.
-3. **Jira**: comment the PR link + a one-paragraph summary on `$ARGUMENTS`; ensure the ticket is linked under its epic; transition status if the workflow expects it.
+3. **Jira** (Atlassian MCP tools, never browser automation): comment the PR link + a one-paragraph summary on `$ARGUMENTS` with `addCommentToJiraIssue`; ensure the ticket is linked under its epic (`editJiraIssue`/`createIssueLink`); transition status with `getTransitionsForJiraIssue` + `transitionJiraIssue` if the workflow expects it.
 4. **Monitor CI to green.** Poll with backoff; if CI fails, fix and push (the Phase 3 cap logic applies — don't grind past 2 fix rounds without escalating).
 5. **Review comments**: for each incoming comment, verify the claim against code/data first — refute with evidence if it doesn't hold, fix it if it does (fix discipline applies) — and post a threaded reply on every thread.
 
