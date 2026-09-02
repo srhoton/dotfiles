@@ -35,45 +35,33 @@ gh pr checkout $ARGUMENTS
 
 ---
 
-## Step 2: Run Reviews in Parallel
+## Step 2: Run Reviews via the review-fanout Workflow
 
-Dispatch **five Task calls in a single message** so they run simultaneously.
+Invoke the **Workflow tool** with the saved orchestration script (this slash command IS your explicit opt-in to run it):
 
-**Scope bounds — include in every subagent prompt:** (1) the explicit repo root and the changed-file list are the agent's ENTIRE scope; (2) do not explore sibling repos or spawn further agents; (3) if evidence outside that scope seems needed, report the gap as a note in the findings output instead of expanding scope.
+- `scriptPath`: `/Users/steverhoton/.claude/workflows/review-fanout.js`
+- `args` (JSON object, not a string):
+  - `repoRoot`: absolute repo root
+  - `files`: the PR's changed-file list from Step 1
+  - `intent`: the PR title and body ("Treat the PR description as the user's requirements")
 
-**Task A — functional-reviewer subagent:**
-- Provide the PR title and body as "the user's stated requirements / intent"
-- Provide the list of changed files (paths only)
-- Instruct: "Review ONLY the changed files listed below. Treat the PR description as the user's requirements. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what's wrong and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
+The workflow runs the five specialist reviewers (functional, code-quality, adr-compliance, performance, data-side-effects) in parallel with schema-validated findings, dedupes by file:line, checks the diff against the defect-class checklist (`~/.claude/knowledge/defect-classes.md`), then adversarially verifies each CRITICAL/HIGH finding with a skeptic agent. It returns `{ actionable, informational, refuted, reviewersSkipped }`.
 
-**Task B — code-quality-reviewer subagent:**
-- Provide the list of changed files (paths only)
-- Instruct: "Review ONLY the changed files listed below for code quality issues. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what's wrong and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
+- `actionable` findings carry `verified: true/false` — `false` means the skeptic errored or the finding was beyond the verify cap; treat those with extra suspicion, don't drop them.
+- `refuted` findings were disproved with cited evidence — never propose them as PR comments; show them in the terminal summary so the user can spot-check.
+- If `reviewersSkipped` is non-empty, say so.
 
-**Task C — adr-compliance-reviewer subagent:**
-- Provide the list of changed files (paths only)
-- Instruct: "Analyze ONLY the changed files listed below for compliance with Fullbay's accepted ADRs. Load ADRs dynamically from ~/git/architecture-decisions. For each violation found, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (which ADR is violated and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
-
-**Task D — performance-reviewer subagent:**
-- Provide the list of changed files (paths only)
-- Instruct: "Review ONLY the changed files listed below for performance bottlenecks, inefficient algorithms, and optimization opportunities. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what the performance issue is and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
-
-**Task E — data-side-effects-reviewer subagent:**
-- Provide the list of changed files (paths only)
-- Instruct: "Review ONLY the changed files listed below for blast radius on already-persisted data: changes to hashes / sourceHash / checksums / idempotency keys / dedup keys / ID derivation that would re-key or re-flag already-migrated records; unguarded status or flag overwrites; schema or version bumps whose companion artifacts (JSON schema files, fixtures, contracts) were not updated in the same change; and re-run/backfill safety. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what changes for existing data, the blast radius, and how to fix it). Format each finding as a clearly delimited block so they can be parsed. If the change touches no persistence, identity, status, or schema surface, say so in one line rather than manufacturing findings."
+**Fallback — Workflow tool unavailable this session:** dispatch five parallel Task calls to the same five subagent types, each prompt containing the repo root + changed-file list (plus PR title/body for the functional reviewer), these scope bounds — (1) that list is the agent's ENTIRE scope, (2) do not explore sibling repos or spawn further agents, (3) report out-of-scope evidence gaps as notes instead of expanding — and a request for delimited findings blocks (severity CRITICAL/HIGH/MEDIUM/LOW, file, line, description). Instruct the functional and data-side-effects reviewers to also check the diff against `~/.claude/knowledge/defect-classes.md`. Then dedup by file:line yourself.
 
 ---
 
-## Step 3: Aggregate and Filter
+## Step 3: Prepare Comments
 
-Once all five reviews return:
+From the workflow's returned structure (or your own aggregation in the fallback case):
 
-1. Parse findings from all five reviewers
-2. Separate into two buckets:
-   - **Actionable** = CRITICAL and HIGH severity findings
-   - **Informational** = MEDIUM and LOW severity findings
-3. Deduplicate: if multiple reviewers flagged the same file:line, merge into one finding and mark source as the combination (e.g. "quality+adr")
-4. For each actionable finding, prepare an inline comment with:
+1. **Actionable** = the returned CRITICAL/HIGH findings that survived verification
+2. **Informational** = MEDIUM and LOW findings
+3. For each actionable finding, prepare an inline comment with:
    - `file`: relative path
    - `line`: line number
    - `body`: the finding description + suggested fix

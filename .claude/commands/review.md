@@ -49,47 +49,29 @@ Report anything they surface as findings **before** Step 2, and fix them first. 
 
 ---
 
-## Step 2: Run Reviews in Parallel
+## Step 2: Run Reviews via the review-fanout Workflow
 
-Dispatch **five Task calls in a single message** so they run simultaneously.
+Invoke the **Workflow tool** with the saved orchestration script (this slash command IS your explicit opt-in to run it):
 
-**Scope bounds — include in every subagent prompt:** (1) the explicit repo root and the changed-file list are the agent's ENTIRE scope; (2) do not explore sibling repos or spawn further agents; (3) if evidence outside that scope seems needed, report the gap as a note in the findings output instead of expanding scope.
+- `scriptPath`: `/Users/steverhoton/.claude/workflows/review-fanout.js`
+- `args` (JSON object, not a string):
+  - `repoRoot`: absolute repo root
+  - `files`: the changed-file list from Step 1
+  - `intent`: the user's stated requirements — the contents of `sdlc-plan.md` if one exists in the repo root, otherwise recent commit messages on this branch
 
-**Task A — functional-reviewer subagent:**
-- Provide the list of changed files (paths only)
-- If an `sdlc-plan.md` exists in the repo root, read it and provide as context for "the user's stated requirements / intent"
-- Otherwise, use recent commit messages on this branch as context for intent
-- Instruct: "Review ONLY the changed files listed below. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what's wrong and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
+The workflow runs the five specialist reviewers (functional, code-quality, adr-compliance, performance, data-side-effects) in parallel with schema-validated findings, dedupes by file:line, checks the diff against the defect-class checklist (`~/.claude/knowledge/defect-classes.md`), then adversarially verifies each CRITICAL/HIGH finding with a skeptic agent. It returns `{ actionable, informational, refuted, reviewersSkipped }`.
 
-**Task B — code-quality-reviewer subagent:**
-- Provide the list of changed files (paths only)
-- Instruct: "Review ONLY the changed files listed below for code quality issues. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what's wrong and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
+- `actionable` findings carry `verified: true/false` — `false` means the skeptic errored or the finding was beyond the verify cap; treat those with extra suspicion, don't drop them.
+- `refuted` findings were disproved with cited evidence — do NOT act on them, but include them in the report so the user can spot-check the refutations.
+- If `reviewersSkipped` is non-empty, say so in the report.
 
-**Task C — adr-compliance-reviewer subagent:**
-- Provide the list of changed files (paths only)
-- Instruct: "Analyze ONLY the changed files listed below for compliance with Fullbay's accepted ADRs. Load ADRs dynamically from ~/git/architecture-decisions. For each violation found, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (which ADR is violated and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
-
-**Task D — performance-reviewer subagent:**
-- Provide the list of changed files (paths only)
-- Instruct: "Review ONLY the changed files listed below for performance bottlenecks, inefficient algorithms, and optimization opportunities. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what the performance issue is and how to fix it). Format each finding as a clearly delimited block so they can be parsed."
-
-**Task E — data-side-effects-reviewer subagent:**
-- Provide the list of changed files (paths only)
-- Instruct: "Review ONLY the changed files listed below for blast radius on already-persisted data: changes to hashes / sourceHash / checksums / idempotency keys / dedup keys / ID derivation that would re-key or re-flag already-migrated records; unguarded status or flag overwrites; schema or version bumps whose companion artifacts (JSON schema files, fixtures, contracts) were not updated in the same change; and re-run/backfill safety. For each finding, output structured data with these fields: severity (CRITICAL, HIGH, MEDIUM, or LOW), file (relative path), line (line number in the file), and description (what changes for existing data, the blast radius, and how to fix it). Format each finding as a clearly delimited block so they can be parsed. If the change touches no persistence, identity, status, or schema surface, say so in one line rather than manufacturing findings."
+**Fallback — Workflow tool unavailable this session:** dispatch five parallel Task calls to the same five subagent types, each prompt containing the repo root + changed-file list, these scope bounds — (1) that list is the agent's ENTIRE scope, (2) do not explore sibling repos or spawn further agents, (3) report out-of-scope evidence gaps as notes instead of expanding — and a request for delimited findings blocks (severity CRITICAL/HIGH/MEDIUM/LOW, file, line, description). Instruct the functional and data-side-effects reviewers to also check the diff against `~/.claude/knowledge/defect-classes.md`. Then dedup by file:line yourself.
 
 ---
 
-## Step 3: Aggregate and Display
+## Step 3: Display
 
-Once all five reviews return:
-
-1. Parse findings from all five reviewers
-2. Separate into two buckets:
-   - **Actionable** = CRITICAL and HIGH severity findings
-   - **Informational** = MEDIUM and LOW severity findings
-3. Deduplicate: if multiple reviewers flagged the same file:line, merge into one finding and mark source as the combination (e.g. "quality+performance")
-
-Display ALL findings in a structured format:
+Using the workflow's returned structure (or your own aggregation in the fallback case), display ALL findings:
 
 ```
 ## Actionable Findings (CRITICAL/HIGH)
@@ -103,6 +85,8 @@ Display ALL findings in a structured format:
 [4] MEDIUM   | src/utils/helpers.ts:30    | Consider extracting shared constant          | quality
 [5] LOW      | src/model/User.java:12     | Zustand store could use selectors            | adr
 ```
+
+If the workflow returned `refuted` findings, add a `## Refuted by verification` section listing each with its refutation — for user spot-checking, not for fixing.
 
 If there are **zero** CRITICAL/HIGH findings, report: "Clean review — no critical or high issues found." Display the informational summary if any, and stop.
 
@@ -130,7 +114,7 @@ Session evidence shows the review loop's dominant failure modes are fix-side, no
 - **Class, not site**: when a finding is anchored at one call site, enumerate all sibling sites before fixing (LSP find-references or grep for the symbol/pattern) and fix or explicitly clear each one. The fix recap must list that enumeration ("fixed at X; checked Y, Z — unaffected because …"). Fixing only the reported site is the single most repeated cause of extra review rounds.
 - **One minimal fix per defect**: never ship a second fix for the same defect without first demonstrating the first alone is insufficient. Two fixes bundled for one bug is how pure regressions ship.
 - **Never trade loud for silent**: a fix must not convert a detectable failure into a silently-recorded success (e.g. latching a clean status over an unhandled path). If the choice is between an uncaught error and a quiet wrong answer, keep the error.
-- **Evidence-backed recap**: every CRITICAL/HIGH fix ships with an executed probe — a test or script that failed before the fix and passes after — not a prose claim. Probes must exercise shipped config values; a test whose stubs invert the shipped configuration structurally cannot catch the bug it claims to cover. Reviewers will refute unverified recaps, and that refutation costs a full round.
+- **Evidence-backed recap**: every CRITICAL/HIGH fix ships with an executed probe — a test or script that failed before the fix and passes after — not a prose claim. For test-covered fixes, run the probe with `~/.claude/bin/mutation-probe --test '<scoped test cmd>' <fix-file>...` — it reverts the fix via file copy (never `git checkout`), proves the test fails without it, and flags VACUOUS tests. Probes must exercise shipped config values; a test whose stubs invert the shipped configuration structurally cannot catch the bug it claims to cover. Reviewers will refute unverified recaps, and that refutation costs a full round.
 
 ### Fix loop
 
@@ -138,7 +122,7 @@ Session evidence shows the review loop's dominant failure modes are fix-side, no
 2. Apply the selected fixes following the fix discipline above
 3. **Re-run the Step 1.5 mechanical gate first** (typecheck + `~/.claude/bin/vet-diff`). This is the step that catches fix-induced regressions deterministically — a fix that introduces a lint error, a type error, or a ReDoS-shaped regex is caught here in seconds, instead of costing a whole LLM review round to rediscover. Fix anything it reports before continuing.
 4. Run the full test suite to verify fixes don't break anything
-5. Re-run all five reviewers on the changed files (same as Step 2) — the LLM re-review remains the backstop for judgment-level regressions the gate cannot see
+5. Re-invoke the review-fanout workflow on the changed files (same as Step 2, fresh run — files changed, so no cache reuse) — the LLM re-review remains the backstop for judgment-level regressions the gate cannot see
 6. Display updated findings and the new `git diff --shortstat`
 
 ### Termination and descope escalation (hard rules — these are enforced, not advisory)

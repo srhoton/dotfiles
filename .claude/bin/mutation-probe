@@ -1,0 +1,126 @@
+#!/bin/bash
+#
+# mutation-probe - prove that new/changed tests actually cover the fix they claim to.
+#
+# For each fix file, temporarily reverts it to its HEAD content (file copy +
+# `git show`, never `git checkout`/`git stash` — see guard-destructive-git),
+# runs the test command, and expects it to FAIL. A test that passes with the
+# fix reverted is VACUOUS: it cannot catch the bug it claims to cover.
+#
+# Usage:
+#   mutation-probe --test '<test command>' [--together] <fix-file>...
+#
+#   --test      Command that runs the relevant test(s). Required. Should be
+#               scoped to the new/changed tests, not the whole suite.
+#   --together  Revert ALL fix files at once and run a single probe. Use for
+#               multi-file atomic fixes where reverting one file alone would
+#               only produce a compile error rather than a meaningful failure.
+#
+# Exit codes: 0 = all probes VALID; 1 = any VACUOUS probe, a failing baseline,
+# or a post-restore failure. The working tree is always restored from backups.
+#
+set -u
+
+TEST_CMD=""
+TOGETHER=0
+FILES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --test) TEST_CMD="${2:-}"; shift 2 ;;
+    --together) TOGETHER=1; shift ;;
+    -h|--help) sed -n '2,22p' "$0"; exit 0 ;;
+    *) FILES+=("$1"); shift ;;
+  esac
+done
+
+if [ -z "$TEST_CMD" ] || [ ${#FILES[@]} -eq 0 ]; then
+  echo "usage: mutation-probe --test '<test command>' [--together] <fix-file>..." >&2
+  exit 1
+fi
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$ROOT" ]; then
+  echo "mutation-probe: not inside a git repository" >&2
+  exit 1
+fi
+
+BACKUP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mutation-probe.XXXXXX")
+trap 'rm -rf "$BACKUP_DIR"' EXIT
+
+run_test() { ( cd "$ROOT" && eval "$TEST_CMD" ) >"$BACKUP_DIR/test.out" 2>&1; }
+
+relpath() {
+  python3 -c 'import os,sys; print(os.path.relpath(os.path.abspath(sys.argv[1]), sys.argv[2]))' "$1" "$ROOT"
+}
+
+backup_file() { # $1=abs path, $2=rel path
+  mkdir -p "$BACKUP_DIR/tree/$(dirname "$2")"
+  cp -p "$1" "$BACKUP_DIR/tree/$2"
+}
+
+revert_file() { # $1=abs path, $2=rel path -> restore HEAD content or delete if new
+  if git -C "$ROOT" cat-file -e "HEAD:$2" 2>/dev/null; then
+    git -C "$ROOT" show "HEAD:$2" > "$1"
+  else
+    rm -f "$1"
+  fi
+}
+
+restore_file() { # $1=abs path, $2=rel path
+  mkdir -p "$(dirname "$1")"
+  cp -p "$BACKUP_DIR/tree/$2" "$1"
+}
+
+# Resolve and validate files up front
+ABS=(); REL=()
+for f in "${FILES[@]}"; do
+  a=$(cd "$(dirname "$f")" 2>/dev/null && printf '%s/%s' "$PWD" "$(basename "$f")")
+  if [ -z "$a" ] || [ ! -f "$a" ]; then
+    echo "mutation-probe: fix file not found: $f" >&2
+    exit 1
+  fi
+  ABS+=("$a"); REL+=("$(relpath "$a")")
+done
+
+FAILED=0
+
+# Baseline: with the fix in place, the tests must pass.
+if ! run_test; then
+  echo "BASELINE FAIL: test command fails with the fix in place — nothing to probe."
+  echo "--- last 20 lines of test output ---"
+  tail -20 "$BACKUP_DIR/test.out"
+  exit 1
+fi
+echo "baseline: PASS (fix in place)"
+
+probe() { # $1..=indices into ABS/REL to revert together; label in $LABEL
+  local idx
+  for idx in "$@"; do backup_file "${ABS[$idx]}" "${REL[$idx]}"; done
+  for idx in "$@"; do revert_file "${ABS[$idx]}" "${REL[$idx]}"; done
+  if run_test; then
+    echo "VACUOUS: $LABEL — tests still pass with the fix reverted"
+    FAILED=1
+  else
+    echo "VALID:   $LABEL — tests fail without the fix"
+  fi
+  for idx in "$@"; do restore_file "${ABS[$idx]}" "${REL[$idx]}"; done
+}
+
+if [ "$TOGETHER" -eq 1 ]; then
+  LABEL="${REL[*]}"
+  probe $(seq 0 $((${#ABS[@]} - 1)))
+else
+  for i in $(seq 0 $((${#ABS[@]} - 1))); do
+    LABEL="${REL[$i]}"
+    probe "$i"
+  done
+fi
+
+# Confirm the restore left the tree in a passing state.
+if ! run_test; then
+  echo "RESTORE FAIL: tests no longer pass after restoring fixes — inspect the working tree." >&2
+  exit 1
+fi
+echo "restore:  PASS (fix back in place)"
+
+exit $FAILED
