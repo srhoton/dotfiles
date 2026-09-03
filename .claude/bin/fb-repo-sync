@@ -1,0 +1,172 @@
+#!/bin/bash
+#
+# fb-repo-sync — clone or fast-forward the fullbay repos whose names start
+# with a set of prefixes into a target directory (default ~/git).
+#
+# For each matching, non-archived, non-empty repo:
+#   - not cloned yet            -> git clone --branch master
+#   - cloned, on master         -> git fetch, then git merge --ff-only
+#   - cloned, on another branch -> git fetch origin master:master
+#                                  (fast-forwards the local master ref; the
+#                                  checked-out branch and working tree are
+#                                  never touched)
+#
+# Never checks out, resets, stashes, or discards anything. A directory whose
+# origin is not github.com/<org>/<name> is skipped, not touched.
+#
+# Prints one line per repo ("STATUS  name  detail") sorted by status, then a
+# count summary. Exit 1 if any repo FAILED, else 0.
+#
+# Usage: fb-repo-sync [-n] [-a] [-j N] [-d DIR] [PREFIX ...]
+#   -n      dry run: report the action each repo would get, change nothing
+#   -a      include archived repos
+#   -j N    parallel workers (default 6)
+#   -d DIR  target directory (default ~/git)
+#   PREFIX  repo-name prefixes (default: act- ath- usr- mig- wor- fin- prt-)
+#
+# Environment: FB_ORG overrides the GitHub org (default fullbay).
+
+set -uo pipefail
+
+ORG="${FB_ORG:-fullbay}"
+BRANCH="master"
+
+first_line() { printf '%s' "$1" | sed -n '1p'; }
+emit() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
+
+# ---- worker mode ------------------------------------------------------------
+# Invoked by xargs as: fb-repo-sync --worker <name> <sshUrl>
+# DRY, DIR, ORG and BRANCH arrive via the environment. Emits exactly one line.
+if [ "${1:-}" = "--worker" ]; then
+  name="$2"; url="$3"; dir="$DIR/$name"
+
+  if [ ! -e "$dir" ]; then
+    if [ "$DRY" = 1 ]; then emit WOULD-CLONE "$name" "$url"; exit 0; fi
+    if err=$(git clone --quiet --branch "$BRANCH" "$url" "$dir" 2>&1); then
+      emit CLONED "$name" "$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)"
+    else
+      emit FAILED "$name" "clone: $(first_line "$err")"
+    fi
+    exit 0
+  fi
+
+  if ! git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    emit SKIPPED "$name" "exists but is not a git repo"; exit 0
+  fi
+
+  origin=$(git -C "$dir" remote get-url origin 2>/dev/null || true)
+  case "$origin" in
+    *github.com[:/]"$ORG"/"$name"|*github.com[:/]"$ORG"/"$name".git) ;;
+    *) emit SKIPPED "$name" "origin mismatch: ${origin:-none}"; exit 0 ;;
+  esac
+
+  br=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)
+
+  if [ "$DRY" = 1 ]; then
+    if [ "$br" = "$BRANCH" ]; then
+      emit WOULD-PULL "$name" "ff-only merge on $BRANCH"
+    else
+      emit WOULD-FETCH-REF "$name" "fetch $BRANCH:$BRANCH (on $br)"
+    fi
+    exit 0
+  fi
+
+  if [ "$br" = "$BRANCH" ]; then
+    old=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+    if ! err=$(git -C "$dir" fetch --quiet origin "$BRANCH" 2>&1); then
+      emit FAILED "$name" "fetch: $(first_line "$err")"; exit 0
+    fi
+    if ! err=$(git -C "$dir" merge --ff-only --quiet "origin/$BRANCH" 2>&1); then
+      emit FAILED "$name" "ff-only merge: $(first_line "$err")"; exit 0
+    fi
+    new=$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)
+    if [ "$old" = "$new" ]; then emit CURRENT "$name" "$new"; else emit UPDATED "$name" "$old..$new"; fi
+  else
+    old=$(git -C "$dir" rev-parse --short "$BRANCH" 2>/dev/null || echo none)
+    if ! err=$(git -C "$dir" fetch --quiet origin "$BRANCH:$BRANCH" 2>&1); then
+      emit FAILED "$name" "fetch $BRANCH:$BRANCH (on $br): $(first_line "$err")"; exit 0
+    fi
+    new=$(git -C "$dir" rev-parse --short "$BRANCH" 2>/dev/null)
+    if [ "$old" = "$new" ]; then
+      emit CURRENT "$name" "$new (on $br)"
+    else
+      emit UPDATED-REF "$name" "$old..$new (on $br)"
+    fi
+  fi
+  exit 0
+fi
+
+# ---- driver mode ------------------------------------------------------------
+DRY=0; ARCHIVED=0; JOBS=6; DIR="$HOME/git"
+while getopts "naj:d:h" opt; do
+  case "$opt" in
+    n) DRY=1 ;;
+    a) ARCHIVED=1 ;;
+    j) JOBS="$OPTARG" ;;
+    d) DIR="${OPTARG/#\~/$HOME}" ;;
+    h|*) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  esac
+done
+shift $((OPTIND - 1))
+PREFIXES="${*:-act- ath- usr- mig- wor- fin- prt-}"
+
+for t in gh git python3 xargs; do
+  command -v "$t" >/dev/null 2>&1 || { echo "fb-repo-sync: '$t' is required" >&2; exit 1; }
+done
+mkdir -p "$DIR" || { echo "fb-repo-sync: cannot create $DIR" >&2; exit 1; }
+
+if ! LIST=$(gh repo list "$ORG" --limit 1000 --json name,sshUrl,isArchived,isEmpty 2>&1); then
+  echo "fb-repo-sync: gh repo list $ORG failed: $(first_line "$LIST")" >&2; exit 1
+fi
+
+# Two kinds of lines: "R<TAB>name<TAB>url" (eligible) and "S<TAB>name<TAB>reason".
+# The JSON goes through a temp file because the heredoc below owns stdin.
+TMP=$(mktemp) || exit 1
+trap 'rm -f "$TMP"' EXIT
+printf '%s' "$LIST" > "$TMP"
+PLAN=$(ARCHIVED="$ARCHIVED" PREFIXES="$PREFIXES" python3 - "$TMP" <<'PY'
+import json, os, sys
+with open(sys.argv[1]) as fh:
+    repos = json.load(fh)
+prefixes = tuple(os.environ["PREFIXES"].split())
+archived_ok = os.environ["ARCHIVED"] == "1"
+for r in sorted(repos, key=lambda r: r["name"]):
+    n = r["name"]
+    if not n.startswith(prefixes):
+        continue
+    if r.get("isArchived") and not archived_ok:
+        print(f"S\t{n}\tarchived (use -a to include)")
+    elif r.get("isEmpty"):
+        print(f"S\t{n}\tempty repo, no default branch")
+    else:
+        print(f"R\t{n}\t{r['sshUrl']}")
+PY
+)
+
+ELIGIBLE=$(printf '%s\n' "$PLAN" | awk -F'\t' '$1=="R"{print $2, $3}')
+PRESKIP=$(printf '%s\n' "$PLAN" | awk -F'\t' -v OFS='\t' '$1=="S"{print "SKIPPED", $2, $3}')
+
+if [ -z "$ELIGIBLE" ]; then
+  echo "fb-repo-sync: no non-skipped repos in '$ORG' match: $PREFIXES" >&2
+  [ -n "$PRESKIP" ] && printf '%s\n' "$PRESKIP"
+  exit 0
+fi
+
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+export DRY DIR ORG BRANCH
+RESULTS=$(printf '%s\n' "$ELIGIBLE" | xargs -P "$JOBS" -n 2 "$SELF" --worker)
+
+# Report: fixed status order, then by name.
+ALL=$(printf '%s\n%s\n' "$RESULTS" "$PRESKIP" | awk -F'\t' 'NF==3')
+ORDER="CLONED UPDATED UPDATED-REF CURRENT WOULD-CLONE WOULD-PULL WOULD-FETCH-REF SKIPPED FAILED"
+for st in $ORDER; do
+  printf '%s\n' "$ALL" | awk -F'\t' -v st="$st" '$1==st' | sort -t$'\t' -k2,2 \
+    | awk -F'\t' '{printf "%-16s %-36s %s\n", $1, $2, $3}'
+done
+
+echo
+printf '%s\n' "$ALL" | awk -F'\t' '{c[$1]++} END{
+  n=split("CLONED UPDATED UPDATED-REF CURRENT WOULD-CLONE WOULD-PULL WOULD-FETCH-REF SKIPPED FAILED", o, " ");
+  s="summary:"; for(i=1;i<=n;i++) if(o[i] in c) s=s" "tolower(o[i])"="c[o[i]]; print s}'
+
+printf '%s\n' "$ALL" | awk -F'\t' '$1=="FAILED"{f=1} END{exit f?1:0}'
