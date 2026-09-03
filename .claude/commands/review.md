@@ -53,7 +53,7 @@ Report anything they surface as findings **before** Step 2, and fix them first. 
 
 Invoke the **Workflow tool** with the saved orchestration script (this slash command IS your explicit opt-in to run it):
 
-- `scriptPath`: `/Users/steverhoton/.claude/workflows/review-fanout.js`
+- `scriptPath`: `~/.claude/workflows/review-fanout.js`
 - `args` (JSON object, not a string):
   - `repoRoot`: absolute repo root
   - `files`: the changed-file list from Step 1
