@@ -47,7 +47,7 @@ In a SINGLE message, send one `Task` tool call per stack using `subagent_type: g
 ```
 You are shipping a single stack: {stack} (expected SHA: {target_sha}).
 
-Execute the canonical 8-stage Port.io shipit pipeline EXACTLY as defined in /Users/steverhoton/.claude/commands/shipit.md. Use Port.io MCP tools only.
+Execute the canonical 8-stage Port.io shipit pipeline EXACTLY as defined in ~/.claude/commands/shipit.md. Use Port.io MCP tools only.
 
 After EACH step, output exactly one line to your final response in this format:
   STATUS: stack={stack} step=<1-8> name=<step-name> state=<IN_PROGRESS|SUCCESS|FAILED|SKIPPED> detail=<short message>

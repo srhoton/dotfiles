@@ -32,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/tmux-on-notification.sh",
+            "command": "bash $HOME/.claude/hooks/tmux-on-notification.sh",
             "timeout": 5000
           }
         ]
@@ -44,7 +44,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/format-on-edit.sh",
+            "command": "bash $HOME/.claude/hooks/format-on-edit.sh",
             "timeout": 30000
           }
         ]
@@ -54,7 +54,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/pr-stale-check.sh",
+            "command": "bash $HOME/.claude/hooks/pr-stale-check.sh",
             "timeout": 15000
           }
         ]
@@ -66,27 +66,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/pre-commit-checks.sh",
+            "command": "bash $HOME/.claude/hooks/pre-commit-checks.sh",
             "timeout": 120000
           },
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/guard-destructive-git.sh",
+            "command": "bash $HOME/.claude/hooks/guard-destructive-git.sh",
             "timeout": 10000
           },
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/guard-aws-sso.sh",
+            "command": "bash $HOME/.claude/hooks/guard-aws-sso.sh",
             "timeout": 15000
           },
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/guard-pr-state.sh",
+            "command": "bash $HOME/.claude/hooks/guard-pr-state.sh",
             "timeout": 15000
           },
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/guard-npm-install.sh",
+            "command": "bash $HOME/.claude/hooks/guard-npm-install.sh",
             "timeout": 10000
           }
         ]
@@ -97,7 +97,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/tmux-on-session-end.sh",
+            "command": "bash $HOME/.claude/hooks/tmux-on-session-end.sh",
             "timeout": 5000
           }
         ]
@@ -108,23 +108,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/session-env-setup.sh",
+            "command": "bash $HOME/.claude/hooks/session-env-setup.sh",
             "timeout": 5000
           },
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/sessionstart-envdrift.sh",
+            "command": "bash $HOME/.claude/hooks/sessionstart-envdrift.sh",
             "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash '/Users/steverhoton/.claude/hooks/herdr-agent-state.sh' session",
-            "timeout": 10
           }
         ]
       }
@@ -134,7 +124,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/steverhoton/.claude/hooks/tmux-on-stop.sh",
+            "command": "bash $HOME/.claude/hooks/tmux-on-stop.sh",
             "timeout": 5000
           }
         ]
@@ -143,7 +133,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "bash /Users/steverhoton/.claude/statusline-command.sh"
+    "command": "bash $HOME/.claude/statusline-command.sh"
   },
   "enabledPlugins": {
     "aws-agents@agent-toolkit-for-aws": true,
