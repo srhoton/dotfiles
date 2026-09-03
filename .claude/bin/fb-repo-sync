@@ -23,7 +23,7 @@
 #   -j N    parallel workers (default 6)
 #   -d DIR  target directory (default ~/git)
 #   PREFIX  repo-name prefixes
-#           (default: act- ath- usr- mig- wor- fin- prt- aps- unt-)
+#           (default: act- ath- usr- mig- wor- fin- prt- aps- unt- app-)
 #
 # Environment: FB_ORG overrides the GitHub org (default fullbay).
 
@@ -109,7 +109,7 @@ while getopts "naj:d:h" opt; do
   esac
 done
 shift $((OPTIND - 1))
-PREFIXES="${*:-act- ath- usr- mig- wor- fin- prt- aps- unt-}"
+PREFIXES="${*:-act- ath- usr- mig- wor- fin- prt- aps- unt- app-}"
 
 for t in gh git python3 xargs; do
   command -v "$t" >/dev/null 2>&1 || { echo "fb-repo-sync: '$t' is required" >&2; exit 1; }
