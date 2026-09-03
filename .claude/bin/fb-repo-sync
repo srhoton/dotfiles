@@ -22,7 +22,8 @@
 #   -a      include archived repos
 #   -j N    parallel workers (default 6)
 #   -d DIR  target directory (default ~/git)
-#   PREFIX  repo-name prefixes (default: act- ath- usr- mig- wor- fin- prt-)
+#   PREFIX  repo-name prefixes
+#           (default: act- ath- usr- mig- wor- fin- prt- aps- unt-)
 #
 # Environment: FB_ORG overrides the GitHub org (default fullbay).
 
@@ -104,11 +105,11 @@ while getopts "naj:d:h" opt; do
     a) ARCHIVED=1 ;;
     j) JOBS="$OPTARG" ;;
     d) DIR="${OPTARG/#\~/$HOME}" ;;
-    h|*) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    h|*) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   esac
 done
 shift $((OPTIND - 1))
-PREFIXES="${*:-act- ath- usr- mig- wor- fin- prt-}"
+PREFIXES="${*:-act- ath- usr- mig- wor- fin- prt- aps- unt-}"
 
 for t in gh git python3 xargs; do
   command -v "$t" >/dev/null 2>&1 || { echo "fb-repo-sync: '$t' is required" >&2; exit 1; }
