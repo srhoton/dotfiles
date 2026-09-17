@@ -5,7 +5,7 @@ Helper executables on `PATH` for Claude Code workflows.
 ## Tracked (shell scripts)
 
 - `agent-msg` — inter-Claude mailbox CLI (legacy filesystem mailbox).
-- `fb-repo-sync` — clones or fast-forwards the fullbay `act-/ath-/usr-/mig-/wor-/fin-/prt-/aps-/unt-/app-` repos into `~/git` without ever switching branches or touching a working tree (`-n` dry run, `-a` include archived).
+- `fb-repo-sync` — clones or fast-forwards the fullbay `act-/ath-/usr-/mig-/wor-/fin-/prt-/aps-/unt-/app-` repos, plus `fb-architecture/architecture-*` and `fb-peo-apex/apex`, into `~/git` on each repo's own default branch, without ever switching branches or touching a working tree (`-n` dry run, `-a` include archived).
 - `pr-review-queue` — finds open PRs awaiting my review and starts a Claude session running `/reviewit <PR#>` for each, in a throwaway detached worktree under `~/git/.pr-review/` and its own tmux window (`-n` dry run, `-m N` cap, `-o ORG` filter, `--clean`).
 - `sha-relation` — classifies a deployed SHA as ahead/behind/equal for env-drift checks.
 - `stale-prs` — lists open PRs being ignored in the current repo.
