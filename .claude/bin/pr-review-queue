@@ -1,0 +1,264 @@
+#!/bin/bash
+#
+# pr-review-queue — find the open PRs where my review is requested and start a
+# Claude Code session running `/reviewit <PR#>` for each one.
+#
+# For each PR:
+#   - the repo's clone is DIR/<repo> (cloned if missing; skipped if its origin
+#     is some other repository)
+#   - the PR head is fetched into a throwaway DETACHED worktree at
+#     DIR/.pr-review/<repo>-<PR#>, so the working clone, its branch and any
+#     uncommitted changes are never touched and several PRs of one repo can
+#     be reviewed at once
+#   - inside tmux: one new window per PR, named <repo>#<PR#>, running claude.
+#     Outside tmux: the sessions run one after another in this terminal.
+#
+# The head SHA is recorded at launch in ~/.claude/state/pr-review-queue.json;
+# a PR is not launched again until its head moves (or -f). The script cannot
+# see whether a review was finished, only that it was started.
+#
+# Prints one line per PR ("STATUS  repo#N  detail"), then a count summary.
+# Exit 1 if any PR FAILED, else 0.
+#
+# Usage: pr-review-queue [-n] [-f] [-m N] [-d DIR] [-o ORG ...] [--clean]
+#   -n       dry run: report what would launch, change nothing
+#   -f       force: ignore the already-launched state
+#   -m N     max sessions launched per run (default 4; a review fans out to
+#            several subagents, so this bounds the load)
+#   -d DIR   clone root (default $PR_REVIEW_DIR or ~/git)
+#   -o ORG   only PRs in this org/owner (repeatable; default: all)
+#   --clean  remove review worktrees whose PR is no longer open (clean
+#            worktrees only) and drop their state entries
+
+set -uo pipefail
+
+STATE="$HOME/.claude/state/pr-review-queue.json"
+DIR="${PR_REVIEW_DIR:-$HOME/git}"
+DRY=0; FORCE=0; MAX=4; CLEAN=0; ORGS=""
+
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; }
+first_line() { printf '%s' "$1" | sed -n '1p'; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) DRY=1 ;;
+    -f) FORCE=1 ;;
+    -m) MAX="${2:?-m needs a number}"; shift ;;
+    -d) DIR="${2:?-d needs a directory}"; DIR="${DIR/#\~/$HOME}"; shift ;;
+    -o) ORGS="$ORGS ${2:?-o needs an org}"; shift ;;
+    --clean) CLEAN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "pr-review-queue: unknown option '$1'" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
+case "$MAX" in ''|*[!0-9]*) echo "pr-review-queue: -m needs a number" >&2; exit 1 ;; esac
+
+for t in gh git python3 claude; do
+  command -v "$t" >/dev/null 2>&1 || { echo "pr-review-queue: '$t' is required" >&2; exit 1; }
+done
+
+WTROOT="$DIR/.pr-review"
+RESULTS=""
+emit() { RESULTS="${RESULTS}$1"$'\t'"$2"$'\t'"$3"$'\n'; }
+
+# ---- state file (JSON object: "owner/repo#N" -> head sha) --------------------
+state_get() {
+  python3 - "$STATE" "$1" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
+except (OSError, ValueError):
+    print("")
+PY
+}
+state_put() {  # key sha   (empty sha deletes the key)
+  mkdir -p "$(dirname "$STATE")"
+  python3 - "$STATE" "$1" "$2" <<'PY'
+import json, os, sys
+path, key, sha = sys.argv[1:4]
+try:
+    data = json.load(open(path))
+except (OSError, ValueError):
+    data = {}
+if sha:
+    data[key] = sha
+else:
+    data.pop(key, None)
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(data, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+report() {
+  local order="$1" st
+  for st in $order; do
+    printf '%s' "$RESULTS" | awk -F'\t' -v st="$st" '$1==st' \
+      | awk -F'\t' '{printf "%-14s %-40s %s\n", $1, $2, $3}'
+  done
+  echo
+  printf '%s' "$RESULTS" | awk -F'\t' -v order="$order" '{c[$1]++} END{
+    n=split(order, o, " "); s="summary:";
+    for(i=1;i<=n;i++) if(o[i] in c) s=s" "tolower(o[i])"="c[o[i]];
+    if (s=="summary:") s=s" nothing to do"; print s}'
+  printf '%s' "$RESULTS" | awk -F'\t' '$1=="FAILED"{f=1} END{exit f?1:0}'
+}
+
+# ---- --clean -----------------------------------------------------------------
+if [ "$CLEAN" = 1 ]; then
+  for wt in "$WTROOT"/*; do
+    [ -d "$wt" ] || continue
+    base=$(basename "$wt"); num="${base##*-}"; repo="${base%-*}"
+    origin=$(git -C "$wt" remote get-url origin 2>/dev/null || true)
+    slug=$(printf '%s' "$origin" | sed -nE 's#.*github\.com[:/]([^/]+/[^/]+)$#\1#p' | sed 's/\.git$//')
+    if [ -z "$slug" ]; then emit SKIPPED "$base" "cannot determine repo from origin"; continue; fi
+    key="$slug#$num"
+    prstate=$(gh pr view "$num" -R "$slug" --json state -q .state 2>/dev/null || true)
+    if [ -z "$prstate" ]; then emit SKIPPED "$key" "could not read PR state"; continue; fi
+    if [ "$prstate" = "OPEN" ]; then emit KEPT "$key" "PR still open"; continue; fi
+    if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+      emit KEPT "$key" "PR $prstate but worktree has uncommitted changes: $wt"; continue
+    fi
+    if [ "$DRY" = 1 ]; then emit WOULD-REMOVE "$key" "PR $prstate: $wt"; continue; fi
+    if err=$(git -C "$DIR/$repo" worktree remove "$wt" 2>&1); then
+      state_put "$key" ""
+      emit REMOVED "$key" "PR $prstate"
+    else
+      emit FAILED "$key" "worktree remove: $(first_line "$err")"
+    fi
+  done
+  report "REMOVED WOULD-REMOVE KEPT SKIPPED FAILED"
+  exit $?
+fi
+
+# ---- enumerate review requests -------------------------------------------------
+if ! LIST=$(gh search prs --review-requested=@me --state=open --limit 100 \
+      --json repository,number,title,isDraft,author,updatedAt 2>&1); then
+  echo "pr-review-queue: gh search prs failed: $(first_line "$LIST")" >&2; exit 1
+fi
+
+# One line per PR: slug<TAB>repo<TAB>number<TAB>label   (oldest activity first).
+# The JSON goes through a temp file because the heredoc owns stdin.
+TMP=$(mktemp) || exit 1
+trap 'rm -f "$TMP"' EXIT
+printf '%s' "$LIST" > "$TMP"
+PLAN=$(ORGS="$ORGS" python3 - "$TMP" <<'PY'
+import json, os, sys
+with open(sys.argv[1]) as fh:
+    prs = json.load(fh)
+orgs = set(os.environ.get("ORGS", "").split())
+for p in sorted(prs, key=lambda p: p.get("updatedAt", "")):
+    slug = p["repository"]["nameWithOwner"]
+    if orgs and slug.split("/")[0] not in orgs:
+        continue
+    title = " ".join((p.get("title") or "-").split())[:60]
+    author = (p.get("author") or {}).get("login") or "?"
+    draft = " [draft]" if p.get("isDraft") else ""
+    print(f"{slug}\t{p['repository']['name']}\t{p['number']}\t@{author}{draft}: {title}")
+PY
+)
+
+if [ -z "$PLAN" ]; then
+  echo "pr-review-queue: no open PRs are waiting on your review${ORGS:+ in:$ORGS}"
+  exit 0
+fi
+
+IN_TMUX=0
+[ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1 && IN_TMUX=1
+LAUNCHED=0
+
+# fd 3 carries the plan so that claude (sequential mode) keeps the terminal on stdin.
+while IFS=$'\t' read -r slug repo num label <&3; do
+  key="$slug#$num"; clone="$DIR/$repo"; wt="$WTROOT/$repo-$num"; win="$repo#$num"
+
+  sha=$(gh pr view "$num" -R "$slug" --json headRefOid -q .headRefOid 2>/dev/null || true)
+  if [ -z "$sha" ]; then emit FAILED "$key" "could not read PR head SHA"; continue; fi
+
+  if [ "$FORCE" = 0 ] && [ "$(state_get "$key")" = "$sha" ]; then
+    emit SKIPPED "$key" "already launched at ${sha:0:7} (-f to relaunch)"; continue
+  fi
+  if [ "$IN_TMUX" = 1 ] && tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep -Fxq "$win"; then
+    emit SKIPPED "$key" "tmux window '$win' is already open"; continue
+  fi
+  if [ -e "$clone" ]; then
+    origin=$(git -C "$clone" remote get-url origin 2>/dev/null || true)
+    case "$origin" in
+      *github.com[:/]"$slug"|*github.com[:/]"$slug".git) ;;
+      *) emit SKIPPED "$key" "origin mismatch in $clone: ${origin:-none}"; continue ;;
+    esac
+  fi
+  if [ "$LAUNCHED" -ge "$MAX" ]; then
+    emit DEFERRED "$key" "limit of $MAX per run reached — $label"; continue
+  fi
+
+  if [ "$DRY" = 1 ]; then
+    how="worktree $wt"; [ -e "$clone" ] || how="clone $slug, then $how"
+    emit WOULD-LAUNCH "$key" "$label ($how)"; LAUNCHED=$((LAUNCHED + 1)); continue
+  fi
+
+  if [ ! -e "$clone" ]; then
+    mkdir -p "$DIR"
+    if ! err=$(git clone --quiet "git@github.com:$slug.git" "$clone" 2>&1); then
+      emit FAILED "$key" "clone: $(first_line "$err")"; continue
+    fi
+  fi
+  if ! err=$(git -C "$clone" fetch --quiet origin "pull/$num/head" 2>&1); then
+    emit FAILED "$key" "fetch pull/$num/head: $(first_line "$err")"; continue
+  fi
+  if [ ! -e "$wt" ]; then
+    mkdir -p "$WTROOT"
+    if ! err=$(git -C "$clone" worktree add --quiet --detach "$wt" "$sha" 2>&1); then
+      emit FAILED "$key" "worktree add: $(first_line "$err")"; continue
+    fi
+  elif [ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+    if ! err=$(git -C "$wt" checkout --quiet --detach "$sha" 2>&1); then
+      emit FAILED "$key" "worktree update: $(first_line "$err")"; continue
+    fi
+  fi  # a dirty existing worktree is reused exactly as it is
+
+  if [ "$IN_TMUX" = 1 ]; then
+    if ! err=$(tmux new-window -d -n "$win" -c "$wt" "claude -n 'review $win' '/reviewit $num'" 2>&1); then
+      emit FAILED "$key" "tmux new-window: $(first_line "$err")"; continue
+    fi
+    state_put "$key" "$sha"
+    emit LAUNCHED "$key" "window '$win' — $label"
+  else
+    echo ">>> $key — $label" >&2
+    state_put "$key" "$sha"
+    (cd "$wt" && claude -n "review $win" "/reviewit $num")
+    emit LAUNCHED "$key" "ran in this terminal — $label"
+  fi
+  LAUNCHED=$((LAUNCHED + 1))
+done 3<<< "$PLAN"
+
+# Every new worktree is a new path, so Claude Code shows its folder-trust
+# prompt in each window unless WTROOT (or a parent) has been trusted. That is
+# the user's call to make, so only point it out — never write the flag here.
+if ! python3 - "$HOME/.claude.json" "$WTROOT" <<'PY'
+import json, os, sys
+try:
+    projects = json.load(open(sys.argv[1])).get("projects", {})
+except (OSError, ValueError):
+    sys.exit(1)
+path = os.path.realpath(sys.argv[2])
+while True:
+    if projects.get(path, {}).get("hasTrustDialogAccepted"):
+        sys.exit(0)
+    parent = os.path.dirname(path)
+    if parent == path:
+        sys.exit(1)
+    path = parent
+PY
+then
+  {
+    echo "note: $WTROOT is not a trusted folder, so each review window will stop at"
+    echo "      Claude Code's 'trust this folder?' prompt. To answer it once for all"
+    echo "      review worktrees:  cd $WTROOT && claude   (accept, then exit)"
+    echo
+  } >&2
+fi
+
+report "LAUNCHED WOULD-LAUNCH DEFERRED SKIPPED FAILED"

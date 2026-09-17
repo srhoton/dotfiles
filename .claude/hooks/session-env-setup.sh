@@ -69,6 +69,7 @@ export PATH="/opt/homebrew/opt/mysql@8.4/bin:$PATH"
 export PATH="$PATH:/opt/homebrew/opt/python@3.11/libexec/bin"
 export PATH="$PATH:$HOME/go/bin"
 export PATH="$PATH:$HOME/.local/bin"
+export PATH="$PATH:$HOME/.claude/bin"
 PATHS
 
 # ---------------------------------------------------------------------------
