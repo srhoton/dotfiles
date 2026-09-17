@@ -27,7 +27,9 @@ Save the PR title, body, head SHA, and list of changed files for use in later st
 ORIGINAL_BRANCH=$(git branch --show-current)
 ```
 
-Then checkout the PR:
+`ORIGINAL_BRANCH` is empty on a detached HEAD — that is the case in a review worktree prepared by `~/.claude/bin/pr-review-queue`.
+
+Then checkout the PR — **unless `git rev-parse HEAD` already equals the PR's `headRefOid`** (a prepared review worktree is already on it; skip the checkout):
 
 ```bash
 gh pr checkout $ARGUMENTS
@@ -69,7 +71,7 @@ From the workflow's returned structure (or your own aggregation in the fallback 
 
 Display the MEDIUM/LOW findings in the terminal as an informational summary (not proposed as PR comments).
 
-If there are **zero** CRITICAL/HIGH findings, report: "Clean review — no critical or high issues found." Then display the informational summary if any, checkout the original branch, and stop.
+If there are **zero** CRITICAL/HIGH findings, report: "Clean review — no critical or high issues found." Then display the informational summary if any, checkout the original branch (only if `ORIGINAL_BRANCH` was non-empty), and stop.
 
 ---
 
@@ -127,7 +129,7 @@ _Reviewed by Claude (functional-reviewer + code-quality-reviewer + adr-complianc
 
 ## Step 6: Cleanup
 
-Checkout the original branch:
+Checkout the original branch (skip this if `ORIGINAL_BRANCH` was empty — there is nothing to return to in a detached review worktree):
 
 ```bash
 git checkout <ORIGINAL_BRANCH>
