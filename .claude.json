@@ -30,14 +30,8 @@
   "promptQueueUseCount": 29,
   "mcpServers": {
     "Atlassian": {
-      "type": "stdio",
-      "command": "npx",
-      "args": [
-        "-y",
-        "mcp-remote",
-        "https://mcp.atlassian.com/v1/sse"
-      ],
-      "env": {}
+      "type": "http",
+      "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
     },
     "Github": {
       "type": "stdio",
@@ -93,14 +87,8 @@
       "mcpContextUris": [],
       "mcpServers": {
         "Atlassian": {
-          "type": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "mcp-remote",
-            "https://mcp.atlassian.com/v1/sse"
-          ],
-          "env": {}
+          "type": "http",
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -235,14 +223,8 @@
       ],
       "mcpServers": {
         "Atlassian": {
-          "type": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "mcp-remote",
-            "https://mcp.atlassian.com/v1/sse"
-          ],
-          "env": {}
+          "type": "http",
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -335,14 +317,8 @@
       "mcpContextUris": [],
       "mcpServers": {
         "Atlassian": {
-          "type": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "mcp-remote",
-            "https://mcp.atlassian.com/v1/sse"
-          ],
-          "env": {}
+          "type": "http",
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -401,14 +377,8 @@
       "mcpContextUris": [],
       "mcpServers": {
         "Atlassian": {
-          "type": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "mcp-remote",
-            "https://mcp.atlassian.com/v1/sse"
-          ],
-          "env": {}
+          "type": "http",
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -521,14 +491,8 @@
       "mcpContextUris": [],
       "mcpServers": {
         "Atlassian": {
-          "type": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "mcp-remote",
-            "https://mcp.atlassian.com/v1/sse"
-          ],
-          "env": {}
+          "type": "http",
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -838,14 +802,8 @@
       "mcpContextUris": [],
       "mcpServers": {
         "Atlassian": {
-          "type": "stdio",
-          "command": "npx",
-          "args": [
-            "-y",
-            "mcp-remote",
-            "https://mcp.atlassian.com/v1/sse"
-          ],
-          "env": {}
+          "type": "http",
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
