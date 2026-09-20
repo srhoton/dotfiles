@@ -31,7 +31,7 @@
   "mcpServers": {
     "Atlassian": {
       "type": "http",
-      "url": "https://mcp.atlassian.com/v1/mcp"
+      "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
     },
     "Github": {
       "type": "stdio",
@@ -88,7 +88,7 @@
       "mcpServers": {
         "Atlassian": {
           "type": "http",
-          "url": "https://mcp.atlassian.com/v1/mcp"
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -224,7 +224,7 @@
       "mcpServers": {
         "Atlassian": {
           "type": "http",
-          "url": "https://mcp.atlassian.com/v1/mcp"
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -318,7 +318,7 @@
       "mcpServers": {
         "Atlassian": {
           "type": "http",
-          "url": "https://mcp.atlassian.com/v1/mcp"
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -378,7 +378,7 @@
       "mcpServers": {
         "Atlassian": {
           "type": "http",
-          "url": "https://mcp.atlassian.com/v1/mcp"
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -492,7 +492,7 @@
       "mcpServers": {
         "Atlassian": {
           "type": "http",
-          "url": "https://mcp.atlassian.com/v1/mcp"
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
@@ -803,7 +803,7 @@
       "mcpServers": {
         "Atlassian": {
           "type": "http",
-          "url": "https://mcp.atlassian.com/v1/mcp"
+          "url": "https://mcp.atlassian.com/v2/mcp?tools=all"
         },
         "Github": {
           "type": "stdio",
