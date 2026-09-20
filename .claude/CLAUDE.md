@@ -24,12 +24,14 @@
 - Before modifying dependencies (Gradle/npm), verify compatibility with current project versions. Do not move runtime dependencies to compileOnly without confirming they are not needed at build/augmentation time.
 - Before claiming a dependency or version doesn't exist, verify against the actual registry. A 404/failed install for `@fullbay/*` packages is almost always a stale CodeArtifact/SSO token, not a missing package — refresh the token and retry first.
 - Never suggest skipping or bypassing pre-commit hooks (`--no-verify`) to get around a failing install or check. Fix the underlying cause.
+- After `git add`, run `git diff --cached --stat` and confirm the intended files are actually staged before committing. A path or glob that matches nothing stages nothing, and the commit goes out without the work.
 
 ### Data Validation
 - Validate data-related changes (finance figures, opening balances, parts/order counts, discrepancies) against live data — Athena queries or the relevant live source — before considering the implementation complete. Do not trust the spec's numbers alone.
 - For debugging, the first move is to confirm or refute the reported hypothesis with live evidence (Athena, AppSync/CloudWatch logs, Step Function execution history) before proposing or implementing a fix, and surface that evidence. Refuting a wrong bug report with data is a valid, preferred outcome — never code to a faulty assumption.
 - Reuse the enabled `aws-data-analytics` plugin's `querying-data-lake` (Athena) skill for these queries rather than hand-rolling SQL/CLI.
 - Do not infer schema, table names, bucket names, or config placement from git history, closed PRs, or sibling repos — those are frequently stale. Verify against the live source and state the query and its actual result.
+- For extraction/transform/reconciliation tooling, validate against the full corpus — or at least 10 inputs of deliberately different shapes — before calling it done, and report the pass/fail count. One passing sample is not evidence; an extractor built from a single invoice needed a rewrite across the 350-invoice corpus.
 
 ### Pull Requests
 - When creating PRs, check if a referenced PR number is still open. Never update a closed PR -- create a new one.
@@ -51,6 +53,7 @@
 
 ### AWS Agent Toolkit
 - Prefer the AWS MCP Server (the `aws-core`/`aws-agents`/`aws-data-analytics` plugins) over raw `aws` CLI calls — it gives sandboxed execution, observability, and audit logging. Fall back to the CLI only when the MCP server is unavailable.
+- If the `aws-data-analytics` `aws-mcp` server fails to connect with `-32602 Invalid request parameters`, the cause is expired default credentials, not the plugin: the proxy runs without `--profile`, so it uses the `[default]` profile's `aws login` session. Ask me to run `! aws login`, then reconnect the server via `/mcp`.
 - Skill-first: before an AWS task, load the relevant bundled skill (`retrieve_skill` via the AWS-knowledge MCP, or the `Skill` tool for `aws-core:*`/`aws-data-analytics:*` skills) and follow its guidance rather than reasoning from general knowledge.
 - **Secrets Manager (hard rule):** for any secret/credential/API-key/token/password task, load the `aws-secrets-manager` skill first and follow it. Do NOT call `secretsmanager get-secret-value`/`batch-get-secret-value` or hit the Secrets Manager Agent daemon directly — the secret would enter context. Use the skill's runtime-resolution pattern (`{{resolve:secretsmanager:<secret-id>:SecretString:<json-key>}}`, resolved at deploy/runtime) so the value never lands in context.
 - IaC over ad-hoc mutation: create/modify AWS infrastructure through Terraform (per @~/.claude/terraform_rules.md and the Terraform Conventions above), not one-off CLI mutations. (The AWS toolkit suggests CDK/CloudFormation — we standardize on Terraform.)
@@ -95,6 +98,7 @@
 - Before drafting any plan that names a service, file, library version, or commit SHA you don't already know exists in this repo, run `/verify-premise` (or invoke the `premise-verifier` agent directly). If the referenced target is not actually present or current, stop and report — do not build a plan against a phantom target.
 - Mandatory for: cross-service/cross-repo features, "look at how X uses Y" exploration that quotes a specific symbol, integration plans referencing a service the current repo has no obvious dependency on, and any task quoting a published library version or commit SHA.
 - Optional but encouraged: same check inside `/build-from-file` when reading a spec that references external services.
+- Before analyzing a repo as evidence of current behavior, run `gh repo view <org>/<repo> --json isArchived,pushedAt`. An archived repo (e.g. `unt-type-svc`) is not the source of truth — say it is archived and ask which repo replaced it.
 
 ## Deployment Workflow
 

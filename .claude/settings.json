@@ -139,7 +139,7 @@
     "aws-agents@agent-toolkit-for-aws": true,
     "aws-core@agent-toolkit-for-aws": false,
     "aws-data-analytics@agent-toolkit-for-aws": true,
-    "discord@claude-plugins-official": true,
+    "discord@claude-plugins-official": false,
     "gopls-lsp@claude-plugins-official": false,
     "jdtls-lsp@claude-plugins-official": false,
     "pyright-lsp@claude-plugins-official": false,
