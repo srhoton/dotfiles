@@ -41,7 +41,7 @@ gh pr checkout $ARGUMENTS
 
 Invoke the **Workflow tool** with the saved orchestration script (this slash command IS your explicit opt-in to run it):
 
-- `scriptPath`: `~/.claude/workflows/review-fanout.js`
+- `name`: `review-fanout` — launch the saved workflow by name. Do not pass a `scriptPath`: the Workflow tool does not expand `~`, and rejects absolute paths outside the current worktree.
 - `args` (JSON object, not a string):
   - `repoRoot`: absolute repo root
   - `files`: the PR's changed-file list from Step 1

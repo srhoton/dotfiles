@@ -45,6 +45,22 @@ else
   PROFILE_ARG=""; LABEL="(default credential chain)"
 fi
 
+# A profile that isn't configured fails the same way an expired session does,
+# but `aws sso login` can't fix it — say so and list the real ones instead.
+NAMED="${PROF:-${AWS_PROFILE:-}}"
+if [ -n "$NAMED" ] && [ "$NAMED" != "default" ]; then
+  KNOWN=$(aws configure list-profiles 2>/dev/null)
+  if [ -n "$KNOWN" ] && ! printf '%s\n' "$KNOWN" | grep -qxF "$NAMED"; then
+    {
+      echo "BLOCKED: AWS profile '$NAMED' is not configured on this machine."
+      echo "Do NOT guess another name. Pick from the configured profiles and"
+      echo "confirm the target account with the user:"
+      printf '%s\n' "$KNOWN" | sed 's/^/    /'
+    } >&2
+    exit 2
+  fi
+fi
+
 STAMP_DIR="$HOME/.claude/session-env"
 mkdir -p "$STAMP_DIR" 2>/dev/null
 KEY=$(printf '%s' "$LABEL" | tr -c 'A-Za-z0-9_.-' '_')
@@ -70,6 +86,11 @@ fi
     echo "Ask the user to re-authenticate:"
     echo "    aws sso login --profile $LABEL"
     echo "(They can run it inline in Claude Code:  ! aws sso login --profile $LABEL )"
+  elif grep -A4 '^\[default\]' "$HOME/.aws/config" 2>/dev/null | grep -q '^login_session'; then
+    echo "The default profile uses an 'aws login' session, which has expired."
+    echo "Ask the user to re-authenticate:   ! aws login"
+    echo "(The aws-data-analytics MCP server uses these same credentials, so it"
+    echo "fails with '-32602 Invalid request parameters' until this is done.)"
   else
     echo "No --profile was given and AWS_PROFILE is unset. Confirm the intended"
     echo "account with the user, then have them run: aws sso login --profile <p>"
