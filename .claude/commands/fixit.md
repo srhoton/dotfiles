@@ -1,4 +1,4 @@
-You are unblocking **my own** PR #$ARGUMENTS. Its reviewers asked for changes, left unresolved comments, or it has a merge conflict. Your job is to resolve the conflict, address every actionable comment, push, and reply on each thread.
+You are unblocking **my own** PR #$ARGUMENTS. Its reviewers asked for changes, left unresolved review threads or conversation comments, or it has a merge conflict. Your job is to resolve the conflict, address every actionable thread and comment, push, reply, and mark each conversation comment handled.
 
 **IMPORTANT: Use `gh` CLI for ALL GitHub operations. Do NOT use GitHub MCP tools.**
 
@@ -55,13 +55,47 @@ A thread is **actionable** when all of these hold — this is the same test `pr-
 - its **first** comment's author is a human (`__typename == "User"`)
 - its **last** comment is not mine (if I already replied, it is waiting on the reviewer, not on me)
 
+Then get the **conversation comments** — top-level comments that are not attached to a line. Reviewers (and `/reviewit`, for MEDIUM findings and when an inline post fails) leave real findings here, and they have no thread:
+
+```bash
+ME=$(gh api user --jq .login)
+gh api graphql -f query='
+query($owner:String!, $name:String!, $num:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$num) {
+      comments(last: 50) {
+        totalCount
+        nodes {
+          databaseId url body createdAt lastEditedAt isMinimized
+          author { login __typename }
+          reactionGroups { content viewerHasReacted }
+          reactions(last: 20) { nodes { content createdAt user { login } } }
+        }
+      }
+    }
+  }
+}' -f owner="${REPO%/*}" -f name="${REPO#*/}" -F num=$ARGUMENTS
+```
+
+A conversation comment is **unhandled** when all of these hold — again the same test `pr-fix-queue` uses:
+
+- its author is a human (`__typename == "User"`) and is not me, and `isMinimized` is false
+- I do **not** have a `ROCKET` reaction on it that is at least as new as its `lastEditedAt` (a comment edited after my rocket is unhandled again)
+
+Only my `ROCKET` counts. A thumbs-up of mine, or a reply of mine further down, does **not** make a comment handled. Read my own later comments anyway: if one already answers an unhandled comment (it contains that comment's URL, or plainly responds to it), that comment only needs its rocket (Step 7), not a second reply.
+
+Sort each unhandled comment into one of two kinds:
+
+- **actionable** — it asks for a change, reports a defect, or asks me a question
+- **acknowledge-only** — "LGTM", thanks, a status note, a question addressed to someone else
+
 Also read the review bodies for context, since a `CHANGES_REQUESTED` review often explains itself outside any thread:
 
 ```bash
 gh pr view $ARGUMENTS --json reviews --jq '.reviews[] | select(.state=="CHANGES_REQUESTED") | {author: .author.login, body: .body}'
 ```
 
-List what you found before changing anything: each actionable thread as `path:line — reviewer — the ask`, plus the conflict state. If there is nothing actionable and no conflict, say so and stop.
+List what you found before changing anything: each actionable thread as `path:line — reviewer — the ask`, each unhandled conversation comment as `<comment url> — reviewer — the ask` (or `— acknowledge-only`), plus the conflict state. If `totalCount` is over 50, say that only the newest 50 comments were checked. If there is nothing actionable, nothing to acknowledge and no conflict, say so and stop. If the only work is acknowledge-only comments, skip to Step 7.
 
 ---
 
@@ -82,7 +116,7 @@ After resolving, `git merge --continue` (or commit the merge), then re-run the b
 
 ## Step 4: Address the comments
 
-Apply CLAUDE.md **Fix Discipline** to every actionable thread:
+Apply CLAUDE.md **Fix Discipline** to every actionable thread and every actionable conversation comment — a finding is the same finding wherever the reviewer typed it:
 
 - **Verify the claim first.** Read the code the comment points at. If the comment is wrong, do not change the code — refute it with evidence (a `file:line`, a test result, a query result) and reply saying so. Refuting a reviewer with evidence is a correct outcome.
 - **Class, not site.** Before fixing a defect at the one line a reviewer noticed, grep or use the LSP to find its siblings, then fix or explicitly clear each. Report the enumeration.
@@ -107,6 +141,8 @@ Run the full test suite, plus the language gate from CLAUDE.md:
 ---
 
 ## Step 6: Commit and push
+
+If Steps 3 and 4 changed no files — every finding was refuted, or the comments were acknowledge-only — skip this step and Step 5, unless Step 1 found already-committed, unpushed commits, which still have to be verified and pushed. Do not make an empty commit.
 
 Write the commit message to a tempfile and use `git commit -F` (never a `-m` heredoc — backticks corrupt it):
 
@@ -135,7 +171,11 @@ Push rules:
 
 ---
 
-## Step 7: Reply on every thread
+## Step 7: Reply on every thread, then reply to and mark every conversation comment
+
+If Step 5 or Step 6 stopped you (red build, rejected push), do **not** reply and do **not** add any rocket — nothing has been delivered yet. Report instead.
+
+### 7a. Review threads
 
 Reply **in-thread** using the replies endpoint and the `databaseId` of the thread's first comment from Step 2:
 
@@ -151,6 +191,28 @@ Every actionable thread gets a reply — fixed, or refuted with the evidence, or
 
 Do **not** resolve the threads. Resolving is the reviewer's call.
 
+### 7b. Conversation comments
+
+Conversation comments have no thread to reply in, so the "handled" signal is my `ROCKET` reaction, and `pr-fix-queue` keeps re-queueing this PR until every unhandled comment has one. **The order below is the safety property — reply first, rocket second.** A rocket with no reply would mark a finding handled that nobody answered; a reply with no rocket just gets this PR one more run, which adds the rocket.
+
+1. **Re-fetch** the conversation comments (the Step 2 query). Another run — my other machine, or me by hand — may have replied while you worked. An actionable comment is *already replied* when a later comment of mine contains its URL. Drop those from the reply you are about to write; they still get their rocket in 3. If the re-fetch shows a **new** unhandled comment you have not worked on, leave it alone: no reply, no rocket. Name it in the report; the queue will pick it up.
+2. **Post one reply** covering every actionable comment that is not already replied. For each, give its URL and the outcome — fixed (with the commit SHA), refuted (with the evidence), or deferred (with the reason):
+
+   ```bash
+   gh pr comment $ARGUMENTS --body-file /tmp/fixit-reply.md
+   ```
+
+   Write the body to a file; never an inline heredoc with backticks. Skip this when there is nothing left to reply to. If the post fails, stop here and report — add no rockets.
+3. **Only after the reply succeeded** (or was not needed), add the rocket to each comment you handled — the actionable ones you replied to, the already-replied ones, and the acknowledge-only ones:
+
+   ```bash
+   gh api --method POST "repos/$REPO/issues/comments/<databaseId>/reactions" -f content=rocket
+   ```
+
+   Check each call. If one fails, say so at the top of the report with the comment URL. Do not retry in a loop: the queue will launch one more run, which finds the reply already posted and only adds the missing rocket.
+
+Acknowledge-only comments get the rocket and **no reply** — do not answer "LGTM" with a comment. Never add a rocket to a comment you did not read and deal with, and never to one you chose to defer without saying so in the reply.
+
 ---
 
 ## Step 8: Report
@@ -159,6 +221,8 @@ Close with a compact summary:
 
 - conflict: resolved (merge commit SHA) / none / could not resolve + why
 - per thread: `path:line` — fixed / refuted (with the evidence) / deferred (with the reason)
+- per conversation comment: `<comment url>` — fixed / refuted / deferred / acknowledged / already replied, and whether its rocket was added
+- any rocket that failed to post, and any new comment that arrived while you worked and was left for the next run
 - tests: what you ran and the result
 - the pushed SHA and the PR url
 - anything left for me to decide
