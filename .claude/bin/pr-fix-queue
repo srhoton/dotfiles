@@ -1,0 +1,490 @@
+#!/bin/bash
+#
+# pr-fix-queue — find my own open PRs that are blocked and start a Claude Code
+# session running `/fixit <PR#>` for each one.
+#
+# A PR counts as blocked when any of these hold:
+#   - a reviewer's latest review is CHANGES_REQUESTED
+#   - it has a merge conflict (mergeable == CONFLICTING)
+#   - it has an unresolved, non-outdated review thread that a human opened and
+#     whose last comment is not mine (i.e. still waiting on my reply)
+#
+# For each blocked PR:
+#   - the repo's clone is DIR/<repo> (cloned if missing; skipped if its origin
+#     is some other repository)
+#   - a worktree is created at DIR/.pr-fix/<repo>-<PR#> on a private branch
+#     pr-fix/<PR#> tracking origin/<pr head branch>. The private branch name is
+#     deliberate: the main clone is often sitting on the very branch the blocked
+#     PR belongs to, and `git worktree add` refuses a branch checked out
+#     elsewhere. It also lets two PRs of one repo run at once. The main clone's
+#     branch and uncommitted changes are never touched.
+#   - inside tmux: one new window per PR, named fix-<repo>#<PR#>, running
+#     claude. Outside tmux: the sessions run one after another in this terminal.
+#
+# The spawned session commits and PUSHES, so re-launching cannot be gated on the
+# PR head SHA the way pr-review-queue does it — this tool's own push moves that
+# SHA. Instead each blocking reason contributes to a SHA-independent
+# fingerprint, and a PR is only relaunched when that fingerprint changes:
+#   changes-requested -> the reviewer's review node id (moves when they re-review)
+#   conflict          -> head oid + base oid (a conflict can only change if one moves)
+#   threads           -> thread id : last comment id (my reply makes it mine, so
+#                        the thread stops triggering)
+# State lives in ~/.claude/state/pr-fix-queue.json.
+#
+# Prints one line per PR ("STATUS  repo#N  detail"), then a count summary.
+# Exit 1 if any PR FAILED, else 0.
+#
+# Usage: pr-fix-queue [-n] [-f] [-m N] [-d DIR] [-o ORG ...] [--include-bots] [--clean]
+#   -n              dry run: report what would launch, change nothing
+#   -f              force: ignore the state file (both the cooldown and STUCK)
+#   -m N            max sessions launched per run (default 2; each one pushes)
+#   -d DIR          clone root (default $PR_FIX_DIR or ~/git)
+#   -o ORG          only PRs in this org/owner (repeatable; default: all)
+#   --include-bots  also trigger on threads opened by bot reviewers
+#   --clean         remove fix worktrees whose PR is no longer open (only when
+#                   clean and with nothing unpushed) and drop their state
+
+set -uo pipefail
+
+STATE="$HOME/.claude/state/pr-fix-queue.json"
+DIR="${PR_FIX_DIR:-$HOME/git}"
+DRY=0; FORCE=0; MAX=2; CLEAN=0; ORGS=""; INCLUDE_BOTS=0
+COOLDOWN_HOURS=2
+
+usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; }
+first_line() { printf '%s' "$1" | sed -n '1p'; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n) DRY=1 ;;
+    -f) FORCE=1 ;;
+    -m) MAX="${2:?-m needs a number}"; shift ;;
+    -d) DIR="${2:?-d needs a directory}"; DIR="${DIR/#\~/$HOME}"; shift ;;
+    -o) ORGS="$ORGS ${2:?-o needs an org}"; shift ;;
+    --include-bots) INCLUDE_BOTS=1 ;;
+    --clean) CLEAN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "pr-fix-queue: unknown option '$1'" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
+case "$MAX" in ''|*[!0-9]*) echo "pr-fix-queue: -m needs a number" >&2; exit 1 ;; esac
+
+for t in gh git python3 claude; do
+  command -v "$t" >/dev/null 2>&1 || { echo "pr-fix-queue: '$t' is required" >&2; exit 1; }
+done
+
+# ---- model -------------------------------------------------------------------
+# The spawned session must run on opus or fable. Managed settings can pin a
+# different model on a fresh session, so --model is always passed explicitly
+# rather than letting the new session inherit whatever it would pick.
+MODEL=$(python3 - "$HOME/.claude/settings.json" <<'MODELPY'
+import json, sys
+try:
+    print((json.load(open(sys.argv[1])).get("model") or "").strip())
+except (OSError, ValueError):
+    print("")
+MODELPY
+)
+case "$MODEL" in
+  opus|fable) ;;
+  *) MODEL=opus ;;
+esac
+
+WTROOT="$DIR/.pr-fix"
+RESULTS=""
+emit() { RESULTS="${RESULTS}$1"$'\t'"$2"$'\t'"$3"$'\n'; }
+
+# ---- state file ---------------------------------------------------------------
+# JSON object: "owner/repo#N" -> {launched_at, head_sha, fingerprint, attempts}
+# Writes take an exclusive lock on a sibling .lock file (macOS has no flock(1),
+# so the lock lives inside python) and land via os.replace, so readers never
+# need a lock to see a consistent file.
+state_get() {  # key -> "fingerprint<TAB>attempts<TAB>within_cooldown<TAB>launched_at"
+  python3 - "$STATE" "$1" "$COOLDOWN_HOURS" <<'PY'
+import datetime, json, sys
+path, key, hours = sys.argv[1], sys.argv[2], float(sys.argv[3])
+try:
+    rec = json.load(open(path)).get(key) or {}
+except (OSError, ValueError):
+    rec = {}
+fp = rec.get("fingerprint", "")
+attempts = int(rec.get("attempts", 0) or 0)
+within = 0
+stamp = rec.get("launched_at", "")
+if stamp:
+    try:
+        then = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc)
+        age = (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds()
+        within = 1 if age < hours * 3600 else 0
+    except ValueError:
+        within = 0
+print("\t".join([fp, str(attempts), str(within), stamp]))
+PY
+}
+
+state_put() {  # key fingerprint attempts head_sha
+  python3 - "$STATE" "$1" "$2" "$3" "$4" <<'PY'
+import datetime, fcntl, json, os, sys
+path, key, fp, attempts, sha = sys.argv[1:6]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+with open(path + ".lock", "a+") as lf:
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    try:
+        data = json.load(open(path))
+    except (OSError, ValueError):
+        data = {}
+    data[key] = {
+        "launched_at": datetime.datetime.now(datetime.timezone.utc)
+                        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "head_sha": sha,
+        "fingerprint": fp,
+        "attempts": int(attempts),
+    }
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+PY
+}
+
+state_del() {  # key
+  python3 - "$STATE" "$1" <<'PY'
+import fcntl, json, os, sys
+path, key = sys.argv[1:3]
+if not os.path.exists(path):
+    sys.exit(0)
+with open(path + ".lock", "a+") as lf:
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    try:
+        data = json.load(open(path))
+    except (OSError, ValueError):
+        sys.exit(0)
+    data.pop(key, None)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+PY
+}
+
+report() {
+  local order="$1" st
+  for st in $order; do
+    printf '%s' "$RESULTS" | awk -F'\t' -v st="$st" '$1==st' \
+      | awk -F'\t' '{printf "%-14s %-40s %s\n", $1, $2, $3}'
+  done
+  echo
+  printf '%s' "$RESULTS" | awk -F'\t' -v order="$order" '{c[$1]++} END{
+    n=split(order, o, " "); s="summary:";
+    for(i=1;i<=n;i++) if(o[i] in c) s=s" "tolower(o[i])"="c[o[i]];
+    if (s=="summary:") s=s" nothing to do"; print s}'
+  printf '%s' "$RESULTS" | awk -F'\t' '$1=="FAILED"{f=1} END{exit f?1:0}'
+}
+
+# A worktree must not be discarded while it still holds work only it has.
+wt_dirty()  { [ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]; }
+wt_ahead()  { [ "$(git -C "$1" rev-list --count '@{u}..HEAD' 2>/dev/null || echo 0)" != "0" ]; }
+
+# ---- --clean -----------------------------------------------------------------
+if [ "$CLEAN" = 1 ]; then
+  for wt in "$WTROOT"/*; do
+    [ -d "$wt" ] || continue
+    base=$(basename "$wt"); num="${base##*-}"; repo="${base%-*}"
+    origin=$(git -C "$wt" remote get-url origin 2>/dev/null || true)
+    slug=$(printf '%s' "$origin" | sed -nE 's#.*github\.com[:/]([^/]+/[^/]+)$#\1#p' | sed 's/\.git$//')
+    if [ -z "$slug" ]; then emit SKIPPED "$base" "cannot determine repo from origin"; continue; fi
+    key="$slug#$num"
+    prstate=$(gh pr view "$num" -R "$slug" --json state -q .state 2>/dev/null || true)
+    if [ -z "$prstate" ]; then emit SKIPPED "$key" "could not read PR state"; continue; fi
+    if [ "$prstate" = "OPEN" ]; then emit KEPT "$key" "PR still open"; continue; fi
+    if wt_dirty "$wt"; then
+      emit KEPT "$key" "PR $prstate but worktree has uncommitted changes: $wt"; continue
+    fi
+    if wt_ahead "$wt"; then
+      emit KEPT "$key" "PR $prstate but worktree has unpushed commits: $wt"; continue
+    fi
+    if [ "$DRY" = 1 ]; then emit WOULD-REMOVE "$key" "PR $prstate: $wt"; continue; fi
+    if err=$(git -C "$DIR/$repo" worktree remove "$wt" 2>&1); then
+      git -C "$DIR/$repo" branch -D "pr-fix/$num" >/dev/null 2>&1
+      state_del "$key"
+      emit REMOVED "$key" "PR $prstate"
+    else
+      emit FAILED "$key" "worktree remove: $(first_line "$err")"
+    fi
+  done
+  report "REMOVED WOULD-REMOVE KEPT SKIPPED FAILED"
+  exit $?
+fi
+
+# ---- enumerate my blocked PRs -------------------------------------------------
+QUERY='
+query {
+  viewer {
+    login
+    pullRequests(states: OPEN, first: 100) {
+      nodes {
+        number title isDraft updatedAt headRefOid headRefName isCrossRepository
+        mergeable reviewDecision
+        repository { nameWithOwner name }
+        baseRef { name target { oid } }
+        latestReviews(first: 20) { nodes { id state } }
+        reviewThreads(first: 60) {
+          nodes {
+            id isResolved isOutdated
+            firstComment: comments(first: 1) { nodes { author { login __typename } } }
+            lastComment:  comments(last: 1)  { nodes { id author { login } } }
+          }
+        }
+      }
+    }
+  }
+}'
+
+# GitHub computes `mergeable` lazily and answers UNKNOWN until it has; the first
+# query is what triggers the computation. Re-poll so a real conflict is not read
+# as "no conflict".
+TMP=$(mktemp) || exit 1
+trap 'rm -f "$TMP"' EXIT
+for attempt in 1 2 3; do
+  if ! OUT=$(gh api graphql -f query="$QUERY" 2>&1); then
+    echo "pr-fix-queue: gh api graphql failed: $(first_line "$OUT")" >&2; exit 1
+  fi
+  printf '%s' "$OUT" > "$TMP"
+  if ! printf '%s' "$OUT" | grep -q '"mergeable": *"UNKNOWN"'; then break; fi
+  [ "$attempt" = 3 ] || sleep 2
+done
+
+PLAN=$(ORGS="$ORGS" INCLUDE_BOTS="$INCLUDE_BOTS" python3 - "$TMP" <<'PY'
+import json, os, sys
+
+with open(sys.argv[1]) as fh:
+    doc = json.load(fh)
+if doc.get("errors"):
+    sys.stderr.write("graphql: %s\n" % doc["errors"][0].get("message", "?"))
+    sys.exit(1)
+
+me = doc["data"]["viewer"]["login"]
+orgs = set(os.environ.get("ORGS", "").split())
+include_bots = os.environ.get("INCLUDE_BOTS") == "1"
+
+# 9 columns: kind slug repo num head base fingerprint head_oid detail
+def row(*cols):
+    print("\t".join(str(c) for c in cols))
+
+nodes = doc["data"]["viewer"]["pullRequests"]["nodes"]
+for p in sorted(nodes, key=lambda p: p.get("updatedAt") or ""):
+    slug = p["repository"]["nameWithOwner"]
+    repo = p["repository"]["name"]
+    num = p["number"]
+    if orgs and slug.split("/")[0] not in orgs:
+        continue
+    if p.get("isDraft"):
+        continue
+
+    labels, fp_parts = [], []
+
+    # A thread is actionable only if a human opened it and I have not replied.
+    actionable = []
+    for t in (p.get("reviewThreads") or {}).get("nodes") or []:
+        if t.get("isResolved") or t.get("isOutdated"):
+            continue
+        fc = ((t.get("firstComment") or {}).get("nodes")) or []
+        lc = ((t.get("lastComment") or {}).get("nodes")) or []
+        if not fc or not lc:
+            continue
+        if not include_bots and (fc[0].get("author") or {}).get("__typename") != "User":
+            continue
+        if (lc[0].get("author") or {}).get("login") == me:
+            continue
+        actionable.append("%s:%s" % (t["id"], lc[0]["id"]))
+    if actionable:
+        labels.append("%d thread(s)" % len(actionable))
+        fp_parts.append("th:" + ",".join(sorted(actionable)))
+
+    cr = sorted(r["id"] for r in ((p.get("latestReviews") or {}).get("nodes") or [])
+                if r.get("state") == "CHANGES_REQUESTED")
+    if p.get("reviewDecision") == "CHANGES_REQUESTED" and cr:
+        labels.append("changes-requested")
+        fp_parts.append("cr:" + ",".join(cr))
+
+    base = p.get("baseRef") or {}
+    base_name = base.get("name") or ""
+    base_oid = ((base.get("target") or {}).get("oid")) or ""
+    if p.get("mergeable") == "CONFLICTING":
+        labels.append("conflict")
+        fp_parts.append("cf:%s+%s" % (p["headRefOid"], base_oid))
+
+    if not labels:
+        # Never treat an unresolved mergeability as "no conflict" silently.
+        if p.get("mergeable") == "UNKNOWN":
+            row("SKIP", slug, repo, num, "", "", "", "",
+                "mergeability still UNKNOWN after 3 polls — not classified")
+        continue
+
+    head = p.get("headRefName") or ""
+    title = " ".join((p.get("title") or "-").split())[:50]
+    detail = ", ".join(labels) + " — " + title
+
+    if p.get("isCrossRepository"):
+        row("SKIP", slug, repo, num, "", "", "", "",
+            "fork PR (isCrossRepository) — pushing to a fork is unsupported")
+        continue
+    if not head or head == base_name or head in ("master", "main"):
+        row("SKIP", slug, repo, num, "", "", "", "",
+            "head branch '%s' looks like a default branch — refusing to push" % head)
+        continue
+
+    row("CAND", slug, repo, num, head, base_name,
+        "|".join(fp_parts), p["headRefOid"], detail)
+PY
+) || exit 1
+
+if [ -z "$PLAN" ]; then
+  echo "pr-fix-queue: none of your open PRs are blocked${ORGS:+ in:$ORGS}"
+  exit 0
+fi
+
+IN_TMUX=0
+[ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1 && IN_TMUX=1
+LAUNCHED=0
+
+# fd 3 carries the plan so that claude (sequential mode) keeps the terminal on stdin.
+while IFS=$'\t' read -r kind slug repo num head base fp headoid detail <&3; do
+  key="$slug#$num"
+
+  if [ "$kind" = "SKIP" ]; then emit SKIPPED "$key" "$detail"; continue; fi
+
+  clone="$DIR/$repo"; wt="$WTROOT/$repo-$num"; win="fix-$repo#$num"
+
+  IFS=$'\t' read -r st_fp st_attempts st_within st_when <<< "$(state_get "$key")"
+  if [ "$FORCE" = 0 ] && [ "$st_within" = "1" ]; then
+    emit IN-FLIGHT "$key" "launched $st_when (<${COOLDOWN_HOURS}h ago) — -f to relaunch"; continue
+  fi
+  if [ "$FORCE" = 0 ] && [ -n "$st_fp" ] && [ "$st_fp" = "$fp" ] && [ "$st_attempts" -ge 1 ]; then
+    emit STUCK "$key" "already ran on this exact input and it is still blocked — $detail"; continue
+  fi
+  if [ "$IN_TMUX" = 1 ] && tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep -Fxq "$win"; then
+    emit SKIPPED "$key" "tmux window '$win' is already open"; continue
+  fi
+  if [ -e "$clone" ]; then
+    origin=$(git -C "$clone" remote get-url origin 2>/dev/null || true)
+    case "$origin" in
+      *github.com[:/]"$slug"|*github.com[:/]"$slug".git) ;;
+      *) emit SKIPPED "$key" "origin mismatch in $clone: ${origin:-none}"; continue ;;
+    esac
+  fi
+  if [ "$LAUNCHED" -ge "$MAX" ]; then
+    emit DEFERRED "$key" "limit of $MAX per run reached — $detail"; continue
+  fi
+
+  if [ "$DRY" = 1 ]; then
+    how="worktree $wt on pr-fix/$num"; [ -e "$clone" ] || how="clone $slug, then $how"
+    emit WOULD-LAUNCH "$key" "$detail ($how)"; LAUNCHED=$((LAUNCHED + 1)); continue
+  fi
+
+  if [ ! -e "$clone" ]; then
+    mkdir -p "$DIR"
+    if ! err=$(git clone --quiet "git@github.com:$slug.git" "$clone" 2>&1); then
+      emit FAILED "$key" "clone: $(first_line "$err")"; continue
+    fi
+  fi
+
+  # Fetch the real branch refs. pull/<N>/head is read-only and lags the branch,
+  # which a reviewing tool can tolerate but a pushing one cannot.
+  git -C "$clone" worktree prune >/dev/null 2>&1
+  if ! err=$(git -C "$clone" fetch --prune --quiet origin \
+        "+refs/heads/$head:refs/remotes/origin/$head" \
+        "+refs/heads/$base:refs/remotes/origin/$base" 2>&1); then
+    emit FAILED "$key" "fetch $head/$base: $(first_line "$err")"; continue
+  fi
+
+  note=""
+  if [ ! -e "$wt" ]; then
+    mkdir -p "$WTROOT"
+    if git -C "$clone" show-ref --verify --quiet "refs/heads/pr-fix/$num"; then
+      err=$(git -C "$clone" worktree add --quiet "$wt" "pr-fix/$num" 2>&1)
+    else
+      err=$(git -C "$clone" worktree add --quiet "$wt" -b "pr-fix/$num" --track "origin/$head" 2>&1)
+    fi
+    if [ -n "$err" ] && [ ! -e "$wt" ]; then
+      emit FAILED "$key" "worktree add: $(first_line "$err")"; continue
+    fi
+  fi
+  # Re-point the upstream every run: the PR's head branch can change under us.
+  git -C "$wt" branch --set-upstream-to "origin/$head" >/dev/null 2>&1
+  git -C "$wt" config push.default nothing >/dev/null 2>&1
+
+  if wt_dirty "$wt"; then
+    note=" [worktree dirty — session told to preserve it]"
+    emit DIRTY "$key" "reusing worktree with uncommitted changes: $wt"
+  elif wt_ahead "$wt"; then
+    note=" [worktree has unpushed commits — session pushes them first]"
+  else
+    git -C "$wt" merge --ff-only '@{u}' >/dev/null 2>&1
+  fi
+
+  # Push safety: the push must land on this PR's own repo. Check the configured
+  # push url AND the url left after any url.<base>.insteadOf rewrite is applied,
+  # since a rewrite can redirect the push somewhere else entirely.
+  # Neither value is ever printed: such a rewrite commonly embeds a credential,
+  # so echoing it in an error would leak the token into logs and terminals.
+  push_ok=1
+  for u in "$(git -C "$wt" remote get-url --push origin 2>/dev/null)" \
+           "$(git -C "$wt" ls-remote --get-url origin 2>/dev/null)"; do
+    case "$u" in
+      *github.com[:/]"$slug"|*github.com[:/]"$slug".git) ;;
+      *) push_ok=0 ;;
+    esac
+  done
+  if [ "$push_ok" = 0 ]; then
+    emit FAILED "$key" "origin does not resolve to $slug for push (url redacted)"; continue
+  fi
+
+  if [ "$IN_TMUX" = 1 ]; then
+    if ! err=$(tmux new-window -d -n "$win" -c "$wt" \
+          "claude --model $MODEL -n 'fix $repo#$num' '/fixit $num'" 2>&1); then
+      emit FAILED "$key" "tmux new-window: $(first_line "$err")"; continue
+    fi
+    state_put "$key" "$fp" 1 "$headoid"
+    emit LAUNCHED "$key" "window '$win' — $detail$note"
+  else
+    echo ">>> $key — $detail$note" >&2
+    state_put "$key" "$fp" 1 "$headoid"
+    (cd "$wt" && claude --model "$MODEL" -n "fix $repo#$num" "/fixit $num")
+    emit LAUNCHED "$key" "ran in this terminal — $detail$note"
+  fi
+  LAUNCHED=$((LAUNCHED + 1))
+done 3<<< "$PLAN"
+
+# Every new worktree is a new path, so Claude Code shows its folder-trust prompt
+# in each window unless WTROOT (or a parent) has been trusted. That is the
+# user's call to make, so only point it out — never write the flag here.
+if ! python3 - "$HOME/.claude.json" "$WTROOT" <<'PY'
+import json, os, sys
+try:
+    projects = json.load(open(sys.argv[1])).get("projects", {})
+except (OSError, ValueError):
+    sys.exit(1)
+path = os.path.realpath(sys.argv[2])
+while True:
+    if projects.get(path, {}).get("hasTrustDialogAccepted"):
+        sys.exit(0)
+    parent = os.path.dirname(path)
+    if parent == path:
+        sys.exit(1)
+    path = parent
+PY
+then
+  {
+    echo "note: $WTROOT is not a trusted folder, so each fix window will stop at"
+    echo "      Claude Code's 'trust this folder?' prompt. To answer it once for all"
+    echo "      fix worktrees:  cd $WTROOT && claude   (accept, then exit)"
+    echo
+  } >&2
+fi
+
+report "LAUNCHED WOULD-LAUNCH DEFERRED IN-FLIGHT STUCK DIRTY SKIPPED FAILED"
