@@ -226,6 +226,20 @@ out=$(real mixed --retry "acme/typo#1" -m 0)
 expect "--retry on an unknown key says nothing was recorded" "$out" "no state recorded for acme/typo#1"
 expect "  and leaves the state alone" "$(keys)" "^acme/repo#1$"
 
+rm -f "$WORK/state.json"
+out=$(real mixed --retry "acme/repo#1" -m 0)
+expect "--retry with no state file says that, not 'check the spelling'" "$out" "no readable state file"
+
+# A malformed record must not abort the sweep and strand the rest of the batch.
+python3 - "$WORK/state.json" <<'PY'
+import json, sys
+json.dump({"acme/repo#2": {"launched_at": None, "fingerprint": "old", "attempts": 1},
+           "other/repo#99": {"launched_at": 12345}}, open(sys.argv[1], "w"))
+PY
+out=$(real mixed -m 0)
+expect "a record with a null launched_at is swept, not a crash" "$(keys)" "^other/repo#99$"
+reject "  and no python traceback reaches the terminal" "$out" "Traceback"
+
 out=$(real mixed --retry "acme/repo#1" --clean); rc=$?
 expect "--retry with --clean is refused" "$out" "cannot be combined"
 if [ "$rc" = 1 ]; then ok "  with exit 1"; else bad "  with exit 1" "rc=$rc"; fi

@@ -187,24 +187,25 @@ with open(path + ".lock", "a+") as lf:
 PY
 }
 
-# Exit 3 when no record was removed, so a caller that cares (--retry) can say so.
-# With KEEP_HOURS set, a record launched less than that long ago is left alone:
-# its session may still be running, and the record is the only thing that stops
-# a second session starting in the same worktree outside tmux.
-state_del() {  # key [key ...]
-  python3 - "$STATE" "${KEEP_HOURS:-0}" "$@" <<'PY'
+# keep_hours > 0 leaves alone any record launched less than that long ago: its
+# session may still be running, and the record is the only thing that stops a
+# second session starting in the same worktree outside tmux. Pass 0 to delete
+# unconditionally. Exit 3: none of the keys was removed. Exit 4: there is no
+# readable state file at all. Callers that care (--retry) tell the two apart.
+state_del() {  # keep_hours key [key ...]
+  python3 - "$STATE" "$@" <<'PY'
 import datetime, fcntl, json, os, sys
 path, keep_hours, keys = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
 if not os.path.exists(path):
-    sys.exit(3)
+    sys.exit(4)
 
 def in_flight(rec):
-    if not keep_hours:
+    if not keep_hours or not isinstance(rec, dict):
         return False
     try:
-        then = datetime.datetime.strptime(rec.get("launched_at", ""), "%Y-%m-%dT%H:%M:%SZ"
+        then = datetime.datetime.strptime(rec.get("launched_at") or "", "%Y-%m-%dT%H:%M:%SZ"
                                           ).replace(tzinfo=datetime.timezone.utc)
-    except ValueError:
+    except (TypeError, ValueError):
         return False
     age = (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds()
     return age < keep_hours * 3600
@@ -214,8 +215,8 @@ with open(path + ".lock", "a+") as lf:
     try:
         data = json.load(open(path))
     except (OSError, ValueError):
-        sys.exit(3)
-    doomed = [k for k in keys if k in data and not in_flight(data[k] or {})]
+        sys.exit(4)
+    doomed = [k for k in keys if k in data and not in_flight(data[k])]
     if not doomed:
         sys.exit(3)
     for k in doomed:
@@ -267,7 +268,7 @@ if [ "$CLEAN" = 1 ]; then
     if [ "$DRY" = 1 ]; then emit WOULD-REMOVE "$key" "PR $prstate: $wt"; continue; fi
     if err=$(git -C "$DIR/$repo" worktree remove "$wt" 2>&1); then
       git -C "$DIR/$repo" branch -D "pr-fix/$num" >/dev/null 2>&1
-      state_del "$key"
+      state_del 0 "$key"
       emit REMOVED "$key" "PR $prstate"
     else
       emit FAILED "$key" "worktree remove: $(first_line "$err")"
@@ -283,10 +284,13 @@ fi
 if [ -n "$RETRY" ] && [ -z "$FIXTURE" ]; then
   if [ "$DRY" = 1 ]; then
     echo "pr-fix-queue: would forget state for $RETRY" >&2
-  elif state_del "$RETRY"; then
-    echo "pr-fix-queue: forgot state for $RETRY" >&2
   else
-    echo "pr-fix-queue: no state recorded for $RETRY (check the spelling)" >&2
+    state_del 0 "$RETRY"
+    case $? in
+      0) echo "pr-fix-queue: forgot state for $RETRY" >&2 ;;
+      3) echo "pr-fix-queue: no state recorded for $RETRY (check the spelling)" >&2 ;;
+      *) echo "pr-fix-queue: no readable state file at $STATE — nothing to forget" >&2 ;;
+    esac
   fi
 fi
 
@@ -487,7 +491,7 @@ while IFS=$'\t' read -r kind slug _repo num _head _base _fp _oid detail; do
   [ "$detail" = "not blocked" ] || echo "note: $slug#$num — $detail" >&2
 done <<< "$PLAN"
 if [ "$DRY" = 0 ] && [ "${#CLEAR_KEYS[@]}" -gt 0 ]; then
-  KEEP_HOURS="$COOLDOWN_HOURS" state_del "${CLEAR_KEYS[@]}"
+  state_del "$COOLDOWN_HOURS" "${CLEAR_KEYS[@]}"
 fi
 PLAN=$(printf '%s\n' "$PLAN" | awk -F'\t' '$1!="CLEAR"')
 
