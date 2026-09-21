@@ -42,7 +42,8 @@
 #                        /fixit replied but its reactions failed, my new reply
 #                        moves the fingerprint, so the PR gets exactly one more
 #                        run instead of reading as STUCK forever.
-# A PR that classifies as not blocked has its state record dropped, so the same
+# A PR that classifies as not blocked has its state record dropped (once its
+# cooldown has passed, since a running session can look clear), so the same
 # blocker coming back later (a reviewer edits a handled comment, a rocket is
 # removed) launches again instead of matching the old fingerprint.
 # State lives in ~/.claude/state/pr-fix-queue.json ($PR_FIX_STATE overrides).
@@ -101,6 +102,9 @@ done
 case "$MAX" in ''|*[!0-9]*) echo "pr-fix-queue: -m needs a number" >&2; exit 1 ;; esac
 if [ -n "$RETRY" ] && ! printf '%s' "$RETRY" | grep -Eq '^[^/#[:space:]]+/[^/#[:space:]]+#[0-9]+$'; then
   echo "pr-fix-queue: --retry needs OWNER/REPO#N, got '$RETRY'" >&2; exit 1
+fi
+if [ -n "$RETRY" ] && [ "$CLEAN" = 1 ]; then
+  echo "pr-fix-queue: --retry and --clean cannot be combined" >&2; exit 1
 fi
 
 for t in gh git python3 claude; do
@@ -183,22 +187,39 @@ with open(path + ".lock", "a+") as lf:
 PY
 }
 
+# Exit 3 when no record was removed, so a caller that cares (--retry) can say so.
+# With KEEP_HOURS set, a record launched less than that long ago is left alone:
+# its session may still be running, and the record is the only thing that stops
+# a second session starting in the same worktree outside tmux.
 state_del() {  # key [key ...]
-  python3 - "$STATE" "$@" <<'PY'
-import fcntl, json, os, sys
-path, keys = sys.argv[1], sys.argv[2:]
+  python3 - "$STATE" "${KEEP_HOURS:-0}" "$@" <<'PY'
+import datetime, fcntl, json, os, sys
+path, keep_hours, keys = sys.argv[1], float(sys.argv[2]), sys.argv[3:]
 if not os.path.exists(path):
-    sys.exit(0)
+    sys.exit(3)
+
+def in_flight(rec):
+    if not keep_hours:
+        return False
+    try:
+        then = datetime.datetime.strptime(rec.get("launched_at", ""), "%Y-%m-%dT%H:%M:%SZ"
+                                          ).replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return False
+    age = (datetime.datetime.now(datetime.timezone.utc) - then).total_seconds()
+    return age < keep_hours * 3600
+
 with open(path + ".lock", "a+") as lf:
     fcntl.flock(lf, fcntl.LOCK_EX)
     try:
         data = json.load(open(path))
     except (OSError, ValueError):
-        sys.exit(0)
-    if not any(k in data for k in keys):
-        sys.exit(0)
-    for k in keys:
-        data.pop(k, None)
+        sys.exit(3)
+    doomed = [k for k in keys if k in data and not in_flight(data[k] or {})]
+    if not doomed:
+        sys.exit(3)
+    for k in doomed:
+        data.pop(k)
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
@@ -262,9 +283,10 @@ fi
 if [ -n "$RETRY" ] && [ -z "$FIXTURE" ]; then
   if [ "$DRY" = 1 ]; then
     echo "pr-fix-queue: would forget state for $RETRY" >&2
-  else
-    state_del "$RETRY"
+  elif state_del "$RETRY"; then
     echo "pr-fix-queue: forgot state for $RETRY" >&2
+  else
+    echo "pr-fix-queue: no state recorded for $RETRY (check the spelling)" >&2
   fi
 fi
 
@@ -424,7 +446,11 @@ for p in sorted(nodes, key=lambda p: p.get("updatedAt") or ""):
                 "mergeability still UNKNOWN after 3 polls — not classified")
         else:
             # Fully classified and not blocked: its state record can go.
-            row("CLEAR", slug, repo, num, "", "", "", "", "not blocked")
+            # Say so when that verdict rests on a truncated comment list.
+            total = (p.get("comments") or {}).get("totalCount") or 0
+            row("CLEAR", slug, repo, num, "", "", "", "",
+                "not blocked" if total <= 50 else
+                "%d conversation comments, only the newest 50 were checked" % total)
         continue
 
     head = p.get("headRefName") or ""
@@ -451,12 +477,17 @@ if [ -n "$FIXTURE" ]; then
 fi
 
 # Drop the state of every PR that is no longer blocked, in one locked write.
+# Records still inside the cooldown are kept: a running session can make its PR
+# look clear before it has finished, and that record is what holds off a second
+# launch. They go on the first run after the cooldown.
 CLEAR_KEYS=()
-while IFS=$'\t' read -r kind slug _repo num _rest; do
-  [ "$kind" = "CLEAR" ] && CLEAR_KEYS+=("$slug#$num")
+while IFS=$'\t' read -r kind slug _repo num _head _base _fp _oid detail; do
+  [ "$kind" = "CLEAR" ] || continue
+  CLEAR_KEYS+=("$slug#$num")
+  [ "$detail" = "not blocked" ] || echo "note: $slug#$num — $detail" >&2
 done <<< "$PLAN"
 if [ "$DRY" = 0 ] && [ "${#CLEAR_KEYS[@]}" -gt 0 ]; then
-  state_del "${CLEAR_KEYS[@]}"
+  KEEP_HOURS="$COOLDOWN_HOURS" state_del "${CLEAR_KEYS[@]}"
 fi
 PLAN=$(printf '%s\n' "$PLAN" | awk -F'\t' '$1!="CLEAR"')
 

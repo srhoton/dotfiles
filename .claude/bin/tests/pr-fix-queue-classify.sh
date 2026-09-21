@@ -144,15 +144,91 @@ expect "UNKNOWN mergeability is SKIP with its reason intact" "$out" "^SKIP${T}ac
 reject "  and is not CLEAR (state must survive)" "$out" "^CLEAR"
 if [ "$took" -lt 2 ]; then ok "  fixture mode does not sleep through the re-poll (${took}s)"; else bad "  fixture mode slept" "${took}s"; fi
 
-fixture draft '[pr(14, [comment(100)], draft=True)]'
+fixture draft '[pr(14, [comment(100)], draft=True), pr(15, [comment(100)])]'
 out=$(run draft)
-reject "draft PR produces no row at all (no CLEAR, state untouched)" "$out" "${T}14${T}"
+expect "draft fixture ran (its non-draft sibling is a candidate)" "$out" "^CAND${T}acme/repo${T}repo${T}15${T}"
+reject "  draft PR produces no row at all (no CLEAR, state untouched)" "$out" "${T}14${T}"
+
+fixture busyclear '[pr(16, [comment(100, reactions=[("ROCKET","me","2026-09-21T11:00:00Z")])], total=73)]'
+out=$(run busyclear)
+expect "CLEAR on a truncated comment list says so" "$out" "^CLEAR${T}.*73 conversation comments, only the newest 50"
+
+# Every row must have all 9 columns. The shell reads rows with IFS=tab, and tab
+# is IFS whitespace, so an empty column collapses and shifts the ones after it.
+cols_ok() {  # CASE OUTPUT
+  if printf '%s\n' "$2" | awk -F'\t' 'NF!=9{bad=1} /\t\t/{bad=1} END{exit bad}'; then ok "$1"
+  else bad "$1" "$2"; fi
+}
+cols_ok "SKIP row has 9 non-empty columns"  "$(run unknown)"
+cols_ok "CLEAR row has 9 non-empty columns" "$(run rocket)"
+cols_ok "CAND row has 9 non-empty columns"  "$(run unanswered)"
 
 if [ -e "$WORK/state-must-not-exist.json" ] || [ -e "$WORK/state-must-not-exist.json.lock" ]; then
   bad "fixture mode touched the state file" "$(ls "$WORK")"
 else
   ok "fixture mode never touches the state file"
 fi
+
+# ---- state handling -----------------------------------------------------------
+# Fixture mode exits before any state access, so these run the real script with
+# `gh` and `claude` stubbed on PATH, a private state file, TMUX unset, and -m 0
+# so that nothing can launch (every candidate is DEFERRED).
+STUB="$WORK/stub"; mkdir -p "$STUB"
+printf '#!/bin/bash\ncat "$STUB_JSON"\n' > "$STUB/gh"
+printf '#!/bin/bash\necho "claude stub must never run" >&2; exit 9\n' > "$STUB/claude"
+chmod +x "$STUB/gh" "$STUB/claude"
+
+real() {  # FIXTURE-NAME [queue args...]
+  local name="$1"; shift
+  env -u TMUX PATH="$STUB:$PATH" STUB_JSON="$WORK/$name.json" \
+    PR_FIX_STATE="$WORK/state.json" PR_FIX_DIR="$WORK/clones" "$QUEUE" "$@" 2>&1
+}
+seed() {  # "key=age_hours" ...   (writes $WORK/state.json)
+  python3 - "$WORK/state.json" "$@" <<'PY'
+import datetime, json, sys
+now = datetime.datetime.now(datetime.timezone.utc)
+data = {}
+for spec in sys.argv[2:]:
+    key, age = spec.rsplit("=", 1)
+    stamp = (now - datetime.timedelta(hours=float(age))).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data[key] = {"launched_at": stamp, "head_sha": "x", "fingerprint": "old", "attempts": 1}
+json.dump(data, open(sys.argv[1], "w"))
+PY
+}
+keys() { python3 -c 'import json,sys; print(" ".join(sorted(json.load(open(sys.argv[1])))))' "$WORK/state.json"; }
+
+fixture mixed '[pr(1, [comment(100)]), pr(2, [comment(100, reactions=[("ROCKET","me","2026-09-21T11:00:00Z")])])]'
+
+seed "acme/repo#1=5" "acme/repo#2=5" "other/repo#99=5"
+real mixed -n -m 0 >/dev/null
+expect "dry run deletes no state" "$(keys)" "^acme/repo#1 acme/repo#2 other/repo#99$"
+
+out=$(real mixed -m 0)
+expect "real run drops only the clear PR's record" "$(keys)" "^acme/repo#1 other/repo#99$"
+expect "  and the blocked PR is DEFERRED, not launched" "$out" "^DEFERRED +acme/repo#1 "
+reject "  and the claude stub never ran" "$out" "claude stub must never run"
+
+seed "acme/repo#2=0.5"
+real mixed -m 0 >/dev/null
+expect "a clear PR still inside the cooldown keeps its record" "$(keys)" "^acme/repo#2$"
+
+fixture reblocked '[pr(2, [comment(100)])]'
+out=$(real reblocked -m 5)
+expect "  so a new comment during that window is IN-FLIGHT, not a second launch" "$out" "^IN-FLIGHT +acme/repo#2 "
+reject "  and the claude stub never ran" "$out" "claude stub must never run"
+
+seed "acme/repo#1=5" "other/repo#99=5"
+out=$(real mixed --retry "other/repo#99" -m 0)
+expect "--retry removes exactly that key" "$(keys)" "^acme/repo#1$"
+expect "  and says so" "$out" "forgot state for other/repo#99"
+
+out=$(real mixed --retry "acme/typo#1" -m 0)
+expect "--retry on an unknown key says nothing was recorded" "$out" "no state recorded for acme/typo#1"
+expect "  and leaves the state alone" "$(keys)" "^acme/repo#1$"
+
+out=$(real mixed --retry "acme/repo#1" --clean); rc=$?
+expect "--retry with --clean is refused" "$out" "cannot be combined"
+if [ "$rc" = 1 ]; then ok "  with exit 1"; else bad "  with exit 1" "rc=$rc"; fi
 
 echo
 echo "passed=$PASS failed=$FAIL"
