@@ -8,6 +8,13 @@
 #   - it has a merge conflict (mergeable == CONFLICTING)
 #   - it has an unresolved, non-outdated review thread that a human opened and
 #     whose last comment is not mine (i.e. still waiting on my reply)
+#   - it has a conversation comment (top-level, not attached to a line) from a
+#     human that I have not marked handled. Conversation comments have no
+#     threads, so "handled" is my ROCKET reaction on the comment, placed at or
+#     after its last edit. `/fixit` adds it once it has dealt with a comment;
+#     add it by hand to dismiss one. No other reaction and no reply of mine
+#     counts: a thumbs-up can mean "good catch, will fix", and a summary reply
+#     would otherwise clear every comment above it, addressed or not.
 #
 # For each blocked PR:
 #   - the repo's clone is DIR/<repo> (cloned if missing; skipped if its origin
@@ -29,29 +36,51 @@
 #   conflict          -> head oid + base oid (a conflict can only change if one moves)
 #   threads           -> thread id : last comment id (my reply makes it mine, so
 #                        the thread stops triggering)
-# State lives in ~/.claude/state/pr-fix-queue.json.
+#   comments          -> each unhandled comment's id @ its last-edit time, plus
+#                        the id of my newest conversation comment. The second
+#                        part is what lets a half-finished run recover: if
+#                        /fixit replied but its reactions failed, my new reply
+#                        moves the fingerprint, so the PR gets exactly one more
+#                        run instead of reading as STUCK forever.
+# A PR that classifies as not blocked has its state record dropped, so the same
+# blocker coming back later (a reviewer edits a handled comment, a rocket is
+# removed) launches again instead of matching the old fingerprint.
+# State lives in ~/.claude/state/pr-fix-queue.json ($PR_FIX_STATE overrides).
 #
 # Prints one line per PR ("STATUS  repo#N  detail"), then a count summary.
 # Exit 1 if any PR FAILED, else 0.
 #
-# Usage: pr-fix-queue [-n] [-f] [-m N] [-d DIR] [-o ORG ...] [--include-bots] [--clean]
+# Usage: pr-fix-queue [-n] [-f] [-m N] [-d DIR] [-o ORG ...] [--include-bots]
+#                     [--retry OWNER/REPO#N] [--clean]
 #   -n              dry run: report what would launch, change nothing
 #   -f              force: ignore the state file (both the cooldown and STUCK)
+#                   for EVERY PR, including ones with a session still running
 #   -m N            max sessions launched per run (default 2; each one pushes)
 #   -d DIR          clone root (default $PR_FIX_DIR or ~/git)
 #   -o ORG          only PRs in this org/owner (repeatable; default: all)
-#   --include-bots  also trigger on threads opened by bot reviewers
+#   --include-bots  also trigger on review threads opened by bot reviewers.
+#                   Never applies to conversation comments: bot comments there
+#                   are status chatter ("I finished the code review").
+#   --retry KEY     forget one PR's state (e.g. fullbay/some-repo#47) so it is
+#                   no longer IN-FLIGHT or STUCK, then run as usual
 #   --clean         remove fix worktrees whose PR is no longer open (only when
 #                   clean and with nothing unpushed) and drop their state
+#
+# Testing: PR_FIX_QUEUE_FIXTURE=<file> reads that GraphQL response instead of
+# calling GitHub, prints the classifier's plan rows, and exits before any state
+# access or launch. See bin/tests/pr-fix-queue-classify.sh.
 
 set -uo pipefail
 
-STATE="$HOME/.claude/state/pr-fix-queue.json"
+STATE="${PR_FIX_STATE:-$HOME/.claude/state/pr-fix-queue.json}"
 DIR="${PR_FIX_DIR:-$HOME/git}"
-DRY=0; FORCE=0; MAX=2; CLEAN=0; ORGS=""; INCLUDE_BOTS=0
+DRY=0; FORCE=0; MAX=2; CLEAN=0; ORGS=""; INCLUDE_BOTS=0; RETRY=""
 COOLDOWN_HOURS=2
+FIXTURE="${PR_FIX_QUEUE_FIXTURE:-}"
 
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; }
+# The header comment is the help text: everything from line 2 to the first
+# non-comment line, so it cannot fall out of step with a hardcoded line range.
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 first_line() { printf '%s' "$1" | sed -n '1p'; }
 
 while [ $# -gt 0 ]; do
@@ -62,6 +91,7 @@ while [ $# -gt 0 ]; do
     -d) DIR="${2:?-d needs a directory}"; DIR="${DIR/#\~/$HOME}"; shift ;;
     -o) ORGS="$ORGS ${2:?-o needs an org}"; shift ;;
     --include-bots) INCLUDE_BOTS=1 ;;
+    --retry) RETRY="${2:?--retry needs OWNER/REPO#N}"; shift ;;
     --clean) CLEAN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "pr-fix-queue: unknown option '$1'" >&2; usage >&2; exit 1 ;;
@@ -69,6 +99,9 @@ while [ $# -gt 0 ]; do
   shift
 done
 case "$MAX" in ''|*[!0-9]*) echo "pr-fix-queue: -m needs a number" >&2; exit 1 ;; esac
+if [ -n "$RETRY" ] && ! printf '%s' "$RETRY" | grep -Eq '^[^/#[:space:]]+/[^/#[:space:]]+#[0-9]+$'; then
+  echo "pr-fix-queue: --retry needs OWNER/REPO#N, got '$RETRY'" >&2; exit 1
+fi
 
 for t in gh git python3 claude; do
   command -v "$t" >/dev/null 2>&1 || { echo "pr-fix-queue: '$t' is required" >&2; exit 1; }
@@ -150,10 +183,10 @@ with open(path + ".lock", "a+") as lf:
 PY
 }
 
-state_del() {  # key
-  python3 - "$STATE" "$1" <<'PY'
+state_del() {  # key [key ...]
+  python3 - "$STATE" "$@" <<'PY'
 import fcntl, json, os, sys
-path, key = sys.argv[1:3]
+path, keys = sys.argv[1], sys.argv[2:]
 if not os.path.exists(path):
     sys.exit(0)
 with open(path + ".lock", "a+") as lf:
@@ -162,7 +195,10 @@ with open(path + ".lock", "a+") as lf:
         data = json.load(open(path))
     except (OSError, ValueError):
         sys.exit(0)
-    data.pop(key, None)
+    if not any(k in data for k in keys):
+        sys.exit(0)
+    for k in keys:
+        data.pop(k, None)
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
@@ -220,6 +256,18 @@ if [ "$CLEAN" = 1 ]; then
   exit $?
 fi
 
+# ---- --retry -----------------------------------------------------------------
+# -f lifts the cooldown and STUCK for every PR, which can start a second session
+# on one that is still running. This forgets a single PR instead.
+if [ -n "$RETRY" ] && [ -z "$FIXTURE" ]; then
+  if [ "$DRY" = 1 ]; then
+    echo "pr-fix-queue: would forget state for $RETRY" >&2
+  else
+    state_del "$RETRY"
+    echo "pr-fix-queue: forgot state for $RETRY" >&2
+  fi
+fi
+
 # ---- enumerate my blocked PRs -------------------------------------------------
 QUERY='
 query {
@@ -239,6 +287,15 @@ query {
             lastComment:  comments(last: 1)  { nodes { id author { login } } }
           }
         }
+        comments(last: 50) {
+          totalCount
+          nodes {
+            databaseId createdAt lastEditedAt isMinimized
+            author { login __typename }
+            reactionGroups { content viewerHasReacted }
+            reactions(last: 20) { nodes { content createdAt user { login } } }
+          }
+        }
       }
     }
   }
@@ -249,7 +306,11 @@ query {
 # as "no conflict".
 TMP=$(mktemp) || exit 1
 trap 'rm -f "$TMP"' EXIT
+if [ -n "$FIXTURE" ]; then
+  cp "$FIXTURE" "$TMP" || { echo "pr-fix-queue: cannot read fixture $FIXTURE" >&2; exit 1; }
+fi
 for attempt in 1 2 3; do
+  [ -z "$FIXTURE" ] || break
   if ! OUT=$(gh api graphql -f query="$QUERY" 2>&1); then
     echo "pr-fix-queue: gh api graphql failed: $(first_line "$OUT")" >&2; exit 1
   fi
@@ -272,8 +333,24 @@ orgs = set(os.environ.get("ORGS", "").split())
 include_bots = os.environ.get("INCLUDE_BOTS") == "1"
 
 # 9 columns: kind slug repo num head base fingerprint head_oid detail
+# Empty columns are written as "-": the shell reads these rows with IFS=tab, and
+# tab is IFS whitespace, so consecutive tabs collapse and shift later columns.
 def row(*cols):
-    print("\t".join(str(c) for c in cols))
+    print("\t".join(str(c) if str(c) != "" else "-" for c in cols))
+
+# A conversation comment is handled when I have a ROCKET on it that is not older
+# than its last edit. reactionGroups gives exact presence; reactions(last: 20)
+# gives the time. Timestamps are same-format ISO-8601 UTC, so they sort as text.
+def rocketed(c):
+    if not any(g.get("content") == "ROCKET" and g.get("viewerHasReacted")
+               for g in c.get("reactionGroups") or []):
+        return False
+    mine = [r.get("createdAt") or ""
+            for r in ((c.get("reactions") or {}).get("nodes") or [])
+            if r.get("content") == "ROCKET" and (r.get("user") or {}).get("login") == me]
+    if not mine:
+        return True  # mine is older than the newest 20 reactions; presence is still exact
+    return not c.get("lastEditedAt") or max(mine) >= c["lastEditedAt"]
 
 nodes = doc["data"]["viewer"]["pullRequests"]["nodes"]
 for p in sorted(nodes, key=lambda p: p.get("updatedAt") or ""):
@@ -305,6 +382,28 @@ for p in sorted(nodes, key=lambda p: p.get("updatedAt") or ""):
         labels.append("%d thread(s)" % len(actionable))
         fp_parts.append("th:" + ",".join(sorted(actionable)))
 
+    # Conversation comments: human-only even with --include-bots (see header).
+    conv = p.get("comments") or {}
+    unhandled, my_newest = [], 0
+    for c in conv.get("nodes") or []:
+        author = c.get("author") or {}
+        if author.get("login") == me:
+            my_newest = max(my_newest, c.get("databaseId") or 0)
+            continue
+        if author.get("__typename") != "User" or c.get("isMinimized"):
+            continue
+        if rocketed(c):
+            continue
+        unhandled.append("%s@%s" % (c.get("databaseId"),
+                                    c.get("lastEditedAt") or c.get("createdAt") or ""))
+    if unhandled:
+        note = ""
+        if (conv.get("totalCount") or 0) > 50:
+            note = " (only newest 50 comments checked)"
+        labels.append("%d comment(s)%s" % (len(unhandled), note))
+        fp_parts.append("ic:" + ",".join(sorted(unhandled)))
+        fp_parts.append("mr:%d" % my_newest)
+
     cr = sorted(r["id"] for r in ((p.get("latestReviews") or {}).get("nodes") or [])
                 if r.get("state") == "CHANGES_REQUESTED")
     if p.get("reviewDecision") == "CHANGES_REQUESTED" and cr:
@@ -323,6 +422,9 @@ for p in sorted(nodes, key=lambda p: p.get("updatedAt") or ""):
         if p.get("mergeable") == "UNKNOWN":
             row("SKIP", slug, repo, num, "", "", "", "",
                 "mergeability still UNKNOWN after 3 polls — not classified")
+        else:
+            # Fully classified and not blocked: its state record can go.
+            row("CLEAR", slug, repo, num, "", "", "", "", "not blocked")
         continue
 
     head = p.get("headRefName") or ""
@@ -342,6 +444,21 @@ for p in sorted(nodes, key=lambda p: p.get("updatedAt") or ""):
         "|".join(fp_parts), p["headRefOid"], detail)
 PY
 ) || exit 1
+
+if [ -n "$FIXTURE" ]; then
+  printf '%s\n' "$PLAN"
+  exit 0
+fi
+
+# Drop the state of every PR that is no longer blocked, in one locked write.
+CLEAR_KEYS=()
+while IFS=$'\t' read -r kind slug _repo num _rest; do
+  [ "$kind" = "CLEAR" ] && CLEAR_KEYS+=("$slug#$num")
+done <<< "$PLAN"
+if [ "$DRY" = 0 ] && [ "${#CLEAR_KEYS[@]}" -gt 0 ]; then
+  state_del "${CLEAR_KEYS[@]}"
+fi
+PLAN=$(printf '%s\n' "$PLAN" | awk -F'\t' '$1!="CLEAR"')
 
 if [ -z "$PLAN" ]; then
   echo "pr-fix-queue: none of your open PRs are blocked${ORGS:+ in:$ORGS}"
