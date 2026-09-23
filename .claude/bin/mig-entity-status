@@ -1,0 +1,573 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["boto3"]
+# ///
+"""Transform and migration status for one Fullbay migration entity.
+
+Usage: mig-entity-status <entity-id | act_...> --profile <sso-profile>
+                         [--days 30] [--mappings] [--json] [--region us-west-2]
+
+Read-only: sts GetCallerIdentity, dynamodb GetItem/Query, states DescribeExecution.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Any
+
+import boto3
+from boto3.dynamodb.types import TypeDeserializer
+from botocore.config import Config
+from botocore.exceptions import (
+    ClientError,
+    NoCredentialsError,
+    ProfileNotFound,
+    SSOError,
+    SSOTokenLoadError,
+    TokenRetrievalError,
+    UnauthorizedSSOTokenError,
+)
+
+TRANSFORM_TABLE = "mig-transform-common-iac"
+MIGRATION_TABLE = "mig-migration-common-iac"
+MAPPING_GSI = "accountId-mappingType-index"
+RUN_PREFIX = "arn:aws:states:"
+MAPPING_PREFIX = "mx"
+
+# From mig-migration-common-iac/terraform/variable-files/*.tfvars.
+ENVS = {
+    "147997133155": "dev",
+    "343218192518": "qa",
+    "528757793739": "stage",
+    "211125509520": "prod",
+    "979667334065": "demo",
+}
+
+# The order BuildStatistics emits them (mig-transform-common-iac step_functions.tf).
+TRANSFORM_KEYS = [
+    "locationsProcessed", "employeesProcessed", "customersProcessed", "unitsProcessed",
+    "repairOrdersProcessed", "partsProcessed", "partsMarkupsProcessed",
+    "outsideServicesRatesProcessed", "vendorsProcessed", "invoicesProcessed",
+    "paymentsProcessed", "creditsProcessed", "statementsProcessed",
+    "vendorInvoicesProcessed", "vendorPaymentsProcessed", "vendorCreditsProcessed",
+    "billsProcessed", "openBalancesProcessed",
+]
+
+# Pipeline-stage order: files, account, locations, contacts, parts, units, work orders.
+MIGRATION_KEYS = [
+    "filesCopied", "tenantId", "accountId", "locationsMapped", "customerLocationsMapped",
+    "employeeCount", "customerCount", "vendorCount", "mappingRecordCount",
+    "descopeFailureCount", "partsProcessed", "catalogEntriesCreated",
+    "partsWithCanonicalMatch", "unitsProcessed", "unitsCreated", "workOrdersCreated",
+    "tasksCreated", "laborLinesCreated", "laborRatesCreated", "serviceOrdersProcessed",
+    "serviceOrdersSkipped",
+]
+
+TABLE_OK = {"COMPLETED", "UNDO_COMPLETED"}
+TABLE_FAIL = {"FAILED", "UNDO_FAILED"}
+SFN_FAIL = {"FAILED", "TIMED_OUT", "ABORTED"}
+AUTH_ERRORS = (
+    UnauthorizedSSOTokenError, SSOTokenLoadError, TokenRetrievalError, SSOError,
+    NoCredentialsError,
+)
+EXPIRED_TOKEN_CODES = {"ExpiredToken", "ExpiredTokenException", "UnrecognizedClientException"}
+
+ENTITY_RE = re.compile(r"^\d+$")
+ACCOUNT_RE = re.compile(r"^act_[A-Za-z0-9]+$")
+
+_deser = TypeDeserializer()
+
+
+class Fatal(Exception):
+    def __init__(self, message: str, code: int) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# ---- data helpers --------------------------------------------------------------
+
+def plain(v: Any) -> Any:
+    if isinstance(v, Decimal):
+        return int(v) if v == v.to_integral_value() else float(v)
+    if isinstance(v, dict):
+        return {k: plain(x) for k, x in v.items()}
+    if isinstance(v, (list, set, tuple)):
+        return [plain(x) for x in v]
+    return v
+
+
+def unmarshal(item: dict[str, Any]) -> dict[str, Any]:
+    return {k: plain(_deser.deserialize(v)) for k, v in item.items()}
+
+
+def query_all(ddb: Any, **params: Any) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for page in ddb.get_paginator("query").paginate(**params):
+        items.extend(page.get("Items", []))
+    return items
+
+
+def parse_ts(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def fmt_ts(s: str | None) -> str:
+    d = parse_ts(s)
+    return d.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ") if d else "-"
+
+
+def fmt_dur(start: str | None, end: str | None) -> str:
+    a, b = parse_ts(start), parse_ts(end)
+    if not a:
+        return "-"
+    if not b:
+        return "open"
+    secs = int((b - a).total_seconds())
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def short_exec(arn: str) -> str:
+    return arn.rsplit(":", 1)[-1][:8]
+
+
+# ---- AWS reads -----------------------------------------------------------------
+
+def make_session(profile: str, region: str) -> boto3.Session:
+    try:
+        return boto3.Session(profile_name=profile, region_name=region)
+    except ProfileNotFound:
+        known = sorted(boto3.Session().available_profiles)
+        listing = "\n".join(f"    {p}" for p in known) or "    (none)"
+        raise Fatal(
+            f"AWS profile '{profile}' is not configured on this machine.\n"
+            f"Pick one of the configured profiles:\n{listing}", 2) from None
+
+
+def resolve_target(ddb: Any, target: str, env: str) -> tuple[str, dict[str, Any] | None]:
+    if ENTITY_RE.match(target):
+        entity = str(int(target))
+        r = ddb.get_item(
+            TableName=MIGRATION_TABLE,
+            Key={"entityId": {"S": entity}, "executionId": {"S": f"mxact_{entity}"}})
+        return entity, unmarshal(r["Item"]) if "Item" in r else None
+
+    items = [unmarshal(i) for i in query_all(
+        ddb, TableName=MIGRATION_TABLE, IndexName=MAPPING_GSI,
+        KeyConditionExpression="accountId = :a AND mappingType = :t",
+        ExpressionAttributeValues={":a": {"S": target}, ":t": {"S": "ACCOUNT"}})]
+    entities = sorted({i["entityId"] for i in items})
+    if not entities:
+        raise Fatal(f"no ACCOUNT mapping for {target} in {env}", 1)
+    if len(entities) > 1:
+        raise Fatal(f"{target} is mapped to more than one entity in {env}: "
+                    f"{', '.join(entities)}", 1)
+    newest = max(items, key=lambda i: i.get("createdAt") or "")
+    return entities[0], newest
+
+
+def load_runs(ddb: Any, entity: str) -> tuple[list[dict], list[dict]]:
+    # The transform SK is an execution ARN, not time-ordered, so the whole partition
+    # is read; it holds only run rows. The migration partition also holds every
+    # mx*_ mapping row, which begins_with keeps out of the read.
+    tf = [unmarshal(i) for i in query_all(
+        ddb, TableName=TRANSFORM_TABLE, KeyConditionExpression="entityId = :e",
+        ExpressionAttributeValues={":e": {"S": entity}})]
+    mg = [unmarshal(i) for i in query_all(
+        ddb, TableName=MIGRATION_TABLE,
+        KeyConditionExpression="entityId = :e AND begins_with(executionId, :p)",
+        ExpressionAttributeValues={":e": {"S": entity}, ":p": {"S": RUN_PREFIX}})]
+
+    def newest_first(rows: list[dict]) -> list[dict]:
+        return sorted(rows, key=lambda r: r.get("startTime") or "", reverse=True)
+
+    return newest_first(tf), newest_first(mg)
+
+
+def mapping_counts(ddb: Any, entity: str) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    for i in query_all(
+            ddb, TableName=MIGRATION_TABLE,
+            KeyConditionExpression="entityId = :e AND begins_with(executionId, :p)",
+            ExpressionAttributeValues={":e": {"S": entity}, ":p": {"S": MAPPING_PREFIX}},
+            ProjectionExpression="#t", ExpressionAttributeNames={"#t": "mappingType"}):
+        counts[i.get("mappingType", {}).get("S", "(none)")] += 1
+    return dict(counts.most_common())
+
+
+def sfn_status(sfn: Any, arn: str) -> str:
+    try:
+        return sfn.describe_execution(executionArn=arn, includedData="METADATA_ONLY")["status"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ExecutionDoesNotExist":
+            return "EXPIRED"
+        raise
+
+
+def financials(sfn: Any, run: dict | None) -> dict[str, Any] | None:
+    # Financials counts are never written to DynamoDB; they only survive in the
+    # execution's output, which Step Functions keeps for 90 days.
+    if not run:
+        return None
+    try:
+        raw = sfn.describe_execution(executionArn=run["executionId"]).get("output")
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ExecutionDoesNotExist":
+            return {"unavailable": "execution data expired (Step Functions keeps it 90 days)"}
+        raise
+    if not raw:
+        return {"unavailable": "the execution has no output"}
+    try:
+        result = (json.loads(raw).get("importFinancialsResult") or {}).get("result")
+    except ValueError:
+        return {"unavailable": "the execution output is not JSON"}
+    if not result:
+        return {"unavailable": "this run's output has no financials result"}
+    keys = ("counts", "failedRecordCount", "pendingRecordCount", "totalRecordCount",
+            "failedRecordRatio", "failedRecordsRef")
+    fin = {k: result.get(k) for k in keys}
+    # Older fin-mg-fun outputs carry only per-phase counts. Rebuild the summary from
+    # them rather than report "None failed" above a table that shows failures.
+    # total = created + skipped + pendingUpdate + failed matches the reported
+    # totalRecordCount exactly on runs that have both.
+    phases = [c or {} for c in (fin["counts"] or {}).values()]
+    if phases and fin["totalRecordCount"] is None:
+        failed = sum(c.get("failed", 0) for c in phases)
+        pending = sum(c.get("pendingUpdate", 0) for c in phases)
+        total = sum(c.get("created", 0) + c.get("skipped", 0) for c in phases) + pending + failed
+        fin.update(totalRecordCount=total, failedRecordCount=failed, pendingRecordCount=pending,
+                   failedRecordRatio=failed / total if total else 0.0,
+                   summaryDerivedFromCounts=True)
+    return fin
+
+
+# ---- analysis ------------------------------------------------------------------
+
+def is_undo(run: dict) -> bool:
+    status = run.get("status") or ""
+    return status.startswith("UNDO_") or status.endswith("_UNDONE")
+
+
+def consistency_flag(run: dict) -> str | None:
+    db, sf = run.get("status"), run.get("sfnStatus")
+    if sf in (None, "EXPIRED"):
+        return None
+    if sf == "SUCCEEDED" and db not in TABLE_OK:
+        return f"Step Functions SUCCEEDED but the table says {db}"
+    if sf in SFN_FAIL and db not in TABLE_FAIL:
+        return f"STALE: Step Functions {sf} but the table still says {db}"
+    if sf == "RUNNING" and db in TABLE_OK | TABLE_FAIL:
+        return f"the table says {db} but Step Functions is still RUNNING"
+    return None
+
+
+def newer_than_ok(runs: list[dict], ok_status: str) -> tuple[dict | None, list[dict]]:
+    for idx, run in enumerate(runs):
+        if run.get("status") == ok_status:
+            return run, runs[:idx]
+    return None, runs
+
+
+def describe_newer(run: dict, kind: str) -> str | None:
+    status = run.get("status")
+    when = fmt_ts(run.get("startTime"))
+    err = run.get("errorMessage")
+    if run.get("flag", "").startswith("STALE"):
+        return f"newer run {when} is {run['flag']}"
+    if status in TABLE_FAIL:
+        return f"newer run {when} {status}" + (f": {err}" if err else "")
+    if kind == "migration" and status == "UNDO_COMPLETED":
+        return f"newer run {when} UNDO_COMPLETED: the data from the run below has been removed"
+    if run.get("sfnStatus") == "RUNNING" or status not in TABLE_OK | TABLE_FAIL:
+        return f"newer run {when} is in progress ({status})"
+    return None
+
+
+def build_report(session: boto3.Session, args: argparse.Namespace) -> dict[str, Any]:
+    cfg = Config(retries={"mode": "adaptive", "max_attempts": 8})
+    account = session.client("sts", config=cfg).get_caller_identity()["Account"]
+    env = ENVS.get(account, "unknown")
+    ddb = session.client("dynamodb", config=cfg)
+    sfn = session.client("stepfunctions", config=cfg)
+
+    entity, mapping = resolve_target(ddb, args.target, env)
+    tf, mg = load_runs(ddb, entity)
+    if not mapping and not tf and not mg:
+        raise Fatal(f"entity {entity} has no mapping and no transform or migration runs in {env}", 1)
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=args.days)
+
+    def in_window(run: dict) -> bool:
+        started = parse_ts(run.get("startTime"))
+        return bool(started and started >= cutoff)
+
+    tf_ok, tf_newer = newer_than_ok(tf, "COMPLETED")
+    mg_ok, mg_newer = newer_than_ok(mg, "COMPLETED")
+
+    # Cross-check the real execution status for every run the report will talk about.
+    to_check = {r["executionId"]: r for r in tf + mg
+                if in_window(r) or r in tf_newer or r in mg_newer}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        statuses = dict(zip(to_check, pool.map(lambda a: sfn_status(sfn, a), to_check), strict=True))
+    warnings: list[str] = []
+    for arn, run in to_check.items():
+        run["sfnStatus"] = statuses[arn]
+        flag = consistency_flag(run)
+        if flag:
+            run["flag"] = flag
+            warnings.append(f"{short_exec(arn)} {fmt_ts(run.get('startTime'))}: {flag}")
+
+    def run_view(run: dict, kind: str) -> dict[str, Any]:
+        view = {
+            "executionArn": run["executionId"],
+            "startTime": run.get("startTime"),
+            "endTime": run.get("endTime"),
+            "duration": fmt_dur(run.get("startTime"), run.get("endTime")),
+            "status": run.get("status"),
+            "sfnStatus": run.get("sfnStatus"),
+        }
+        if kind == "migration":
+            view["message"] = run.get("message")
+            view["undo"] = is_undo(run)
+        if run.get("errorMessage"):
+            view["errorMessage"] = run["errorMessage"]
+        if run.get("flag"):
+            view["flag"] = run["flag"]
+        return view
+
+    def newer_notes(rows: list[dict], kind: str) -> list[dict[str, Any]]:
+        notes = []
+        for run in rows:
+            note = describe_newer(run, kind)
+            if note:
+                entry: dict[str, Any] = {"note": note, "executionArn": run["executionId"]}
+                stats = run.get(f"{kind}Statistics")
+                if stats:
+                    entry["partialStatistics"] = stats
+                notes.append(entry)
+        return notes
+
+    last_tf = None
+    if tf_ok or tf_newer:
+        last_tf = {
+            "fromRun": tf_ok and {"executionArn": tf_ok["executionId"],
+                                  "startTime": tf_ok.get("startTime")},
+            "statistics": (tf_ok or {}).get("transformStatistics") or {},
+            "newerRuns": newer_notes(tf_newer, "transform"),
+        }
+
+    last_mg = None
+    if mg_ok or mg_newer:
+        last_mg = {
+            "fromRun": mg_ok and {"executionArn": mg_ok["executionId"],
+                                  "startTime": mg_ok.get("startTime"),
+                                  "message": mg_ok.get("message")},
+            "statistics": (mg_ok or {}).get("migrationStatistics") or {},
+            "financials": financials(sfn, mg_ok),
+            "newerRuns": newer_notes(mg_newer, "migration"),
+        }
+
+    return {
+        "target": {"input": args.target, "entityId": entity, "profile": args.profile,
+                   "awsAccount": account, "env": env, "region": args.region},
+        "window": {"days": args.days, "since": cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")},
+        "mapping": mapping and {
+            "entityId": entity,
+            "accountId": mapping.get("accountId"),
+            "tenantId": mapping.get("tenantId"),
+            "createdAt": mapping.get("createdAt"),
+            "operation": mapping.get("operation"),
+            "sfnExecutionId": mapping.get("sfnExecutionId"),
+        },
+        "mappingCounts": mapping_counts(ddb, entity) if args.mappings else None,
+        "transformRuns": [run_view(r, "transform") for r in tf if in_window(r)],
+        "migrationRuns": [run_view(r, "migration") for r in mg if in_window(r)],
+        "lastTransformStatistics": last_tf,
+        "lastMigrationStatistics": last_mg,
+        "warnings": warnings,
+    }
+
+
+# ---- rendering -----------------------------------------------------------------
+
+def grid(stats: dict[str, Any], order: list[str], indent: str = "  ", cols: int = 2) -> list[str]:
+    keys = [k for k in order if k in stats] + sorted(k for k in stats if k not in order)
+    if not keys:
+        return [f"{indent}(no statistics recorded)"]
+    kw = max(len(k) for k in keys)
+    vw = max(len(str(stats[k])) for k in keys)
+    cells = [f"{k:<{kw}} {stats[k]!s:>{vw}}" for k in keys]
+    return [indent + "    ".join(cells[i:i + cols]) for i in range(0, len(cells), cols)]
+
+
+def render_runs(title: str, runs: list[dict], kind: str) -> list[str]:
+    lines = [f"{title} ({len(runs)})"]
+    if not runs:
+        return [*lines, "  (none in window)"]
+    sw = max(len(r["status"] or "-") for r in runs)
+    for r in runs:
+        sfn = r.get("sfnStatus") or "-"
+        row = (f"  {fmt_ts(r['startTime'])}  {r['duration']:>7}  {r['status'] or '-':<{sw}}"
+               f"  sfn:{sfn:<9}  {short_exec(r['executionArn'])}")
+        if kind == "migration" and r.get("message"):
+            row += f"  {r['message']}"
+        lines.append(row.rstrip())
+        if r.get("errorMessage"):
+            lines.append(f"      error: {r['errorMessage']}")
+        if r.get("flag"):
+            lines.append(f"      ! {r['flag']}")
+    return lines
+
+
+def render_newer(notes: list[dict]) -> list[str]:
+    lines = []
+    for n in notes:
+        lines.append(f"  ! {n['note']}")
+        if n.get("partialStatistics"):
+            lines.append("    partial statistics:")
+            lines += grid(n["partialStatistics"], MIGRATION_KEYS + TRANSFORM_KEYS, indent="      ")
+    return lines
+
+
+def render_financials(fin: dict[str, Any] | None) -> list[str]:
+    if fin is None:
+        return []
+    if "unavailable" in fin:
+        return [f"  financials: unavailable - {fin['unavailable']}"]
+    total, failed = fin.get("totalRecordCount"), fin.get("failedRecordCount")
+    pending, ratio = fin.get("pendingRecordCount"), fin.get("failedRecordRatio")
+    pct = f" ({ratio * 100:.1f}%)" if isinstance(ratio, (int, float)) else ""
+    head = f"  financials: {total} records, {failed} {'FAILED' if failed else 'failed'}{pct}, {pending} pending"
+    if fin.get("summaryDerivedFromCounts"):
+        head += "  (summed from phase counts; this run predates the summary fields)"
+    lines = [head]
+    counts = fin.get("counts") or {}
+    if counts:
+        pw = max(len(p) for p in counts)
+        lines.append(f"    {'phase':<{pw}}  created  skipped  pendingUpdate  failed")
+        for phase, c in counts.items():
+            c = c or {}
+            lines.append(f"    {phase:<{pw}}  {c.get('created', 0):>7}  {c.get('skipped', 0):>7}"
+                         f"  {c.get('pendingUpdate', 0):>13}  {c.get('failed', 0):>6}")
+    if fin.get("failedRecordsRef"):
+        lines.append(f"    failure report: {fin['failedRecordsRef']}")
+    return lines
+
+
+def render_text(rep: dict[str, Any]) -> str:
+    t, w = rep["target"], rep["window"]
+    out = [
+        f"mig-entity-status  entity {t['entityId']}  |  {t['profile']}  "
+        f"{t['env']} ({t['awsAccount']})  {t['region']}",
+        f"window: last {w['days']} days (since {fmt_ts(w['since'])})    times are UTC",
+        "",
+        "MAPPING",
+    ]
+    m = rep["mapping"]
+    if m:
+        out.append(f"  entity   {m['entityId']}    account  {m['accountId'] or '-'}"
+                   f"    tenant  {m['tenantId'] or '-'}")
+        out.append(f"  mapped   {fmt_ts(m['createdAt'])} ({m.get('operation') or '-'})")
+    else:
+        out.append(f"  entity {t['entityId']} has no ACCOUNT mapping - not migrated yet")
+    counts = rep.get("mappingCounts")
+    if counts is not None:
+        out.append(f"  mapping records by type ({sum(counts.values())}):")
+        if counts:
+            kw = max(len(k) for k in counts)
+            out += [f"    {k:<{kw}}  {v:>7}" for k, v in counts.items()]
+        else:
+            out.append("    (none)")
+
+    out.append("")
+    out += render_runs("TRANSFORM RUNS", rep["transformRuns"], "transform")
+    out.append("")
+    out += render_runs("MIGRATION RUNS", rep["migrationRuns"], "migration")
+
+    for title, key, order in (("LAST TRANSFORM STATISTICS", "lastTransformStatistics", TRANSFORM_KEYS),
+                              ("LAST MIGRATION STATISTICS", "lastMigrationStatistics", MIGRATION_KEYS)):
+        out.append("")
+        block = rep[key]
+        if not block:
+            out += [title, "  (no runs recorded)"]
+            continue
+        src = block["fromRun"]
+        if src:
+            out.append(f"{title}  (from {fmt_ts(src['startTime'])}, {short_exec(src['executionArn'])})")
+            out += render_newer(block["newerRuns"])
+            out += grid(block["statistics"], order)
+        else:
+            out.append(f"{title}  (no COMPLETED run on record)")
+            out += render_newer(block["newerRuns"])
+        out += render_financials(block.get("financials"))
+
+    if rep["warnings"]:
+        out += ["", "WARNINGS"] + [f"  ! {x}" for x in rep["warnings"]]
+    return "\n".join(out)
+
+
+# ---- entry point ---------------------------------------------------------------
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="mig-entity-status",
+        description="Mapping, recent runs, and latest statistics for a migration entity.")
+    p.add_argument("target", help="numeric entity id, or a PUID account id (act_...)")
+    p.add_argument("-p", "--profile", required=True,
+                   help="AWS SSO profile, e.g. fb-dev-non-prod/Admin (required, never defaulted)")
+    p.add_argument("--days", type=int, default=30, help="run-history window (default 30)")
+    p.add_argument("--mappings", action="store_true",
+                   help="also count mapping records per mappingType (reads every mapping row)")
+    p.add_argument("--json", action="store_true", help="emit one JSON object instead of the report")
+    p.add_argument("--region", default="us-west-2", help="AWS region (default us-west-2)")
+    args = p.parse_args(argv)
+    if not (ENTITY_RE.match(args.target) or ACCOUNT_RE.match(args.target)):
+        p.error(f"'{args.target}' is neither a numeric entity id nor an act_... account id")
+    if args.days < 1:
+        p.error("--days must be at least 1")
+    return args
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    sso_hint = (f"SSO session for '{args.profile}' is missing or expired.\n"
+                f"  run: aws sso login --profile {args.profile}")
+    try:
+        report = build_report(make_session(args.profile, args.region), args)
+    except Fatal as e:
+        print(f"mig-entity-status: {e}", file=sys.stderr)
+        return e.code
+    except AUTH_ERRORS:
+        print(f"mig-entity-status: {sso_hint}", file=sys.stderr)
+        return 2
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code in EXPIRED_TOKEN_CODES:
+            print(f"mig-entity-status: {sso_hint}", file=sys.stderr)
+        else:
+            print(f"mig-entity-status: AWS {code}: {e.response['Error'].get('Message', '')}",
+                  file=sys.stderr)
+        return 2
+    print(json.dumps(report, indent=2, default=str) if args.json else render_text(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
