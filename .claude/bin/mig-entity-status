@@ -81,7 +81,9 @@ AUTH_ERRORS = (
 EXPIRED_TOKEN_CODES = {"ExpiredToken", "ExpiredTokenException", "UnrecognizedClientException"}
 
 ENTITY_RE = re.compile(r"^\d+$")
-ACCOUNT_RE = re.compile(r"^act_[A-Za-z0-9]+$")
+# The PUID boundary format (architecture-decisions: PUID prefixed base62 identifiers), fixed to the account prefix.
+ACCOUNT_RE = re.compile(r"^act_[0-9a-zA-Z]{10,22}$")
+MAX_DAYS = 3650
 
 _deser = TypeDeserializer()
 
@@ -294,6 +296,9 @@ def describe_newer(run: dict, kind: str) -> str | None:
         return f"newer run {when} {status}" + (f": {err}" if err else "")
     if kind == "migration" and status == "UNDO_COMPLETED":
         return f"newer run {when} UNDO_COMPLETED: the data from the run below has been removed"
+    # Step Functions purges a standard execution only after it has ended, so an expired one cannot still be running.
+    if run.get("sfnStatus") == "EXPIRED" and status not in TABLE_OK | TABLE_FAIL:
+        return f"newer run {when} never recorded an end state ({status}) and its execution has expired"
     if run.get("sfnStatus") == "RUNNING" or status not in TABLE_OK | TABLE_FAIL:
         return f"newer run {when} is in progress ({status})"
     return None
@@ -321,9 +326,10 @@ def build_report(session: boto3.Session, args: argparse.Namespace) -> dict[str, 
     tf_ok, tf_newer = newer_than_ok(tf, "COMPLETED")
     mg_ok, mg_newer = newer_than_ok(mg, "COMPLETED")
 
-    # Cross-check the real execution status for every run the report will talk about.
+    # Cross-check the real execution status for every run the report will talk about, including the
+    # runs the statistics come from even outside the window, so a mismatch behind them is never silent.
     to_check = {r["executionId"]: r for r in tf + mg
-                if in_window(r) or r in tf_newer or r in mg_newer}
+                if in_window(r) or r in tf_newer or r in mg_newer or r is tf_ok or r is mg_ok}
     with ThreadPoolExecutor(max_workers=8) as pool:
         statuses = dict(zip(to_check, pool.map(lambda a: sfn_status(sfn, a), to_check), strict=True))
     warnings: list[str] = []
@@ -408,7 +414,8 @@ def build_report(session: boto3.Session, args: argparse.Namespace) -> dict[str, 
 # ---- rendering -----------------------------------------------------------------
 
 def grid(stats: dict[str, Any], order: list[str], indent: str = "  ", cols: int = 2) -> list[str]:
-    keys = [k for k in order if k in stats] + sorted(k for k in stats if k not in order)
+    known = [k for k in dict.fromkeys(order) if k in stats]
+    keys = known + sorted(k for k in stats if k not in order)
     if not keys:
         return [f"{indent}(no statistics recorded)"]
     kw = max(len(k) for k in keys)
@@ -532,16 +539,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("target", help="numeric entity id, or a PUID account id (act_...)")
     p.add_argument("-p", "--profile", required=True,
                    help="AWS SSO profile, e.g. fb-dev-non-prod/Admin (required, never defaulted)")
-    p.add_argument("--days", type=int, default=30, help="run-history window (default 30)")
+    p.add_argument("--days", type=int, default=30, help=f"run-history window, 1-{MAX_DAYS} (default 30)")
     p.add_argument("--mappings", action="store_true",
                    help="also count mapping records per mappingType (reads every mapping row)")
     p.add_argument("--json", action="store_true", help="emit one JSON object instead of the report")
     p.add_argument("--region", default="us-west-2", help="AWS region (default us-west-2)")
     args = p.parse_args(argv)
     if not (ENTITY_RE.match(args.target) or ACCOUNT_RE.match(args.target)):
-        p.error(f"'{args.target}' is neither a numeric entity id nor an act_... account id")
-    if args.days < 1:
-        p.error("--days must be at least 1")
+        p.error(f"'{args.target}' is neither a numeric entity id nor an account id "
+                f"(act_ followed by 10-22 base62 characters)")
+    if not 1 <= args.days <= MAX_DAYS:
+        p.error(f"--days must be from 1 to {MAX_DAYS}")
     return args
 
 
