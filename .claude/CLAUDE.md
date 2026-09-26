@@ -25,6 +25,9 @@
 - Before claiming a dependency or version doesn't exist, verify against the actual registry. A 404/failed install for `@fullbay/*` packages is almost always a stale CodeArtifact/SSO token, not a missing package — refresh the token and retry first.
 - Never suggest skipping or bypassing pre-commit hooks (`--no-verify`) to get around a failing install or check. Fix the underlying cause.
 - After `git add`, run `git diff --cached --stat` and confirm the intended files are actually staged before committing. A path or glob that matches nothing stages nothing, and the commit goes out without the work.
+- Lockfiles: never regenerate `pnpm-lock.yaml` in a way that drops the repo's `pnpm.overrides`, and confirm `pnpm install --frozen-lockfile` passes before pushing (CI installs frozen). If typecheck or tests changed the lockfile unintentionally, restore it before committing.
+- Use the repo's `mise`-pinned pnpm (`mise exec -- pnpm …`). The global pnpm 12 enforces a one-day `minimumReleaseAge` that rejects just-published versions, and writes a stray `pnpm-workspace.yaml`.
+- Code must tolerate CI-only env vars (e.g. `SHORT_SHA`) being unset in local runs.
 
 ### Data Validation
 - Validate data-related changes (finance figures, opening balances, parts/order counts, discrepancies) against live data — Athena queries or the relevant live source — before considering the implementation complete. Do not trust the spec's numbers alone.
@@ -33,11 +36,16 @@
 - Do not infer schema, table names, bucket names, or config placement from git history, closed PRs, or sibling repos — those are frequently stale. Verify against the live source and state the query and its actual result.
 - For extraction/transform/reconciliation tooling, validate against the full corpus — or at least 10 inputs of deliberately different shapes — before calling it done, and report the pass/fail count. One passing sample is not evidence; an extractor built from a single invoice needed a rewrite across the 350-invoice corpus.
 
+### Migration Conventions
+- "Account id" means the Next `act_` PUID unless I ask for the legacy (numeric entity) id.
+- Migration status, statistics, and entity mappings live in the `mig-migration-common-iac` and `mig-transform-common-iac` DynamoDB tables. The `/envdrift` / Port.io drift data is unrelated.
+
 ### Pull Requests
 - When creating PRs, check if a referenced PR number is still open. Never update a closed PR -- create a new one.
 - Right before opening a PR, merge (or rebase onto) the latest `origin/master`/default branch and re-run the full test suite, so CI breakage from concurrently-merged changes (e.g. strict `toEqual` assertion drift) surfaces locally rather than in the pipeline.
 - For multiline PR bodies, prefer `gh pr create --body-file <tmpfile>` over inline heredocs. Heredocs containing backticks corrupt PR content.
 - Same rule applies to multiline commit messages: write to a tempfile and use `git commit -F <tmpfile>` rather than `-m "$(cat <<EOF ...`.
+- PR comment and review-reply bodies go through `--body-file <tmpfile>` or `gh api ... --input <payload.json>`. `gh` does not expand `@path` in a body argument, so it posts the literal path.
 
 ### Git State Verification
 - Before claiming a file or commit doesn't exist, run `git fetch origin && git log origin/<branch> --oneline -20` to confirm the local clone is current. Local clones drift.
@@ -48,7 +56,19 @@
 - Always use the established IDP config library with flat UPPER_SNAKE_CASE keys. Do not create custom YAML config readers or use camelCase/nested YAML structures.
 
 ### AWS Commands
-- Before running any AWS CLI command against an environment, confirm the active SSO profile/account matches the intended target (`aws sts get-caller-identity` or check `AWS_PROFILE`, e.g. fb-demo-us-prod/Admin). Never assume the default profile is the right one.
+- Before running any AWS CLI command against an environment, confirm the active SSO profile/account matches the intended target (`aws sts get-caller-identity` or check `AWS_PROFILE`). Never assume the default profile is the right one. Pick the profile from this map; an ARN's account id decides it, so match the ARN against the table before the first call:
+
+  | Target | Profile | Account |
+  |---|---|---|
+  | dev | `fb-dev-non-prod/Admin` | 147997133155 |
+  | qa | `fb-qa-non-prod/Admin` | 343218192518 |
+  | stage | `fb-stage-non-prod/Admin` | 528757793739 |
+  | prod | `fb-live-us-prod/Admin` | 211125509520 |
+  | demo | `fb-demo-us-prod/Admin` | 979667334065 |
+  | data lake / Athena | `fb-datalake-prod/Admin` | 230514136789 |
+
+  "Prod" means `fb-live-us-prod`, never `fb-demo-us-prod`.
+- **Prod is read-only. With `fb-live-us-prod` (account 211125509520) you NEVER modify data** — no DynamoDB/S3/RDS writes or deletes, no Step Functions starts, stops, or redrives, no Lambda invokes that write, no queue sends or purges, no Terraform apply, no console-equivalent mutations. Only describe/get/list/query/scan and log reads. If a fix needs a prod change, write up the exact change and hand it to me; do not run it, even if asked mid-task to "just fix it".
 - Confirm the SSO session isn't expired before starting a long AWS/Terraform task — re-authenticate proactively (`aws sso login --profile <p>`) rather than discovering the expiry mid-run on a rejected call or blocked dependency install.
 
 ### AWS Agent Toolkit

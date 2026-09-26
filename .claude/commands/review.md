@@ -6,6 +6,8 @@ Follow these steps exactly:
 
 ## Step 1: Detect Changed Files
 
+**First, check `$ARGUMENTS`.** If it is a bare PR number (matches `^#?[0-9]+$`, e.g. `10` or `#10`), do not run this review. Reply: "`/review` reviews local working-tree changes; to review PR #N use `/reviewit N`." and stop. A number is never a file filter.
+
 Determine what files have changed relative to the main branch:
 
 ```bash
