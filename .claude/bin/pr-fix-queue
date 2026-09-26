@@ -305,7 +305,7 @@ query {
         mergeable reviewDecision
         repository { nameWithOwner name }
         baseRef { name target { oid } }
-        latestReviews(first: 20) { nodes { id state } }
+        latestOpinionatedReviews(first: 20) { nodes { id state } }
         reviewThreads(first: 60) {
           nodes {
             id isResolved isOutdated
@@ -430,7 +430,9 @@ for p in sorted(nodes, key=lambda p: p.get("updatedAt") or ""):
         fp_parts.append("ic:" + ",".join(sorted(unhandled)))
         fp_parts.append("mr:%d" % my_newest)
 
-    cr = sorted(r["id"] for r in ((p.get("latestReviews") or {}).get("nodes") or [])
+    # latestReviews can omit a still-standing CHANGES_REQUESTED that reviewDecision reports;
+    # latestOpinionatedReviews keeps each reviewer's latest approval or change request.
+    cr = sorted(r["id"] for r in ((p.get("latestOpinionatedReviews") or {}).get("nodes") or [])
                 if r.get("state") == "CHANGES_REQUESTED")
     if p.get("reviewDecision") == "CHANGES_REQUESTED" and cr:
         labels.append("changes-requested")

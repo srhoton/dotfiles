@@ -39,15 +39,20 @@ def thread(id, first="rev", last="rev", last_id="L1", typename="User"):
             "firstComment": {"nodes": [{"author": {"login": first, "__typename": typename}}]},
             "lastComment": {"nodes": [{"id": last_id, "author": {"login": last}}]}}
 
-def pr(num, comments=(), threads=(), total=None, mergeable="MERGEABLE", draft=False):
+def pr(num, comments=(), threads=(), total=None, mergeable="MERGEABLE", draft=False,
+       decision="REVIEW_REQUIRED", reviews=(), latest=None):
+    # reviews: (id, state) per reviewer's latest approve/request (latestOpinionatedReviews);
+    # latest overrides latestReviews, which GitHub can return without a standing request.
+    rv = lambda rows: {"nodes": [{"id": i, "state": st} for i, st in rows]}
     return {
         "number": num, "title": "t%d" % num, "isDraft": draft,
         "updatedAt": "2026-09-21T12:00:00Z", "headRefOid": "h%d" % num,
         "headRefName": "feature-%d" % num, "isCrossRepository": False,
-        "mergeable": mergeable, "reviewDecision": "REVIEW_REQUIRED",
+        "mergeable": mergeable, "reviewDecision": decision,
         "repository": {"nameWithOwner": "acme/repo", "name": "repo"},
         "baseRef": {"name": "master", "target": {"oid": "b0"}},
-        "latestReviews": {"nodes": []},
+        "latestOpinionatedReviews": rv(reviews),
+        "latestReviews": rv(reviews if latest is None else latest),
         "reviewThreads": {"nodes": list(threads)},
         "comments": {"totalCount": len(comments) if total is None else total,
                      "nodes": list(comments)},
@@ -77,6 +82,16 @@ reject() {  # CASE OUTPUT PATTERN  (extended regex that must NOT match)
 }
 
 T=$'\t'
+
+fixture standingcr '[pr(40, decision="CHANGES_REQUESTED", reviews=[("R1","CHANGES_REQUESTED"),("R2","APPROVED")], latest=[("R2","APPROVED")])]'
+out=$(run standingcr)
+expect "standing change request hidden from latestReviews is a candidate" "$out" "^CAND${T}acme/repo${T}repo${T}40${T}"
+expect "  fingerprint names the requesting review" "$out" "cr:R1"
+expect "  label says changes-requested" "$out" "changes-requested"
+
+fixture approvedonly '[pr(41, decision="APPROVED", reviews=[("R3","APPROVED")])]'
+out=$(run approvedonly)
+reject "an approval alone is not a change request" "$out" "changes-requested"
 
 fixture unanswered '[pr(1, [comment(100)])]'
 out=$(run unanswered)
