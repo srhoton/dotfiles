@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""pr-my-turn: which of my open PRs are waiting on me.
+
+Groups every open PR I authored into what I need to do with it: resolve a merge
+conflict, fix something (changes requested, required checks failing, behind
+base, unanswered review threads), or merge it. PRs in my personal repos get
+their own section, since there I am the reviewer. Everything else is counted in
+a footer as waiting on others, so nothing is silently dropped.
+
+GitHub's mergeStateStatus is the merge-readiness verdict: in ruleset-protected
+repos CLEAN means approved, required checks passing, and no conflict. It is not
+reviewDecision, which rulesets can leave null even when an approval is required.
+
+Usage: pr-my-turn [-o ORG ...] [--json]
+Read-only: one paginated `gh api graphql` query. Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Any
+
+QUERY = """
+query($cursor: String) {
+  viewer {
+    login
+    pullRequests(states: OPEN, first: 50, after: $cursor, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      totalCount
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number title url isDraft createdAt updatedAt
+        mergeable mergeStateStatus reviewDecision baseRefName
+        repository { nameWithOwner owner { login } }
+        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        latestOpinionatedReviews(first: 20) { nodes { state author { login __typename } } }
+        reviewThreads(first: 60) {
+          nodes {
+            isResolved isOutdated
+            firstComment: comments(first: 1) { nodes { author { login __typename } } }
+            lastComment: comments(last: 1) { nodes { author { login } } }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+MAX_POLLS = 3
+POLL_DELAY_S = 2
+READY_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
+FAILED_CHECKS = {"FAILURE", "ERROR"}
+RUNNING_CHECKS = {"PENDING", "EXPECTED"}
+
+SECTIONS = [
+    ("conflict", "MERGE CONFLICT"),
+    ("fix", "NEEDS YOUR FIX"),
+    ("ready", "READY TO MERGE"),
+]
+PERSONAL_TAGS = {"conflict": "conflict", "fix": "needs fix", "ready": "mergeable", "unknown": "unknown", "others": "waiting"}
+
+
+class GhError(Exception):
+    pass
+
+
+# ---- GitHub --------------------------------------------------------------------
+
+def run_graphql(cursor: str | None) -> dict[str, Any]:
+    cmd = ["gh", "api", "graphql", "-f", f"query={QUERY}"]
+    if cursor is not None:
+        cmd += ["-f", f"cursor={cursor}"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        raise GhError("the gh CLI is not installed or not on PATH") from None
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        raise GhError(f"gh api graphql failed: {detail[0] if detail else f'exit {proc.returncode}'}")
+    doc = json.loads(proc.stdout)
+    if doc.get("errors"):
+        raise GhError(f"GraphQL: {doc['errors'][0].get('message', '?')}")
+    return doc["data"]["viewer"]
+
+
+def fetch_all() -> tuple[str, int, list[dict[str, Any]]]:
+    login, total, prs, cursor = "", 0, [], None
+    while True:
+        viewer = run_graphql(cursor)
+        login = viewer["login"]
+        page = viewer["pullRequests"]
+        total = page["totalCount"]
+        prs.extend(page["nodes"])
+        if not page["pageInfo"]["hasNextPage"]:
+            return login, total, prs
+        cursor = page["pageInfo"]["endCursor"]
+
+
+def is_unknown(pr: dict[str, Any]) -> bool:
+    return pr.get("mergeable") == "UNKNOWN" or pr.get("mergeStateStatus") == "UNKNOWN"
+
+
+def fetch_resolved() -> tuple[str, int, list[dict[str, Any]]]:
+    """GitHub computes mergeability lazily and answers UNKNOWN until it has; the first query triggers it."""
+    for attempt in range(1, MAX_POLLS + 1):
+        login, total, prs = fetch_all()
+        if not any(is_unknown(pr) for pr in prs) or attempt == MAX_POLLS:
+            return login, total, prs
+        time.sleep(POLL_DELAY_S)
+    raise AssertionError("unreachable")
+
+
+# ---- classification ------------------------------------------------------------
+
+def nodes(pr: dict[str, Any], *path: str) -> list[dict[str, Any]]:
+    value: Any = pr
+    for key in path:
+        value = (value or {}).get(key)
+    return [n for n in (value or {}).get("nodes") or [] if n]
+
+
+def check_state(pr: dict[str, Any]) -> str | None:
+    commits = nodes(pr, "commits")
+    rollup = ((commits[0].get("commit") or {}).get("statusCheckRollup") or {}) if commits else {}
+    return rollup.get("state")
+
+
+def human_reviews(pr: dict[str, Any], me: str) -> list[dict[str, Any]]:
+    # latestReviews can omit a still-standing CHANGES_REQUESTED that reviewDecision reports;
+    # latestOpinionatedReviews keeps each reviewer's latest approval or change request.
+    return [r for r in nodes(pr, "latestOpinionatedReviews")
+            if (r.get("author") or {}).get("__typename") == "User" and (r["author"].get("login") != me)]
+
+
+def unanswered_threads(pr: dict[str, Any], me: str) -> int:
+    count = 0
+    for t in nodes(pr, "reviewThreads"):
+        if t.get("isResolved") or t.get("isOutdated"):
+            continue
+        first = nodes(t, "firstComment")
+        last = nodes(t, "lastComment")
+        if not first or not last:
+            continue
+        if (first[0].get("author") or {}).get("__typename") != "User":
+            continue
+        if (last[0].get("author") or {}).get("login") == me:
+            continue
+        count += 1
+    return count
+
+
+def logins(reviews: list[dict[str, Any]], state: str) -> list[str]:
+    return sorted({r["author"]["login"] for r in reviews if r.get("state") == state})
+
+
+def fix_reasons(pr: dict[str, Any], me: str, reviews: list[dict[str, Any]], checks: str | None) -> list[str]:
+    reasons = []
+    requested = logins(reviews, "CHANGES_REQUESTED")
+    if requested:
+        reasons.append("changes requested by " + ", ".join(f"@{u}" for u in requested))
+    elif pr.get("reviewDecision") == "CHANGES_REQUESTED":
+        reasons.append("changes requested")
+    # A failing rollup on a mergeable PR (UNSTABLE) is only non-required checks; ready_notes reports those.
+    if checks in FAILED_CHECKS and pr.get("mergeStateStatus") not in READY_STATES:
+        reasons.append("required checks failing" if pr.get("mergeStateStatus") == "BLOCKED" else "checks failing")
+    if pr.get("mergeStateStatus") == "BEHIND":
+        reasons.append(f"behind {pr.get('baseRefName') or 'base'}")
+    threads = unanswered_threads(pr, me)
+    if threads:
+        reasons.append(f"{threads} unanswered review thread{'s' if threads != 1 else ''}")
+    return reasons
+
+
+def ready_notes(pr: dict[str, Any], reviews: list[dict[str, Any]], checks: str | None) -> list[str]:
+    notes = []
+    approved = logins(reviews, "APPROVED")
+    if approved:
+        notes.append("approved by " + ", ".join(f"@{u}" for u in approved))
+    elif pr.get("reviewDecision") == "APPROVED":
+        notes.append("approved")
+    else:
+        notes.append("no review required, none given")
+    if pr.get("mergeStateStatus") == "UNSTABLE":
+        notes.append("non-required checks failing")
+    elif checks == "SUCCESS":
+        notes.append("checks passing")
+    return notes
+
+
+def waiting_reason(pr: dict[str, Any], reviews: list[dict[str, Any]], checks: str | None) -> str:
+    state = pr.get("mergeStateStatus")
+    if pr.get("isDraft") or state == "DRAFT":
+        return "draft"
+    if checks in RUNNING_CHECKS:
+        return "checks running"
+    if state == "BLOCKED":
+        return "blocked by branch rules" if logins(reviews, "APPROVED") else "awaiting approval"
+    return f"merge state {state or 'unreported'}"
+
+
+def classify(pr: dict[str, Any], me: str) -> dict[str, Any]:
+    """Section and reasons for one PR. A PR goes to the first matching section; its reasons list every issue."""
+    reviews = human_reviews(pr, me)
+    checks = check_state(pr)
+    conflict = pr.get("mergeable") == "CONFLICTING"
+    reasons = ([f"conflicts with {pr.get('baseRefName') or 'base'}"] if conflict else []) + fix_reasons(pr, me, reviews, checks)
+    personal = ((pr.get("repository") or {}).get("owner") or {}).get("login") == me
+
+    if conflict:
+        section = "conflict"
+    elif reasons:
+        section = "fix"
+    elif is_unknown(pr):
+        section = "unknown"
+        reasons = ["mergeability still UNKNOWN after re-polling"]
+    elif pr.get("mergeStateStatus") in READY_STATES:
+        section = "ready"
+        reasons = ready_notes(pr, reviews, checks)
+    else:
+        section = "others"
+        reasons = [waiting_reason(pr, reviews, checks)]
+
+    return {
+        "section": "personal" if personal else section,
+        "state": section,
+        "repo": pr["repository"]["nameWithOwner"],
+        "number": pr["number"],
+        "title": " ".join((pr.get("title") or "").split()),
+        "url": pr.get("url"),
+        "createdAt": pr.get("createdAt"),
+        "updatedAt": pr.get("updatedAt"),
+        "mergeStateStatus": pr.get("mergeStateStatus"),
+        "mergeable": pr.get("mergeable"),
+        "reviewDecision": pr.get("reviewDecision"),
+        "checks": checks,
+        "reasons": reasons,
+    }
+
+
+# ---- report --------------------------------------------------------------------
+
+def parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def age(value: str | None, now: datetime) -> str:
+    then = parse_ts(value)
+    if then is None:
+        return "-"
+    secs = max(0, int((now - then).total_seconds()))
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def build_report(login: str, total: int, prs: list[dict[str, Any]], orgs: set[str], now: datetime) -> dict[str, Any]:
+    scoped = [pr for pr in prs if not orgs or pr["repository"]["owner"]["login"] in orgs]
+    items = [classify(pr, login) for pr in scoped]
+    by_section: dict[str, list[dict[str, Any]]] = {key: [] for key in ("conflict", "fix", "ready", "personal", "unknown", "others")}
+    for item in items:
+        by_section[item["section"]].append(item)
+    for key, group in by_section.items():
+        field = "createdAt" if key == "personal" else "updatedAt"
+        group.sort(key=lambda i: i.get(field) or "")
+    waiting: dict[str, int] = {}
+    for item in by_section["others"]:
+        waiting[item["reasons"][0]] = waiting.get(item["reasons"][0], 0) + 1
+    return {
+        "viewer": login,
+        "generatedAt": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "openCount": total,
+        "inScopeCount": len(scoped),
+        "orgs": sorted(orgs),
+        "waitingOnYou": sum(len(by_section[k]) for k, _ in SECTIONS),
+        "sections": {k: by_section[k] for k in ("conflict", "fix", "ready", "personal", "unknown")},
+        "waitingOnOthers": dict(sorted(waiting.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "others": by_section["others"],
+    }
+
+
+def truncate(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def render_item(item: dict[str, Any], now: datetime, ref_width: int, personal: bool) -> list[str]:
+    ref = f"{item['repo']}#{item['number']}"
+    when = f"opened {(item.get('createdAt') or '-')[:10]}" if personal else f"updated {age(item.get('updatedAt'), now)}"
+    detail = item["reasons"]
+    if personal:
+        detail = [PERSONAL_TAGS[item["state"]], *detail]
+    return [
+        f"  {ref:<{ref_width}}  {truncate(item['title'], 50):<50}  {when}",
+        f"      {' · '.join(detail)}",
+        f"      {item['url']}",
+    ]
+
+
+def render_text(rep: dict[str, Any], now: datetime) -> str:
+    scope = f" · orgs: {', '.join(rep['orgs'])}" if rep["orgs"] else ""
+    out = [f"PRs WAITING ON YOU ({rep['waitingOnYou']})    {rep['openCount']} open{scope} · {rep['generatedAt'][:16].replace('T', ' ')}Z"]
+    sections = rep["sections"]
+    visible = [i for k in ("conflict", "fix", "ready", "personal", "unknown") for i in sections[k]]
+    ref_width = max((len(f"{i['repo']}#{i['number']}") for i in visible), default=0)
+    if rep["waitingOnYou"] == 0:
+        out += ["", "Nothing is waiting on you."]
+    for key, title in [*SECTIONS, ("personal", "PERSONAL REPOS — self-merge"), ("unknown", "COULD NOT CLASSIFY")]:
+        group = sections[key]
+        if not group:
+            continue
+        out += ["", f"{title} ({len(group)})"]
+        for item in group:
+            out += render_item(item, now, ref_width, key == "personal")
+    waiting = rep["waitingOnOthers"]
+    summary = " · ".join(f"{n} {reason}" for reason, n in waiting.items()) if waiting else "none"
+    out += ["", f"Waiting on others: {summary}"]
+    if sections["conflict"] or sections["fix"]:
+        out.append("tip: pr-fix-queue works conflicts and review feedback in isolated sessions (-n to preview)")
+    return "\n".join(out)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="pr-my-turn", description="Which of my open PRs are waiting on me.")
+    p.add_argument("-o", "--org", action="append", default=[], metavar="ORG",
+                   help="only PRs in this org/owner (repeatable; default: all)")
+    p.add_argument("--json", action="store_true", help="emit one JSON object instead of the report")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        login, total, prs = fetch_resolved()
+    except GhError as e:
+        print(f"pr-my-turn: {e}", file=sys.stderr)
+        return 1
+    now = datetime.now(timezone.utc)
+    report = build_report(login, total, prs, set(args.org), now)
+    print(json.dumps(report, indent=2) if args.json else render_text(report, now))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
