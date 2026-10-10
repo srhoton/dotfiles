@@ -180,6 +180,11 @@ Adhere to the following guidelines when using tools:
 - **Atlassian MCP for Jira/Confluence**: all Jira/Confluence operations go through the Atlassian MCP tools when the server is connected (`getJiraIssue`, `searchJiraIssuesUsingJql`, `createJiraIssue`, `addOrEditJiraIssueComment`, `transitionJiraIssue`, `getConfluenceContent`) — never browser automation. Those are the Rovo MCP v2 names; a server still on v1 exposes `addCommentToJiraIssue` and `getConfluencePage` instead, so match on whichever the connected server lists. If the server isn't connected in a session, say so and ask rather than falling back to the browser. GitHub stays `gh` CLI, not MCP.
 - **WebSearch / WebFetch for unfamiliar territory**: when debugging an error message you don't recognize, working with an unfamiliar library API, or looking up AWS service behavior, use WebSearch followed by WebFetch on the most authoritative result. Prefer official docs over Stack Overflow. The `/docs <topic>` skill wraps this pattern.
 - **Bounded subagents**: every subagent you dispatch gets an explicit repo/directory scope in its prompt, plus the anchor artifact (ARN, file, template) if I supplied one. A subagent that needs more scope must return and ask — never expand on its own.
+- **Subagent model tier**: the built-in `Explore` agent runs on the session model (Opus) unless the Agent call passes `model`, so set `model` explicitly on every dispatch that isn't a pinned custom agent:
+  - **`haiku`** — pure lookups and transcription with no judgment: locating files or symbols, listing matches, counting rows or items, copying or reformatting already-written content into Jira, Confluence, or GitHub.
+  - **`sonnet`** — the default for `Explore` and other read-only research that must read and then summarize or classify: mapping a contract, impact or drift audits, inventorying a repo's conventions.
+  - **Omit `model` (inherit Opus)** — design, adversarial critique, root-cause triage, fix design, and anything that writes code. `Plan` agents always inherit.
+  - When unsure between tiers, take the higher one; a wrong answer from a cheaper model costs more than it saves. Pinned custom agents (`model:` in their frontmatter, e.g. the reviewers and `premise-verifier`) keep their own model; don't override it.
 
 ### Thinking Depth
 
