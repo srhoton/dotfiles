@@ -69,6 +69,10 @@ TASK_TOOLS = {"Task", "Agent"}
 
 # MCP servers not carried over: GitHub goes through the gh CLI.
 SKIP_MCP = {"Github"}
+# claude.ai connectors have no local config to read, so the ones opencode needs are listed here.
+CONNECTOR_MCP = {
+    "Port": {"type": "http", "url": "https://mcp.us.port.io/v1"},
+}
 # settings.json env keys safe to write literally into a server's environment.
 SAFE_ENV = {"AWS_PROFILE", "AWS_REGION"}
 
@@ -221,7 +225,7 @@ def enabled_plugin_dirs(settings: dict, plugin_cache: Path) -> list[Path]:
 
 
 def build_mcp(mcp_sources: list[Path], plugin_dirs: list[Path], settings_env: dict) -> dict:
-    servers: dict[str, dict] = {}
+    servers: dict[str, dict] = dict(CONNECTOR_MCP)
     for source in mcp_sources:
         if source.exists():
             servers.update(json.loads(source.read_text()).get("mcpServers", {}))

@@ -203,7 +203,8 @@ class GenerateTest(unittest.TestCase):
         out = self.run_generate(kagi_value=planted)
         config = json.loads((out / "opencode.json").read_text())
         mcp = config["mcp"]
-        self.assertEqual(sorted(mcp), ["Atlassian", "Kagi", "aws-mcp"])
+        self.assertEqual(sorted(mcp), ["Atlassian", "Kagi", "Port", "aws-mcp"])
+        self.assertEqual(mcp["Port"], {"type": "remote", "url": "https://mcp.us.port.io/v1"})
         self.assertEqual(
             mcp["Kagi"]["environment"]["KAGI_API_KEY"], "{env:KAGI_API_KEY}"
         )

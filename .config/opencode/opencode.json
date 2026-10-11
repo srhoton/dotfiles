@@ -20,6 +20,10 @@
         "KAGI_API_KEY": "{env:KAGI_API_KEY}"
       }
     },
+    "Port": {
+      "type": "remote",
+      "url": "https://mcp.us.port.io/v1"
+    },
     "aws-mcp": {
       "type": "local",
       "command": [
