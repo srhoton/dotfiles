@@ -1,0 +1,191 @@
+<!-- Generated from .claude/CLAUDE.md by scripts/claude-to-opencode. Edit the source and regenerate. -->
+# Global Rules
+
+## Language Rules
+- Java coding rules ~/.config/opencode/rules/java_rules.md
+- Terraform coding rules ~/.config/opencode/rules/terraform_rules.md
+- Python coding rules ~/.config/opencode/rules/python_rules.md
+- Golang coding rules ~/.config/opencode/rules/golang_rules.md
+- Typescript coding rules ~/.config/opencode/rules/typescript_rules.md
+- React coding rules ~/.config/opencode/rules/react_rules.md
+
+## Investigation Scope
+
+- When I give you a concrete artifact — a Step Function execution ARN, entity ID, S3 path, file path, PR number, Jira ticket, log line — **start there. Read it and exhaust it before any broad search, grep sweep, or subagent dispatch. The named artifact IS the research.**
+- Do not fan out across sibling repos or spawn discovery subagents until the supplied artifact has been read and proven insufficient. If it is insufficient, say specifically what is missing and ask before widening scope.
+- Subagents for parallel **review** and **counting/aggregation**: fine at any time. Subagents for **discovery/exploration**: only after the supplied artifact is exhausted.
+- When I name a single repo or file, stay in it. Do not go check "how the sibling service does it" unless I ask.
+
+## Workflow Rules
+
+### Before Committing
+- Always run the full test suite before committing. If tests fail, fix them before proceeding.
+- For Java/Quarkus: run `./gradlew spotlessApply` before committing.
+- For TypeScript: verify `tsc --noEmit` passes (no `TS2741`/type-mismatch errors) before committing — prefer the project's `typecheck`/`build` script. When adding a field to a type/interface, update every companion object and JSON schema fixture (e.g. `*.v1.json`) in the same change so the compile stays green.
+- Before modifying dependencies (Gradle/npm), verify compatibility with current project versions. Do not move runtime dependencies to compileOnly without confirming they are not needed at build/augmentation time.
+- Before claiming a dependency or version doesn't exist, verify against the actual registry. A 404/failed install for `@fullbay/*` packages is almost always a stale CodeArtifact/SSO token, not a missing package — refresh the token and retry first.
+- Never suggest skipping or bypassing pre-commit hooks (`--no-verify`) to get around a failing install or check. Fix the underlying cause.
+- After `git add`, run `git diff --cached --stat` and confirm the intended files are actually staged before committing. A path or glob that matches nothing stages nothing, and the commit goes out without the work.
+- Lockfiles: never regenerate `pnpm-lock.yaml` in a way that drops the repo's `pnpm.overrides`, and confirm `pnpm install --frozen-lockfile` passes before pushing (CI installs frozen). If typecheck or tests changed the lockfile unintentionally, restore it before committing.
+- Use the repo's `mise`-pinned pnpm (`mise exec -- pnpm …`). The global pnpm 12 enforces a one-day `minimumReleaseAge` that rejects just-published versions, and writes a stray `pnpm-workspace.yaml`.
+- Code must tolerate CI-only env vars (e.g. `SHORT_SHA`) being unset in local runs.
+
+### Data Validation
+- Validate data-related changes (finance figures, opening balances, parts/order counts, discrepancies) against live data — Athena queries or the relevant live source — before considering the implementation complete. Do not trust the spec's numbers alone.
+- For debugging, the first move is to confirm or refute the reported hypothesis with live evidence (Athena, AppSync/CloudWatch logs, Step Function execution history) before proposing or implementing a fix, and surface that evidence. Refuting a wrong bug report with data is a valid, preferred outcome — never code to a faulty assumption.
+- Reuse the enabled `aws-data-analytics` plugin's `querying-data-lake` (Athena) skill for these queries rather than hand-rolling SQL/CLI.
+- Do not infer schema, table names, bucket names, or config placement from git history, closed PRs, or sibling repos — those are frequently stale. Verify against the live source and state the query and its actual result.
+- For extraction/transform/reconciliation tooling, validate against the full corpus — or at least 10 inputs of deliberately different shapes — before calling it done, and report the pass/fail count. One passing sample is not evidence; an extractor built from a single invoice needed a rewrite across the 350-invoice corpus.
+
+### Migration Conventions
+- "Account id" means the Next `act_` PUID unless I ask for the legacy (numeric entity) id.
+- Migration status, statistics, and entity mappings live in the `mig-migration-common-iac` and `mig-transform-common-iac` DynamoDB tables. The `/envdrift` / Port.io drift data is unrelated.
+
+### Pull Requests
+- When creating PRs, check if a referenced PR number is still open. Never update a closed PR -- create a new one.
+- Right before opening a PR, merge (or rebase onto) the latest `origin/master`/default branch and re-run the full test suite, so CI breakage from concurrently-merged changes (e.g. strict `toEqual` assertion drift) surfaces locally rather than in the pipeline.
+- For multiline PR bodies, prefer `gh pr create --body-file <tmpfile>` over inline heredocs. Heredocs containing backticks corrupt PR content.
+- Same rule applies to multiline commit messages: write to a tempfile and use `git commit -F <tmpfile>` rather than `-m "$(cat <<EOF ...`.
+- PR comment and review-reply bodies go through `--body-file <tmpfile>` or `gh api ... --input <payload.json>`. `gh` does not expand `@path` in a body argument, so it posts the literal path.
+
+### Git State Verification
+- Before claiming a file or commit doesn't exist, run `git fetch origin && git log origin/<branch> --oneline -20` to confirm the local clone is current. Local clones drift.
+- When asked about a specific commit SHA, check if it's a squash-merge of a PR (`git log --format='%s' -1 <sha>` — look for a `(#NN)` suffix) before treating it as standalone work.
+- If a user pastes a GitHub URL that disagrees with your local view, trust the URL and `git fetch` to reconcile — do not assume the user is mistaken.
+
+### Environment Configuration
+- Always use the established IDP config library with flat UPPER_SNAKE_CASE keys. Do not create custom YAML config readers or use camelCase/nested YAML structures.
+
+### AWS Commands
+- Before running any AWS CLI command against an environment, confirm the active SSO profile/account matches the intended target (`aws sts get-caller-identity` or check `AWS_PROFILE`). Never assume the default profile is the right one. Pick the profile from this map; an ARN's account id decides it, so match the ARN against the table before the first call:
+
+  | Target | Profile | Account |
+  |---|---|---|
+  | dev | `fb-dev-non-prod/Admin` | 147997133155 |
+  | qa | `fb-qa-non-prod/Admin` | 343218192518 |
+  | stage | `fb-stage-non-prod/Admin` | 528757793739 |
+  | prod | `fb-live-us-prod/Admin` | 211125509520 |
+  | demo | `fb-demo-us-prod/Admin` | 979667334065 |
+  | data lake / Athena | `fb-datalake-prod/Admin` | 230514136789 |
+
+  "Prod" means `fb-live-us-prod`, never `fb-demo-us-prod`.
+- **Prod is read-only. With `fb-live-us-prod` (account 211125509520) you NEVER modify data** — no DynamoDB/S3/RDS writes or deletes, no Step Functions starts, stops, or redrives, no Lambda invokes that write, no queue sends or purges, no Terraform apply, no console-equivalent mutations. Only describe/get/list/query/scan and log reads. If a fix needs a prod change, write up the exact change and hand it to me; do not run it, even if asked mid-task to "just fix it".
+- Confirm the SSO session isn't expired before starting a long AWS/Terraform task — re-authenticate proactively (`aws sso login --profile <p>`) rather than discovering the expiry mid-run on a rejected call or blocked dependency install.
+
+### AWS Agent Toolkit
+- Prefer the AWS MCP Server (the `aws-core`/`aws-agents`/`aws-data-analytics` plugins) over raw `aws` CLI calls — it gives sandboxed execution, observability, and audit logging. Fall back to the CLI only when the MCP server is unavailable.
+- If the `aws-data-analytics` `aws-mcp` server fails to connect with `-32602 Invalid request parameters`, the cause is expired credentials, not the plugin. The proxy runs without `--profile`, so it uses `AWS_PROFILE`, which `settings.json` `env` sets to `fb-dev-non-prod/Admin`. Ask me to run `! aws sso login --profile fb-dev-non-prod/Admin`, then reconnect it with `opencode mcp`. That `AWS_PROFILE` is also the default for any `aws` CLI call without `--profile`, so pass `--profile` explicitly for every other account.
+- Skill-first: before an AWS task, load the relevant bundled skill (`retrieve_skill` via the AWS-knowledge MCP, or the `Skill` tool for `aws-core:*`/`aws-data-analytics:*` skills) and follow its guidance rather than reasoning from general knowledge.
+- **Secrets Manager (hard rule):** for any secret/credential/API-key/token/password task, load the `aws-secrets-manager` skill first and follow it. Do NOT call `secretsmanager get-secret-value`/`batch-get-secret-value` or hit the Secrets Manager Agent daemon directly — the secret would enter context. Use the skill's runtime-resolution pattern (`{{resolve:secretsmanager:<secret-id>:SecretString:<json-key>}}`, resolved at deploy/runtime) so the value never lands in context.
+- IaC over ad-hoc mutation: create/modify AWS infrastructure through Terraform (per ~/.config/opencode/rules/terraform_rules.md and the Terraform Conventions above), not one-off CLI mutations. (The AWS toolkit suggests CDK/CloudFormation — we standardize on Terraform.)
+- Do not use em dashes in AWS resource names or descriptions — use hyphens.
+- Keep the AWS plugins current: periodically run `/plugin marketplace update` then `/reload-plugins`. The `agent-toolkit-for-aws` marketplace ships new plugins/skills (e.g. `aws-agents-for-devsecops`) that a stale local clone won't surface.
+
+### Debugging
+- Lead with live-data evidence per the Data Validation rule above — confirm or refute the hypothesis before proposing a fix.
+- When diagnosing 401s/auth failures or other distributed-system errors, consider consumer-side causes (cold-start JWKS fetch blocking, concurrency races, client clock skew) in addition to the issuer/server side before settling on a root cause.
+- Never label a failure "transient" or "one-off" without metric evidence (CloudWatch/Athena/DynamoDB query over the failure window). Quantify blast radius — a measured count of affected entities/records/executions — before proposing a fix.
+- Every root-cause claim must cite a `file:line`, an execution ARN, or a query result. If I push back on a conclusion, re-derive it from primary sources — do not restate it.
+
+### Terraform Conventions
+- Never use `count = 0` together with `moved` blocks on the same resource — this causes plan errors.
+- Do not change DMS `MaxFullLoadSubTasks` above the current value without explicit approval (known OOM risk).
+- Always run `terraform validate` and `terraform plan` before suggesting a commit.
+- Do not modify IAM roles tagged with governance policies — flag for human approval instead of attempting the change.
+- EventBridge **event-bus** targets reject `retry_policy` and `dead_letter_config` at the `PutTargets` API — omit those blocks for bus-to-bus routing (they're valid only on non-bus targets like Lambda/SQS).
+- Before validating target/permission blocks against AWS, pull the latest state instead of trusting a stale local clone — the API-accepted shape drifts, and a stale clone will generate blocks the live API rejects.
+
+### Descope FGA / Authorization Schemas
+- Validate FGA/ReBAC DSL against the Descope console before considering a schema change done — do not assume the generated syntax is accepted.
+- Common DSL syntax errors to avoid: no bare relation names on the RHS of a relation definition (qualify them), and no `//` comments in the DSL (the parser rejects them).
+- When managing FGA in Terraform, translate the ReBAC requirements into DSL and iterate through console validation rather than trusting a one-shot conversion.
+
+### Spec-Driven Implementation
+- When implementing from a spec/plan file, read the entire spec first and present a summary plan before making code changes. Make reasonable assumptions and note them rather than asking clarifying questions interactively.
+
+### Design Gate (before code, for design-novel work)
+- When a change introduces a **new mechanism or layer** (not a targeted bug fix) touching durable state, retry/rate-limit/quota logic, migration semantics, or multi-step orchestration: write the design into the plan file and run an **adversarial design review first** — dispatch the `functional-reviewer` against the design doc + spec, instructed to attack failure-path coverage, idempotency, and re-run safety — **before writing code**. One cheap design round replaces several expensive code-review rounds; session history shows design flaws found post-implementation cost 3+ review rounds each and sometimes a full revert.
+- Implement separable layers **separately**, reviewing each before starting the next. Do not interleave a novel layer with routine changes in one diff — interleaving is what makes the eventual revert expensive.
+- A layer that keeps failing review for a *different structural reason each round* is a design problem: revert it and return to this gate rather than continuing to patch it.
+
+### Fix Discipline (fixes made in response to review findings)
+- **Class, not site**: before fixing a defect found at one call site, enumerate all sibling sites (LSP find-references / grep) and fix or explicitly clear each; include the enumeration in the fix recap.
+- **One minimal fix per defect**: never ship a second fix for the same bug without demonstrating the first alone is insufficient.
+- **Never trade loud for silent**: a fix must not convert a detectable failure into a silently-latched success.
+- **Evidence-backed recap**: every CRITICAL/HIGH fix ships with an executed probe (failed before, passes after) that exercises shipped config values — prose recaps are not acceptance evidence.
+- `commands/review.md` Step 5 is authoritative for the fix-loop budget: hard cap of 2 fix iterations, diff-growth tripwire, and descope escalation via `question`. Stopping at that cap is required behavior under "Escalate instead of grinding" — not premature stopping.
+
+### Premise Verification
+- Before drafting any plan that names a service, file, library version, or commit SHA you don't already know exists in this repo, run `/verify-premise` (or invoke the `premise-verifier` agent directly). If the referenced target is not actually present or current, stop and report — do not build a plan against a phantom target.
+- Mandatory for: cross-service/cross-repo features, "look at how X uses Y" exploration that quotes a specific symbol, integration plans referencing a service the current repo has no obvious dependency on, and any task quoting a published library version or commit SHA.
+- Optional but encouraged: same check inside `/build-from-file` when reading a spec that references external services.
+- Before analyzing a repo as evidence of current behavior, run `gh repo view <org>/<repo> --json isArchived,pushedAt`. An archived repo (e.g. `unt-type-svc`) is not the source of truth — say it is archived and ask which repo replaced it.
+
+## Deployment Workflow
+
+- Standard end-to-end flow: implement → tests pass → self-review (`/review`) → commit with git notes → push → open PR → address review → ship through dev/stage/prod/demo via Port.io (`/shipit`).
+- **Port.io cache flicker**: action runs can oscillate between IN_PROGRESS and SUCCESS during polling. Poll the same state 2-3 times before reporting a final terminal state.
+- **Stale SHAs in deploys**: before triggering a deploy or terraform apply, confirm the target entity's `short_sha` matches the expected commit on origin. If misaligned, wait 30s and re-fetch — do not fire the action against a stale entity.
+- **Approval gate polling**: treat `approval_status = null` as pending, not failed. `commands/shipit.md` is authoritative for the pipeline's backoff, attempt caps, and stale-gate handling — follow it rather than improvising a retry count here.
+
+### New Lambda Repos
+- Every new Node/TypeScript Lambda project must include a `.npmrc` configured for the @fullbay AWS CodeArtifact registry before the first PR is opened. Missing this file is the single most common CI failure pattern (`npm install` returns 404 for `@fullbay/*` packages and the pipeline fails at the install step).
+- Any build/scaffold skill that creates a new Node-based Lambda must either generate the `.npmrc` or refuse to commit until one exists in the project root.
+
+## Communication Style
+
+- When the user asks for an investigation, write-up, or findings document, document the findings — do not attempt fixes unless explicitly asked.
+- When I give a character or word budget for written content (bios, blurbs, PR comments, commit messages), count it and state the actual count in your response. Characters ≠ words.
+- Avoid interactive clarifying questions during plan-writing phases; make a reasonable assumption and note it instead.
+- Raise decisions and clarifying questions **before** implementing, not after. Once work is delivered, do not end the turn with `question` — close with a short written summary (what changed, evidence, PR/ticket links) plus a bulleted **suggested next steps** list I can pick from.
+
+### Output Token Discipline
+
+- Keep chat responses concise. Avoid restating large file contents or full diffs back to the user — they can read the files.
+- Summarize work using bullet lists with `file:line` references, not pasted code blocks.
+- For multi-file refactors, show only key snippets in the final summary, not every change.
+- For deploy/pipeline polling, report state changes as a compact table — not narrative prose.
+- This applies to user-visible output. Internal reasoning depth should remain high per the Thinking Depth section.
+- For any single output that would exceed roughly 150 lines or include large code/diff/log blocks (review findings, migration plans, scraped log dumps, multi-file refactor diffs): write the full content to `~/.claude/scratch/<repo-basename>/<topic>-<ISO8601>.md` (`mkdir -p` on demand) and post only a 3-bullet summary in chat with the path. Hard output-token caps have killed prior sessions mid-task; the scratch file is the durable artifact, chat is the index. Applies especially to reviewer output, deployment plans, and long log analyses.
+
+## Code Quality
+- Prefer correct, complete implementations over minimal ones.
+- Use appropriate data structures and algorithms — don't brute-force what has a known better solution.
+- When fixing a bug, fix the root cause, not the symptom.
+- If something I asked for requires error handling or validation to work reliably, include it without asking.
+
+### Code Editing Conventions
+- Never use bulk `sed`/regex edits for code changes. Make targeted, type-aware edits (Edit tool or LSP-assisted) instead — bulk text substitution has injected bugs like `, null` into `Collections.emptyList()` and enum/string mismatches.
+- After any multi-file change, run the build (and tests where fast) before moving on, so mechanical errors surface immediately rather than at commit time.
+
+### Pattern Discovery
+- **When writing new code that should follow an existing convention**, search for 2-3 existing examples first and follow them rather than inventing a new pattern. This applies to *authoring* code — it does NOT apply to investigating an artifact I named (see Investigation Scope).
+- **Reuse before creating**: before adding a utility or helper, grep for an existing one (e.g. `rg 'normalize|<helper-name>' src/ constants.ts`). Do not create a parallel implementation of something that already exists.
+
+## Claude Code Behaviour Guidelines
+
+- Avoid ownership-dodging behaviour: if you encounter an issue, take responsibility for it and work towards a solution instead of passing it on to someone else. Don't say things like "not caused by my changes" or say that it's "a pre-existing issue". Instead, acknowledge the problem and take initiative to fix it. Also, don't give up with excuses like "known limitation" and don't mark it for "future work".
+- Avoid premature stopping: if you encounter a problem, don't stop at the first obstacle. Instead, keep pushing forward and find a way to overcome it. Don't say things like "good stopping point" or "natural checkpoint". Instead, keep going until you have a complete solution.
+- Avoid permission-seeking behaviour: if you have the knowledge and capability to solve a problem, push through. Don't say things like "should I continue?" or "want me to keep going?". Instead, take initiative and act towards the solution.
+- **Escalate instead of grinding — these are NOT premature stopping.** Stop and report when: (a) you are blocked on an external approval gate, third-party latency, or expired credentials after a bounded number of attempts — never retry the same failing call in a loop (see the `/shipit` polling budget); (b) live evidence contradicts the ticket, spec, or my stated premise — surface the contradiction instead of coding to a wrong assumption; (c) an action is destructive or irreversible and needs my confirmation. Grinding past these wastes my time. The anti-stopping rule above applies to ordinary obstacles only.
+- Do plan multi-step approaches before acting (plan which files to read and in what order, which tools to use, etc).
+- Do recall and apply project-specific conventions from AGENTS.md files.
+- Do catch your own mistakes by applying reasoning loops and self-checks, and fix them before committing or asking for help.
+
+### Use of tools
+
+Adhere to the following guidelines when using tools:
+
+- **Research proportionate to uncertainty**: how much you research scales with how unclear the task is. When I have named the artifact, file, or symbol, reading it *is* the research — go there first (see Investigation Scope). Reserve broad exploration for genuinely open-ended questions. Always prefer surgical edits over rewriting whole files or sweeping changes.
+- **LSP-first for symbol-level questions**: when working in a file type with an active LSP (Java via jdtls, TypeScript via typescript-lsp, Python via pyright), prefer LSP capabilities — find-references, go-to-definition, workspace-symbols, diagnostics — over grep + build cycles. LSPs distinguish overloads, inheritance, and imported vs local symbols where grep can't. Keep grep for text/comment/config searches and for languages without an active LSP (Terraform, shell, YAML).
+- **Atlassian MCP for Jira/Confluence**: all Jira/Confluence operations go through the Atlassian MCP tools when the server is connected (`getJiraIssue`, `searchJiraIssuesUsingJql`, `createJiraIssue`, `addOrEditJiraIssueComment`, `transitionJiraIssue`, `getConfluenceContent`) — never browser automation. Those are the Rovo MCP v2 names; a server still on v1 exposes `addCommentToJiraIssue` and `getConfluencePage` instead, so match on whichever the connected server lists. If the server isn't connected in a session, say so and ask rather than falling back to the browser. GitHub stays `gh` CLI, not MCP.
+- **WebSearch / WebFetch for unfamiliar territory**: when debugging an error message you don't recognize, working with an unfamiliar library API, or looking up AWS service behavior, use WebSearch followed by WebFetch on the most authoritative result. Prefer official docs over Stack Overflow. The `/docs <topic>` skill wraps this pattern.
+- **Bounded subagents**: every subagent you dispatch gets an explicit repo/directory scope in its prompt, plus the anchor artifact (ARN, file, template) if I supplied one. A subagent that needs more scope must return and ask — never expand on its own.
+
+### Thinking Depth
+
+Apply deep thinking to genuinely hard problems — ambiguous root causes, architectural trade-offs, subtle correctness questions. Shallow thinking defaults to the cheapest available action, which is how wrong diagnoses happen.
+
+Depth means quality of reasoning, not breadth of file reads. Thinking hard about the artifact I gave you beats scanning ten files I didn't ask about.
+
+Never reason from assumptions, always reason from the actual data. Read and understand the actual code, execution, or documentation before deciding. Don't rely on guesses.
