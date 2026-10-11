@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Generate the opencode config in .config/opencode/ from the Claude Code config in .claude/.
+
+The generator owns AGENTS.md, opencode.json, agents/, commands/, rules/ and skills/ under
+the output directory. Anything else there (plugins/, hand-written files) is left alone.
+
+Secrets: MCP env values are never read into output; each becomes an {env:NAME} reference.
+settings.local.json is never opened. The finished output is scanned for credential shapes
+and the run fails if any match.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import filecmp
+import json
+import re
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+HOME = Path.home()
+
+OWNED = ("AGENTS.md", "opencode.json", "agents", "commands", "rules", "skills")
+GLOBAL_DIR = "~/.config/opencode"
+
+# Text rewrites applied to AGENTS.md, agent bodies and command bodies.
+COMMON_REWRITES: list[tuple[str, str]] = [
+    (r"~/\.claude/(\w+_rules\.md|<lang>_rules\.md)", GLOBAL_DIR + r"/rules/\1"),
+    (r"~/\.claude/commands/([\w-]+)\.md", GLOBAL_DIR + r"/commands/\1.md"),
+    (r"`CLAUDE\.md`", "`AGENTS.md` (or `CLAUDE.md`)"),
+    (r"(?<!`)\bCLAUDE\.md\b(?!`)", "AGENTS.md"),
+    (r"\b(?:Task|Agent) tool\b", "task tool"),
+    (r"\bTask calls\b", "task calls"),
+    (r"\bAskUserQuestion\b", "question"),
+    (r"\bTodoWrite\b", "todowrite"),
+    (r"mcp__claude_ai_Atlassian__", "Atlassian_"),
+    (r"\*\*Fallback — Workflow tool unavailable this session:\*\*",
+     "**opencode has no Workflow tool, so always run reviews this way:**"),
+]
+
+# AGENTS.md-only rewrites. Each must match at least once: a miss means CLAUDE.md changed
+# under the generator and the rule needs updating, so the run fails instead of drifting.
+AGENTS_RULES: list[tuple[str, str, str]] = [
+    (
+        "rules includes",
+        r"@~/\.claude/(\w+_rules\.md)",
+        GLOBAL_DIR + r"/rules/\1",
+    ),
+    (
+        "subagent model tier",
+        r"^- \*\*Subagent model tier\*\*:.*\n(?:  .*\n)*",
+        "",
+    ),
+    (
+        "mcp reconnect",
+        r"reconnect the server via `/mcp`",
+        "reconnect it with `opencode mcp`",
+    ),
+]
+
+AGENT_DROP_KEYS = {"name", "model", "color", "tools"}
+COMMAND_DROP_KEYS = {"allowed-tools", "argument-hint", "model", "name"}
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+TASK_TOOLS = {"Task", "Agent"}
+
+# MCP servers not carried over: GitHub goes through the gh CLI.
+SKIP_MCP = {"Github"}
+# settings.json env keys safe to write literally into a server's environment.
+SAFE_ENV = {"AWS_PROFILE", "AWS_REGION"}
+
+SKILL_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+SECRET_PATTERNS = [
+    re.compile(r"ghp_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"xox[abprs]-[A-Za-z0-9-]{10,}"),
+]
+# A long unbroken token mixing upper, lower and digits, the shape of most API keys.
+LONG_TOKEN = re.compile(r"(?<![A-Za-z0-9+/=_-])[A-Za-z0-9+/=_-]{40,}(?![A-Za-z0-9+/=_-])")
+
+
+class GenerationError(Exception):
+    """Raised when the source no longer matches what the generator expects."""
+
+
+def split_frontmatter(text: str) -> tuple[list[tuple[str, list[str]]], str]:
+    """Split markdown into top-level frontmatter entries and the body.
+
+    Each entry is (key, raw_lines) where raw_lines holds the key line plus its
+    indented continuation lines, so block scalars survive untouched.
+    """
+    if not text.startswith("---\n"):
+        return [], text
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        raise GenerationError("unterminated frontmatter")
+    entries: list[tuple[str, list[str]]] = []
+    for line in text[4:end].split("\n"):
+        match = re.match(r"^([A-Za-z][\w-]*):", line)
+        if match:
+            entries.append((match.group(1), [line]))
+        elif entries:
+            entries[-1][1].append(line)
+        elif line.strip():
+            raise GenerationError(f"frontmatter line outside any key: {line!r}")
+    return entries, text[end + 5 :]
+
+
+def frontmatter_value(entries: list[tuple[str, list[str]]], key: str) -> str | None:
+    for name, lines in entries:
+        if name == key:
+            return lines[0].split(":", 1)[1].strip()
+    return None
+
+
+def apply_common(text: str) -> str:
+    for pattern, repl in COMMON_REWRITES:
+        text = re.sub(pattern, repl, text)
+    return text
+
+
+def convert_claude_md(text: str) -> str:
+    for label, pattern, repl in AGENTS_RULES:
+        text, count = re.subn(pattern, repl, text, flags=re.MULTILINE)
+        if count == 0:
+            raise GenerationError(f"AGENTS.md rule '{label}' matched nothing in CLAUDE.md")
+    header = (
+        "<!-- Generated from .claude/CLAUDE.md by scripts/claude-to-opencode."
+        " Edit the source and regenerate. -->\n"
+    )
+    return header + apply_common(text)
+
+
+def convert_agent(text: str) -> str:
+    entries, body = split_frontmatter(text)
+    if frontmatter_value(entries, "description") is None:
+        raise GenerationError("agent has no description")
+    tools_raw = frontmatter_value(entries, "tools")
+    permission: list[str] = []
+    if tools_raw:
+        tools = {t.strip() for t in tools_raw.split(",") if t.strip()}
+        if not tools & WRITE_TOOLS:
+            permission.append("  edit: deny")
+        if not tools & TASK_TOOLS:
+            permission.append("  task: deny")
+    lines = ["---"]
+    for key, raw in entries:
+        if key not in AGENT_DROP_KEYS:
+            lines.extend(raw)
+    lines.append("mode: subagent")
+    if permission:
+        lines.append("permission:")
+        lines.extend(permission)
+    lines.append("---")
+    return "\n".join(lines) + "\n" + apply_common(body)
+
+
+def describe_command(body: str) -> str:
+    """Derive a one-line description from a command's first prose line."""
+    for line in body.splitlines():
+        line = line.strip()
+        if line and not line.startswith(("#", "---", "```")):
+            line = re.sub(r"[*`]", "", line)
+            line = line.replace("$ARGUMENTS", "<args>")
+            sentence = re.split(r"(?<=[.!?])\s", line, maxsplit=1)[0]
+            if len(sentence) < 40:
+                sentence = line
+            if len(sentence) > 120:
+                sentence = sentence[:117].rstrip() + "..."
+            return sentence
+    raise GenerationError("command has no prose line to describe it")
+
+
+def convert_command(text: str) -> str:
+    entries, body = split_frontmatter(text)
+    kept = [(k, raw) for k, raw in entries if k not in COMMAND_DROP_KEYS]
+    if not any(k == "description" for k, _ in kept):
+        kept.insert(0, ("description", ["description: " + json.dumps(describe_command(body), ensure_ascii=False)]))
+    lines = ["---"]
+    for _, raw in kept:
+        lines.extend(raw)
+    lines.append("---")
+    return "\n".join(lines) + "\n" + apply_common(body)
+
+
+def mcp_entry(name: str, server: dict, settings_env: dict) -> dict:
+    env_keys = list(server.get("env", {}))
+    if server.get("url") or server.get("type") in ("http", "sse"):
+        entry: dict = {"type": "remote", "url": server["url"]}
+        if server.get("headers"):
+            entry["headers"] = {h: "{env:MCP_" + re.sub(r"\W", "_", name).upper() + "_"
+                                + re.sub(r"\W", "_", h).upper() + "}" for h in server["headers"]}
+        return entry
+    if not server.get("command"):
+        raise GenerationError(f"MCP server {name} has neither url nor command")
+    entry = {"type": "local", "command": [server["command"], *server.get("args", [])]}
+    environment = {key: "{env:" + key + "}" for key in env_keys}
+    for key in SAFE_ENV & set(settings_env):
+        environment.setdefault(key, settings_env[key])
+    if environment:
+        entry["environment"] = dict(sorted(environment.items()))
+    return entry
+
+
+def enabled_plugin_dirs(settings: dict, plugin_cache: Path) -> list[Path]:
+    dirs = []
+    for plugin_id, enabled in sorted(settings.get("enabledPlugins", {}).items()):
+        if not enabled:
+            continue
+        plugin, _, marketplace = plugin_id.partition("@")
+        versions = sorted((plugin_cache / marketplace / plugin).glob("*/"))
+        if versions:
+            dirs.append(versions[-1])
+    return dirs
+
+
+def build_mcp(mcp_sources: list[Path], plugin_dirs: list[Path], settings_env: dict) -> dict:
+    servers: dict[str, dict] = {}
+    for source in mcp_sources:
+        if source.exists():
+            servers.update(json.loads(source.read_text()).get("mcpServers", {}))
+    for plugin_dir in plugin_dirs:
+        mcp_file = plugin_dir / ".mcp.json"
+        if mcp_file.exists():
+            servers.update(json.loads(mcp_file.read_text()).get("mcpServers", {}))
+    return {
+        name: mcp_entry(name, server, settings_env)
+        for name, server in sorted(servers.items())
+        if name not in SKIP_MCP
+    }
+
+
+def copy_skills(plugin_dirs: list[Path], out: Path) -> None:
+    for plugin_dir in plugin_dirs:
+        skills_dir = plugin_dir / "skills"
+        if not skills_dir.is_dir():
+            continue
+        for skill in sorted(p for p in skills_dir.iterdir() if (p / "SKILL.md").exists()):
+            entries, _ = split_frontmatter((skill / "SKILL.md").read_text())
+            name = frontmatter_value(entries, "name")
+            if name != skill.name or not SKILL_NAME.match(skill.name):
+                raise GenerationError(f"skill {skill} name {name!r} is not a valid opencode skill name")
+            if (out / "skills" / skill.name).exists():
+                raise GenerationError(f"duplicate skill name {skill.name}")
+            shutil.copytree(skill, out / "skills" / skill.name)
+
+
+def copy_licenses(plugin_dirs: list[Path], marketplaces: Path, out: Path) -> None:
+    """Ship each source marketplace's LICENSE and NOTICE beside the skills copied from it."""
+    for marketplace in sorted({d.parent.parent.name for d in plugin_dirs if (d / "skills").is_dir()}):
+        for name in ("LICENSE", "NOTICE"):
+            source = marketplaces / marketplace / name
+            if source.exists():
+                shutil.copy2(source, out / "skills" / f"{marketplace}.{name}")
+
+
+def scan_secrets(root: Path) -> list[str]:
+    hits = []
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        text = path.read_text(errors="replace")
+        for pattern in SECRET_PATTERNS:
+            if pattern.search(text):
+                hits.append(f"{path.relative_to(root)}: matches {pattern.pattern}")
+        for token in LONG_TOKEN.findall(text):
+            mixed = re.search(r"[A-Z]", token) and re.search(r"[a-z]", token) and re.search(r"\d", token)
+            # Hyphenated identifiers (header names, slugs) have short segments; keys do not.
+            unbroken = max(len(segment) for segment in re.split(r"[-_]", token)) >= 24
+            if mixed and unbroken and not re.fullmatch(r"[0-9a-f]+", token) and "/" not in token:
+                hits.append(f"{path.relative_to(root)}: long mixed token ({len(token)} chars)")
+    return hits
+
+
+def generate(src: Path, out: Path, claude_home: Path, mcp_sources: list[Path]) -> None:
+    settings = json.loads((src / "settings.json").read_text())
+    disabled = {name for name, state in settings.get("skillOverrides", {}).items() if state == "off"}
+    plugin_dirs = enabled_plugin_dirs(settings, claude_home / "plugins" / "cache")
+
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "AGENTS.md").write_text(convert_claude_md((src / "CLAUDE.md").read_text()))
+
+    (out / "rules").mkdir()
+    for rules in sorted(src.glob("*_rules.md")):
+        shutil.copy2(rules, out / "rules" / rules.name)
+
+    (out / "agents").mkdir()
+    for agent in sorted((src / "agents").glob("*.md")):
+        (out / "agents" / agent.name).write_text(convert_agent(agent.read_text()))
+
+    (out / "commands").mkdir()
+    for command in sorted((src / "commands").glob("*.md")):
+        if command.stem not in disabled:
+            (out / "commands" / command.name).write_text(convert_command(command.read_text()))
+
+    (out / "skills").mkdir()
+    copy_skills(plugin_dirs, out)
+    copy_licenses(plugin_dirs, claude_home / "plugins" / "marketplaces", out)
+
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "instructions": [GLOBAL_DIR + "/rules/*.md"],
+        "formatter": True,
+        "mcp": build_mcp(mcp_sources, plugin_dirs, settings.get("env", {})),
+    }
+    (out / "opencode.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n")
+
+    hits = scan_secrets(out)
+    if hits:
+        raise GenerationError("possible secrets in output:\n  " + "\n  ".join(hits))
+
+
+def owned_files(root: Path) -> set[str]:
+    files = set()
+    for name in OWNED:
+        target = root / name
+        if target.is_file():
+            files.add(name)
+        elif target.is_dir():
+            files.update(str(p.relative_to(root)) for p in target.rglob("*") if p.is_file())
+    return files
+
+
+def diff_trees(expected: Path, actual: Path) -> list[str]:
+    report = []
+    want, have = owned_files(expected), owned_files(actual)
+    report += [f"missing: {f}" for f in sorted(want - have)]
+    report += [f"extra:   {f}" for f in sorted(have - want)]
+    for rel in sorted(want & have):
+        if not filecmp.cmp(expected / rel, actual / rel, shallow=False):
+            a = (actual / rel).read_text(errors="replace").splitlines(keepends=True)
+            b = (expected / rel).read_text(errors="replace").splitlines(keepends=True)
+            report.append("".join(difflib.unified_diff(a, b, f"current/{rel}", f"generated/{rel}")))
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--src", type=Path, default=REPO / ".claude")
+    parser.add_argument("--out", type=Path, default=REPO / ".config" / "opencode")
+    parser.add_argument("--claude-home", type=Path, default=HOME / ".claude",
+                        help="installed Claude home, for the plugin cache")
+    parser.add_argument("--mcp-source", type=Path, action="append",
+                        help="JSON file with mcpServers (default: repo .claude.json and ~/.claude.json)")
+    parser.add_argument("--check", action="store_true", help="exit 1 if --out differs from a fresh run")
+    args = parser.parse_args(argv)
+    mcp_sources = args.mcp_source or [REPO / ".claude.json", HOME / ".claude.json"]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        staged = Path(tmp) / "opencode"
+        try:
+            generate(args.src, staged, args.claude_home, mcp_sources)
+        except GenerationError as err:
+            print(f"claude-to-opencode: {err}", file=sys.stderr)
+            return 2
+        if args.check:
+            report = diff_trees(staged, args.out)
+            if report:
+                print("\n".join(report))
+                print("claude-to-opencode: output is stale; rerun without --check", file=sys.stderr)
+                return 1
+            print("claude-to-opencode: up to date")
+            return 0
+        args.out.mkdir(parents=True, exist_ok=True)
+        for name in OWNED:
+            target = args.out / name
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
+            source = staged / name
+            if source.is_dir():
+                shutil.copytree(source, target)
+            else:
+                shutil.copy2(source, target)
+    print(f"claude-to-opencode: wrote {len(owned_files(args.out))} files to {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
