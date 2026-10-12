@@ -15,6 +15,10 @@ const scopeNote = args.scopeNote ||
   '(2) do not explore sibling repos or spawn further agents; ' +
   '(3) if evidence outside that scope seems needed, report the gap as a LOW finding instead of expanding scope.'
 
+// Reviews and verification always run on Opus, whatever the session model is.
+// Hooks don't see agent() calls inside a workflow, so the model is set here rather than left to frontmatter.
+const REVIEW_MODEL = 'opus'
+
 const FINDINGS_SCHEMA = {
   type: 'object',
   required: ['findings'],
@@ -95,7 +99,7 @@ const REVIEWERS = [
 phase('Review')
 // Barrier is intentional: dedup below needs the full finding set from all five reviewers.
 const reviews = await parallel(REVIEWERS.map(r => () =>
-  agent(r.prompt, { label: `review:${r.key}`, phase: 'Review', agentType: r.agentType, schema: FINDINGS_SCHEMA })
+  agent(r.prompt, { label: `review:${r.key}`, phase: 'Review', agentType: r.agentType, model: REVIEW_MODEL, schema: FINDINGS_SCHEMA })
     .then(res => res && res.findings.map(f => ({ ...f, source: r.key })))
 ))
 const skipped = REVIEWERS.filter((r, i) => !reviews[i]).map(r => r.key)
@@ -135,7 +139,7 @@ const verified = await parallel(toVerify.map(f => () =>
     'Reviewers over-report: a finding that is unreachable, already guarded elsewhere, based on a misread of the ' +
     'code, or real-but-minor should be refuted (real-but-minor: say so in the reason). ' +
     'Cite file:line evidence either way. If you cannot decide from the code, refuted=false.',
-    { label: `verify:${f.file}:${f.line}`, phase: 'Verify', schema: VERDICT_SCHEMA }
+    { label: `verify:${f.file}:${f.line}`, phase: 'Verify', model: REVIEW_MODEL, schema: VERDICT_SCHEMA }
   ).then(v => ({ finding: f, verdict: v }))
 ))
 

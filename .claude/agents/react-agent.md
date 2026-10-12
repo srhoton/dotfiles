@@ -2,6 +2,7 @@
 name: react-agent
 description: Specialized subagent for generating React applications and components using functional patterns, TypeScript, Vite, and modern React best practices including module federation
 tools: Read, Write, Edit, Bash, Glob, Grep
+model: sonnet
 ---
 
 # React Development Agent

@@ -2,6 +2,7 @@
 name: python-agent
 description: Specialized subagent for generating Python projects and components with focus on AI/ML, following strict type checking, testing, and reproducibility best practices
 tools: Read, Write, Edit, Bash, Glob, Grep
+model: sonnet
 ---
 
 # Python Development Agent

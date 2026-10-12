@@ -2,6 +2,7 @@
 name: terraform-agent
 description: Specialized subagent for generating Terraform infrastructure as code following AWS best practices with proper state management, security, and testing
 tools: Read, Write, Edit, Bash, Glob, Grep
+model: sonnet
 ---
 
 # Terraform Infrastructure Agent

@@ -2,6 +2,7 @@
 name: golang-agent
 description: Specialized subagent for generating Go projects and components following idiomatic Go patterns, with focus on concurrency, performance, and reliability
 tools: Read, Write, Edit, Bash, Glob, Grep
+model: sonnet
 ---
 
 # Golang Development Agent

@@ -121,7 +121,12 @@ Session evidence shows the review loop's dominant failure modes are fix-side, no
 ### Fix loop
 
 1. Record the current diff size before fixing: `git diff --shortstat "$DEFAULT_BRANCH"...HEAD`
-2. Apply the selected fixes following the fix discipline above
+2. Dispatch the `implementer` agent to apply the selected fixes. Do not write the fixes yourself, and do not pass `model`. The prompt carries:
+   - the repo root and the changed-file list from Step 1 as its scope;
+   - each selected finding, with its number, severity, `file:line`, description, and any verification text;
+   - the four fix-discipline rules above, verbatim.
+
+   When it returns, read its `FIXES` and `BLOCKERS` sections. A finding it declined as wrong goes back in the report with its reasoning; don't silently drop it.
 3. **Re-run the Step 1.5 mechanical gate first** (typecheck + `~/.claude/bin/vet-diff`). This is the step that catches fix-induced regressions deterministically — a fix that introduces a lint error, a type error, or a ReDoS-shaped regex is caught here in seconds, instead of costing a whole LLM review round to rediscover. Fix anything it reports before continuing.
 4. Run the full test suite to verify fixes don't break anything
 5. Re-invoke the review-fanout workflow on the changed files (same as Step 2, fresh run — files changed, so no cache reuse) — the LLM re-review remains the backstop for judgment-level regressions the gate cannot see

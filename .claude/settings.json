@@ -6,7 +6,7 @@
   "permissions": {
     "defaultMode": "auto"
   },
-  "model": "fable",
+  "model": "opus",
   "skillOverrides": {
     "bughunt": "off",
     "build": "off",
@@ -39,6 +39,24 @@
             "timeout": 5000
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -59,6 +77,14 @@
             "type": "command",
             "command": "bash $HOME/.claude/hooks/pr-stale-check.sh",
             "timeout": 15000
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
           }
         ]
       }
@@ -93,6 +119,24 @@
             "timeout": 10000
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
+          }
+        ]
+      },
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/guard-agent-model.sh",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "SessionEnd": [
@@ -102,6 +146,14 @@
             "type": "command",
             "command": "bash $HOME/.claude/hooks/tmux-on-session-end.sh",
             "timeout": 5000
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
           }
         ]
       }
@@ -130,6 +182,14 @@
             "timeout": 10
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
+          }
+        ]
       }
     ],
     "Stop": [
@@ -139,6 +199,44 @@
             "type": "command",
             "command": "bash $HOME/.claude/hooks/tmux-on-stop.sh",
             "timeout": 5000
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/steverhoton/.config/iterm2/cc-status"
           }
         ]
       }
@@ -176,6 +274,7 @@
   "awaySummaryEnabled": false,
   "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
+  "skipWorkflowUsageWarning": true,
   "theme": "light",
   "verbose": true,
   "remoteControlAtStartup": true,
@@ -183,6 +282,5 @@
   "skipAutoPermissionPrompt": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754086649066
-  },
-  "skipWorkflowUsageWarning": true
+  }
 }
