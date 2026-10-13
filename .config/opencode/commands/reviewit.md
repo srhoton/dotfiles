@@ -11,16 +11,10 @@ Follow these steps exactly:
 
 ## Step 1: Fetch PR Context
 
-Run these commands to gather PR info:
+Gather the PR info in one call, then the diff:
 
 ```bash
-# Get repo owner/name
-REPO=$(gh repo view --json owner,name --jq '.owner.login + "/" + .name')
-
-# Get PR details
-gh pr view $ARGUMENTS --json title,body,headRefName,headRefOid,files
-
-# Get the full diff
+~/.claude/bin/pr-context $ARGUMENTS --json   # repo, title, body, head SHA, files, checks, local HEAD match
 gh pr diff $ARGUMENTS
 ```
 
@@ -64,6 +58,7 @@ The workflow runs the five specialist reviewers (functional, code-quality, adr-c
 
 From the workflow's returned structure (or your own aggregation in the fallback case):
 
+0. Run `~/.claude/bin/fanout-report <workflow output file> --repo <repo name>`. It writes the full report (actionable, refuted with refutations, informational, skipped reviewers) to `~/.claude/scratch/<repo>/` and prints the path and counts. Use the report for the steps below instead of re-parsing the output by hand, and give the user its path.
 1. **Actionable** = the returned CRITICAL/HIGH findings that survived verification
 2. **Informational** = MEDIUM and LOW findings
 3. For each actionable finding, prepare an inline comment with:
@@ -99,7 +94,16 @@ Then use `question` with this question:
 
 ## Step 5: Post Accepted Comments to PR
 
-For each accepted finding, post an inline comment using `gh api`. Use the head SHA captured in Step 1.
+Write the accepted findings to a JSON file in the scratchpad, as `{"reviewers": "functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + performance-reviewer + data-side-effects-reviewer", "findings": [{"severity", "file", "line", "description", "suggestion"}]}`. Then post them:
+
+```bash
+~/.claude/bin/pr-review-post $ARGUMENTS <findings.json> -n   # dry run: check the inline/fallback split
+~/.claude/bin/pr-review-post $ARGUMENTS <findings.json>      # posts
+```
+
+The script reads the PR diff and posts every finding on a commentable line as **one** review, using the body format below. Findings on lines outside the diff go into **one** conversation comment, so nothing is rejected or lost. If the review POST fails, it retries with every finding in the fallback comment. Report its summary line.
+
+Only if the script is missing, post by hand as below. Use the head SHA captured in Step 1.
 
 ```bash
 gh api repos/{owner}/{repo}/pulls/{number}/comments \

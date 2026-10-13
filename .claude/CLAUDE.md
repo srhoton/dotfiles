@@ -154,7 +154,7 @@
 - If something I asked for requires error handling or validation to work reliably, include it without asking.
 
 ### Code Editing Conventions
-- Never use bulk `sed`/regex edits for code changes. Make targeted, type-aware edits (Edit tool or LSP-assisted) instead — bulk text substitution has injected bugs like `, null` into `Collections.emptyList()` and enum/string mismatches.
+- Never use bulk `sed`/regex edits for code changes. Make targeted, type-aware edits (Edit tool or LSP-assisted) instead — bulk text substitution has injected bugs like `, null` into `Collections.emptyList()` and enum/string mismatches. Inline Python `s.replace(...)` / `open(p,'w').write(s)` in a Bash call is the same thing: use the Edit tool. Transcripts show it in 110 sessions.
 - After any multi-file change, run the build (and tests where fast) before moving on, so mechanical errors surface immediately rather than at commit time.
 
 ### Pattern Discovery

@@ -73,7 +73,7 @@ For each completed component:
 
 #### Step 3.0: Mechanical gate
 
-Before dispatching any reviewer, run the project's typecheck/build, tests, and lint (`~/.claude/bin/vet-diff` for JS/TS). Fix anything it reports first — deterministic checks are cheaper and more reliable than LLM reviewers, and spending reviewer attention on type errors is how judgment-level bugs slip through.
+Before dispatching any reviewer, run `~/.claude/bin/repo-gate`: the project's typecheck/build, tests, and lint, with `vet-diff` for JS/TS. Fix anything it reports first — deterministic checks are cheaper and more reliable than LLM reviewers, and spending reviewer attention on type errors is how judgment-level bugs slip through.
 
 #### Step 3.1: Parallel review
 

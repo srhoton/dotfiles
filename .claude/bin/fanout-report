@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""fanout-report: turn review-fanout workflow output into a markdown report.
+
+The review-fanout workflow (~/.claude/workflows/review-fanout.js) returns
+{actionable, informational, refuted, reviewersSkipped}. Its output file is
+normally a JSON object {summary, agentCount, logs, result}, but this also
+accepts a file that IS the bare result object, or a file where that JSON object
+is embedded in surrounding text (the outermost object containing "actionable"
+is used).
+
+The report has a title, a counts line, a warning for skipped reviewers, then the
+sections "Actionable (CRITICAL/HIGH)" (numbered [1]..[n]), "Refuted by
+verification", and "Informational (MEDIUM/LOW)". Pipes in cells are escaped.
+
+Usage: fanout-report <workflow-output-file> [--repo NAME] [--out PATH] [--stdout]
+  --repo NAME  repo label (default: basename of the git toplevel of the cwd)
+  --out PATH   write the report here (default:
+               ~/.claude/scratch/<repo>/review-<UTC ISO8601 compact>.md)
+  --stdout     print the whole report instead of just the path and counts line
+Prints the report path and one counts line (or the whole report with --stdout).
+Exit 0 on success, 1 on unreadable or unparseable input. Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+class InputError(Exception):
+    pass
+
+
+# ---- parsing -------------------------------------------------------------------
+
+def unwrap(doc: Any) -> dict[str, Any] | None:
+    """Return the result object from a wrapped or bare document, else None."""
+    if not isinstance(doc, dict):
+        return None
+    if "actionable" in doc:
+        return doc
+    inner = doc.get("result")
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except ValueError:
+            return None
+    if isinstance(inner, dict) and "actionable" in inner:
+        return inner
+    return None
+
+
+def extract_result(text: str) -> dict[str, Any]:
+    try:
+        found = unwrap(json.loads(text))
+    except ValueError:
+        found = None
+    if found is not None:
+        return found
+    # Embedded in surrounding text: the earliest '{' that decodes to an object holding
+    # "actionable" (directly or under "result") is the outermost such object.
+    decoder = json.JSONDecoder()
+    pos = text.find("{")
+    while pos != -1:
+        try:
+            doc, _ = decoder.raw_decode(text, pos)
+        except ValueError:
+            doc = None
+        found = unwrap(doc)
+        if found is not None:
+            return found
+        pos = text.find("{", pos + 1)
+    raise InputError('no JSON object containing "actionable" found')
+
+
+def items(result: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    value = result.get(key) or []
+    if not isinstance(value, list):
+        raise InputError(f'"{key}" is not a list')
+    return [i for i in value if isinstance(i, dict)]
+
+
+# ---- rendering -----------------------------------------------------------------
+
+def cell(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return " ".join(text.splitlines()).replace("|", "\\|").strip()
+
+
+def location(item: dict[str, Any]) -> str:
+    file = item.get("file")
+    line = item.get("line")
+    if file is None:
+        return "-"
+    return f"{file}:{line}" if line is not None else str(file)
+
+
+def table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    out = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
+    out += ["| " + " | ".join(row) + " |" for row in rows]
+    return out
+
+
+def render(result: dict[str, Any], repo: str, generated: str) -> tuple[str, str]:
+    actionable = items(result, "actionable")
+    informational = items(result, "informational")
+    refuted = items(result, "refuted")
+    skipped = [str(s) for s in (result.get("reviewersSkipped") or [])]
+    unverified = sum(1 for a in actionable if not a.get("verified"))
+
+    counts = f"{len(actionable)} actionable, {len(refuted)} refuted, {len(informational)} informational"
+    out = [f"# Review fan-out report: {repo}", "", f"Generated {generated}", "", f"**{counts}**"]
+    if unverified:
+        out += ["", f"_{unverified} actionable finding(s) are UNVERIFIED (no skeptic verdict)._"]
+    if skipped:
+        out += ["", f"> WARNING: reviewers skipped (returned nothing or errored): {', '.join(skipped)}. "
+                    "Coverage is incomplete."]
+
+    out += ["", "## Actionable (CRITICAL/HIGH)", ""]
+    if actionable:
+        out += table(
+            ["#", "Severity", "File:Line", "Source", "Verified", "Description"],
+            [[f"[{n}]", cell(a.get("severity")), cell(location(a)), cell(a.get("source")),
+              "yes" if a.get("verified") else "NO", cell(a.get("description"))]
+             for n, a in enumerate(actionable, 1)],
+        )
+        out += ["", "Verification detail:", ""]
+        for n, a in enumerate(actionable, 1):
+            text = " ".join(str(a.get("verification") or "").split())
+            if a.get("verified"):
+                out.append(f"- [{n}] verification: {text or '(no reason recorded)'}")
+            else:
+                out.append(f"- [{n}] unverified" + (f": {text}" if text else ""))
+    else:
+        out.append("_None._")
+
+    out += ["", "## Refuted by verification", ""]
+    if refuted:
+        out += table(
+            ["#", "Severity", "File:Line", "Source", "Description", "Refutation"],
+            [[str(n), cell(r.get("severity")), cell(location(r)), cell(r.get("source")),
+              cell(r.get("description")), cell(r.get("refutation"))]
+             for n, r in enumerate(refuted, 1)],
+        )
+    else:
+        out.append("_None._")
+
+    out += ["", "## Informational (MEDIUM/LOW)", ""]
+    if informational:
+        out += table(
+            ["#", "Severity", "File:Line", "Source", "Description"],
+            [[str(n), cell(i.get("severity")), cell(location(i)), cell(i.get("source")),
+              cell(i.get("description"))]
+             for n, i in enumerate(informational, 1)],
+        )
+    else:
+        out.append("_None._")
+
+    return "\n".join(out) + "\n", counts
+
+
+# ---- main ----------------------------------------------------------------------
+
+def default_repo() -> str:
+    try:
+        proc = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False)
+        top = proc.stdout.strip() if proc.returncode == 0 else ""
+    except FileNotFoundError:
+        top = ""
+    return os.path.basename(top or os.getcwd()) or "unknown"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="fanout-report", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("file", help="workflow output file (wrapped, bare result, or JSON embedded in text)")
+    p.add_argument("--repo", help="repo label for the title and default path (default: git toplevel basename)")
+    p.add_argument("--out", help="report path (default: ~/.claude/scratch/<repo>/review-<UTC>.md)")
+    p.add_argument("--stdout", action="store_true", help="print the whole report instead of path + counts")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        text = Path(args.file).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"fanout-report: cannot read {args.file}: {e.strerror or e}", file=sys.stderr)
+        return 1
+    now = datetime.now(timezone.utc)
+    repo = (args.repo or default_repo()).strip("/").replace("/", "-") or "unknown"
+    try:
+        report, counts = render(extract_result(text), repo, now.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    except InputError as e:
+        print(f"fanout-report: {args.file}: {e}", file=sys.stderr)
+        return 1
+
+    out = Path(args.out).expanduser() if args.out else (
+        Path("~/.claude/scratch").expanduser() / repo / f"review-{now.strftime('%Y%m%dT%H%M%SZ')}.md")
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(report, encoding="utf-8")
+    except OSError as e:
+        print(f"fanout-report: cannot write {out}: {e.strerror or e}", file=sys.stderr)
+        return 1
+
+    if args.stdout:
+        sys.stdout.write(report)
+    else:
+        print(out)
+        print(counts)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""pr-context: everything a session needs to know about one PR, in one call.
+
+Replaces the `gh repo view` + several `gh pr view --json ...` + `git rev-parse HEAD`
++ review-threads GraphQL sequence that /fixit and friends each re-run. One GraphQL
+query fetches the PR header, files, reviews, review threads, conversation comments
+and check results; the local clone's state is read with a few git calls.
+
+"Actionable" is decided by lib/pr_feedback.py, the same module pr-fix-queue uses to
+decide whether a PR is blocked, so what this shows is what the queue would act on.
+
+Usage: pr-context <PR#|URL> [-R owner/repo] [--json]
+  -R owner/repo   repository (default: the PR URL's, else `gh repo view` here)
+  --json          emit everything as one JSON object instead of the text report
+
+Exit 0 normally (actionable feedback is not an error), 1 if the PR is not found,
+2 on any other failure. Read-only. Standard library only.
+Testing: GH=<command> replaces the gh binary (see bin/tests/pr-context.sh).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from typing import Any
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import pr_feedback  # noqa: E402
+
+QUERY = """
+query($owner: String!, $name: String!, $num: Int!) {
+  viewer { login }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $num) {
+      number title url state isDraft baseRefName headRefName headRefOid
+      mergeable mergeStateStatus reviewDecision body
+      files(first: 100) { totalCount nodes { path additions deletions } }
+      latestReviews(first: 20) { nodes { state author { login } } }
+      latestOpinionatedReviews(first: 20) { nodes { id state body submittedAt author { login } } }
+      reviewThreads(first: 60) {
+        totalCount
+        nodes {
+          id isResolved isOutdated path line
+          firstComment: comments(first: 1) { nodes { databaseId author { login __typename } } }
+          lastComment: comments(last: 1) { nodes { id databaseId author { login } } }
+          comments(first: 30) {
+            totalCount
+            nodes { databaseId body createdAt author { login __typename } }
+          }
+        }
+      }
+      comments(last: 50) {
+        totalCount
+        nodes {
+          databaseId url body createdAt lastEditedAt isMinimized
+          author { login __typename }
+          reactionGroups { content viewerHasReacted }
+          reactions(last: 20) { nodes { content createdAt user { login } } }
+        }
+      }
+      commits(last: 1) {
+        nodes { commit { statusCheckRollup { state contexts(first: 100) {
+          totalCount
+          nodes {
+            __typename
+            ... on CheckRun { name status conclusion }
+            ... on StatusContext { context state }
+          }
+        } } } }
+      }
+    }
+  }
+}
+"""
+
+MAX_POLLS = 3
+POLL_DELAY_S = 2
+BODY_LIMIT = 2000
+SNIPPET_LIMIT = 300
+REVIEW_BODY_LIMIT = 500
+FILE_LIST_LIMIT = 50
+PASS_RESULTS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+FAIL_RESULTS = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
+                "STARTUP_FAILURE", "STALE"}
+
+
+class NotFound(Exception):
+    pass
+
+
+class Failure(Exception):
+    pass
+
+
+# ---- GitHub --------------------------------------------------------------------
+
+def gh_cmd() -> list[str]:
+    return shlex.split(os.environ.get("GH") or "gh")
+
+
+def run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=cwd)
+    except FileNotFoundError:
+        raise Failure(f"'{cmd[0]}' is not installed or not on PATH") from None
+
+
+def first_line(text: str) -> str:
+    lines = text.strip().splitlines()
+    return lines[0] if lines else ""
+
+
+def parse_target(arg: str, repo_opt: str | None) -> tuple[str | None, int]:
+    """(repo from the URL or -R or None, PR number). -R wins over a URL's repo."""
+    m = re.match(r"^https?://[^/]+/([^/]+/[^/]+)/pull/(\d+)", arg)
+    if m:
+        return repo_opt or m.group(1), int(m.group(2))
+    m = re.match(r"^#?(\d+)$", arg)
+    if m:
+        return repo_opt, int(m.group(1))
+    raise Failure(f"'{arg}' is neither a PR number nor a PR URL")
+
+
+def resolve_repo(repo: str | None) -> str:
+    if repo:
+        if not re.match(r"^[^/\s]+/[^/\s]+$", repo):
+            raise Failure(f"-R needs OWNER/REPO, got '{repo}'")
+        return repo
+    proc = run([*gh_cmd(), "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+    slug = proc.stdout.strip()
+    if proc.returncode != 0 or "/" not in slug:
+        raise Failure("cannot determine the repo: pass -R owner/repo or run inside a clone "
+                      f"({first_line(proc.stderr) or 'gh repo view failed'})")
+    return slug
+
+
+def fetch_once(slug: str, num: int) -> dict[str, Any]:
+    owner, name = slug.split("/", 1)
+    proc = run([*gh_cmd(), "api", "graphql", "-f", f"query={QUERY}",
+                "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"num={num}"])
+    try:
+        doc = json.loads(proc.stdout)
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        raise Failure(f"gh api graphql failed: {first_line(proc.stderr or proc.stdout) or f'exit {proc.returncode}'}")
+    errors = doc.get("errors") or []
+    pr = ((doc.get("data") or {}).get("repository") or {}).get("pullRequest")
+    if pr is None:
+        if any(e.get("type") == "NOT_FOUND" or "Could not resolve" in (e.get("message") or "")
+               for e in errors) or not errors:
+            raise NotFound(f"PR {slug}#{num} not found")
+        raise Failure(f"GraphQL: {errors[0].get('message', '?')}")
+    return {"viewer": ((doc.get("data") or {}).get("viewer") or {}).get("login") or "", "pr": pr}
+
+
+def fetch(slug: str, num: int) -> dict[str, Any]:
+    """GitHub computes `mergeable` lazily and answers UNKNOWN until it has; re-poll."""
+    for attempt in range(1, MAX_POLLS + 1):
+        got = fetch_once(slug, num)
+        if got["pr"].get("mergeable") != "UNKNOWN" or attempt == MAX_POLLS:
+            return got
+        time.sleep(POLL_DELAY_S)
+    raise AssertionError("unreachable")
+
+
+# ---- local clone ---------------------------------------------------------------
+
+def git(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return run(["git", *args])
+
+
+def remote_slugs() -> set[str]:
+    proc = git(["remote", "-v"])
+    slugs = set()
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        # The owner/repo path of any remote URL, whatever the host: https, scp-style
+        # (git@github-work:owner/repo.git, an SSH host alias) or ssh://host:443/owner/repo.
+        m = re.search(r"[:/]([^/:\s]+)/([^/\s]+?)(?:\.git)?/?$", fields[1])
+        if m:
+            slugs.add(f"{m.group(1)}/{m.group(2)}".lower())
+    return slugs
+
+
+def local_state(slug: str, head_oid: str) -> dict[str, Any]:
+    if git(["rev-parse", "--is-inside-work-tree"]).returncode != 0 or slug.lower() not in remote_slugs():
+        return {"inRepo": False, "headMatchesPr": None}
+    head = git(["rev-parse", "HEAD"]).stdout.strip()
+    status = git(["status", "--porcelain"]).stdout.splitlines()
+    upstream = git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
+    ahead = None
+    if upstream.returncode == 0:
+        count = git(["rev-list", "--count", "@{u}..HEAD"]).stdout.strip()
+        ahead = int(count) if count.isdigit() else None
+    return {
+        "inRepo": True,
+        "branch": git(["branch", "--show-current"]).stdout.strip() or None,
+        "head": head,
+        "headMatchesPr": head == head_oid,
+        "uncommittedCount": len(status),
+        "upstream": upstream.stdout.strip() if upstream.returncode == 0 else None,
+        "unpushedCount": ahead,
+    }
+
+
+# ---- checks --------------------------------------------------------------------
+
+def summarize_checks(pr: dict[str, Any]) -> dict[str, Any]:
+    commits = (pr.get("commits") or {}).get("nodes") or []
+    rollup = (((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") or {}) if commits else {}
+    contexts = (rollup.get("contexts") or {})
+    items = []
+    for c in contexts.get("nodes") or []:
+        if not c:
+            continue
+        if c.get("__typename") == "CheckRun":
+            name = c.get("name")
+            result = c.get("conclusion") if c.get("status") == "COMPLETED" else (c.get("status") or "PENDING")
+        else:
+            name, result = c.get("context"), c.get("state")
+        if result in PASS_RESULTS:
+            bucket = "pass"
+        elif result in FAIL_RESULTS:
+            bucket = "fail"
+        else:
+            bucket = "pending"
+        items.append({"name": name, "result": result, "bucket": bucket})
+    return {
+        "state": rollup.get("state"),
+        "total": contexts.get("totalCount") or 0,
+        "pass": sum(i["bucket"] == "pass" for i in items),
+        "fail": sum(i["bucket"] == "fail" for i in items),
+        "pending": sum(i["bucket"] == "pending" for i in items),
+        "failing": [i["name"] for i in items if i["bucket"] == "fail"],
+        "pendingNames": [i["name"] for i in items if i["bucket"] == "pending"],
+        "contexts": items,
+    }
+
+
+# ---- assemble ------------------------------------------------------------------
+
+def login(node: dict[str, Any] | None) -> str:
+    return ((node or {}).get("author") or {}).get("login") or "ghost"
+
+
+def build_context(slug: str, got: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
+    pr, me = got["pr"], got["viewer"]
+    threads, thread_skips = pr_feedback.classify_threads(pr, me)
+    comments, _my_newest, comment_skips = pr_feedback.classify_comments(pr, me)
+    standing = set(pr_feedback.changes_requested_ids(pr))
+    files = pr.get("files") or {}
+    all_threads = pr.get("reviewThreads") or {}
+    conv = pr.get("comments") or {}
+
+    thread_items = []
+    for t, first, _last in threads:
+        thread_items.append({
+            "id": t.get("id"),
+            "replyToId": first.get("databaseId"),
+            "path": t.get("path"),
+            "line": t.get("line"),
+            "author": login(first),
+            "commentCount": (t.get("comments") or {}).get("totalCount"),
+            "comments": [{"databaseId": c.get("databaseId"), "author": login(c),
+                          "createdAt": c.get("createdAt"), "body": c.get("body") or ""}
+                         for c in (t.get("comments") or {}).get("nodes") or []],
+        })
+    comment_items = []
+    for c in comments:
+        reply = pr_feedback.already_replied_by(c, pr, me)
+        comment_items.append({
+            "databaseId": c.get("databaseId"), "url": c.get("url"), "author": login(c),
+            "createdAt": c.get("createdAt"), "lastEditedAt": c.get("lastEditedAt"),
+            "body": c.get("body") or "",
+            "alreadyReplied": reply is not None,
+            **({"alreadyRepliedBy": {"databaseId": reply.get("databaseId"), "url": reply.get("url")}}
+               if reply is not None else {}),
+        })
+
+    return {
+        "repo": slug,
+        "viewer": me,
+        "pr": {k: pr.get(k) for k in (
+            "number", "title", "url", "state", "isDraft", "baseRefName", "headRefName",
+            "headRefOid", "mergeable", "mergeStateStatus", "reviewDecision", "body")},
+        "local": local,
+        "files": {"totalCount": files.get("totalCount") or 0,
+                  "nodes": [{"path": f.get("path"), "additions": f.get("additions"),
+                             "deletions": f.get("deletions")} for f in files.get("nodes") or []]},
+        "reviews": [{"author": login(r), "state": r.get("state")}
+                    for r in (pr.get("latestReviews") or {}).get("nodes") or []],
+        "changesRequestedReviews": [
+            {"id": r.get("id"), "author": login(r), "state": r.get("state"),
+             "submittedAt": r.get("submittedAt"), "body": r.get("body") or ""}
+            for r in (pr.get("latestOpinionatedReviews") or {}).get("nodes") or []
+            if r.get("id") in standing],
+        "changesRequestedBy": sorted({login(r) for r in (pr.get("latestOpinionatedReviews") or {}).get("nodes") or []
+                                      if r.get("id") in standing}),
+        "checks": summarize_checks(pr),
+        "actionable": {
+            "mergeConflict": pr.get("mergeable") == "CONFLICTING",
+            "threads": thread_items,
+            "comments": comment_items,
+        },
+        "skipped": {"threads": thread_skips, "comments": comment_skips},
+        "truncated": {
+            "threads": max(0, (all_threads.get("totalCount") or 0) - len(all_threads.get("nodes") or [])),
+            "comments": max(0, (conv.get("totalCount") or 0) - len(conv.get("nodes") or [])),
+            "files": max(0, (files.get("totalCount") or 0) - len(files.get("nodes") or [])),
+        },
+    }
+
+
+# ---- text report ---------------------------------------------------------------
+
+def snippet(text: str, limit: int = SNIPPET_LIMIT) -> str:
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[:limit] + "..."
+
+
+def counts(skips: dict[str, int]) -> str:
+    return ", ".join(f"{n} {why}" for why, n in sorted(skips.items())) or "none"
+
+
+def render_local(local: dict[str, Any]) -> str:
+    if not local.get("inRepo"):
+        return "local: not this repo"
+    head = local["head"][:12]
+    match = "== PR head" if local["headMatchesPr"] else "!= PR head"
+    parts = [f"branch {local.get('branch') or '(detached)'}", f"HEAD {head} {match}",
+             f"{local['uncommittedCount']} uncommitted"]
+    if local.get("unpushedCount") is not None:
+        parts.append(f"{local['unpushedCount']} unpushed vs {local['upstream']}")
+    else:
+        parts.append("no upstream")
+    return "local: " + " | ".join(parts)
+
+
+def render_text(ctx: dict[str, Any]) -> str:
+    pr, chk, act = ctx["pr"], ctx["checks"], ctx["actionable"]
+    state = pr["state"] + (" (draft)" if pr.get("isDraft") else "")
+    out = [
+        f"PR {ctx['repo']}#{pr['number']}  {state}  {pr['title']}",
+        str(pr["url"]),
+        f"{pr['headRefName']} -> {pr['baseRefName']}  head {str(pr['headRefOid'])[:12]}",
+        f"mergeable={pr['mergeable']}  mergeState={pr['mergeStateStatus']}  review={pr['reviewDecision'] or 'none'}",
+        f"viewer: {ctx['viewer']}",
+        render_local(ctx["local"]),
+    ]
+    if ctx["local"].get("headMatchesPr") is False:
+        out.append("  WARNING: local HEAD is not the PR head; fetch/pull or check out the PR branch first")
+
+    reviews = ctx["reviews"]
+    line = "REVIEWS: " + (", ".join(f"{r['author']} {r['state']}" for r in reviews) if reviews else "none")
+    if ctx["changesRequestedBy"]:
+        line += "  | changes requested by " + ", ".join(ctx["changesRequestedBy"])
+    out.append(line)
+
+    line = f"CHECKS: {chk['pass']} pass, {chk['fail']} fail, {chk['pending']} pending"
+    if chk["total"] > len(chk["contexts"]):
+        line += f" (first {len(chk['contexts'])} of {chk['total']})"
+    if chk["failing"]:
+        line += " | failing: " + ", ".join(str(n) for n in chk["failing"])
+    out.append(line)
+
+    files = ctx["files"]
+    adds = sum(f.get("additions") or 0 for f in files["nodes"])
+    dels = sum(f.get("deletions") or 0 for f in files["nodes"])
+    out += ["", f"FILES ({files['totalCount']} changed, +{adds} -{dels})"]
+    for f in files["nodes"][:FILE_LIST_LIMIT]:
+        out.append(f"  {f['path']}  +{f['additions']} -{f['deletions']}")
+    if len(files["nodes"]) > FILE_LIST_LIMIT:
+        out.append(f"  ... {len(files['nodes']) - FILE_LIST_LIMIT} more listed in --json")
+    if ctx["truncated"]["files"]:
+        out.append(f"  (only the first {len(files['nodes'])} files fetched)")
+
+    body = (pr.get("body") or "").strip()
+    if body:
+        shown = body if len(body) <= BODY_LIMIT else body[:BODY_LIMIT] + f"\n... [body truncated, {len(body)} chars; --json has all]"
+        out += ["", "BODY", shown]
+
+    if act["mergeConflict"]:
+        out += ["", "MERGE CONFLICT with " + str(pr["baseRefName"])]
+
+    for r in ctx["changesRequestedReviews"]:
+        out += ["", f"CHANGES REQUESTED REVIEW by {r['author']} ({r['submittedAt'] or '-'})",
+                f"  {snippet(r['body'], REVIEW_BODY_LIMIT) or '(no body)'}"]
+
+    out += ["", f"ACTIONABLE THREADS ({len(act['threads'])})"]
+    for t in act["threads"]:
+        out.append(f"  reply-to id {t['replyToId']}  {t['path']}:{t['line']}  by {t['author']}  (thread {t['id']})")
+        for c in t["comments"]:
+            out.append(f"    {c['author']}: {snippet(c['body'])}")
+        if (t["commentCount"] or 0) > len(t["comments"]):
+            out.append(f"    ... only the first {len(t['comments'])} of {t['commentCount']} comments fetched")
+    if ctx["truncated"]["threads"]:
+        out.append(f"  (only the first 60 threads fetched; {ctx['truncated']['threads']} not checked)")
+
+    out += ["", f"ACTIONABLE CONVERSATION COMMENTS ({len(act['comments'])})"]
+    for c in act["comments"]:
+        tag = "[already replied] " if c["alreadyReplied"] else ""
+        out.append(f"  id {c['databaseId']}  {c['author']}: {tag}{snippet(c['body'])}")
+    if ctx["truncated"]["comments"]:
+        out.append(f"  (only the newest 50 comments checked; {ctx['truncated']['comments']} older not checked)")
+
+    out += ["", "SKIPPED (not actionable)",
+            f"  threads: {counts(ctx['skipped']['threads'])}",
+            f"  comments: {counts(ctx['skipped']['comments'])}"]
+    return "\n".join(out)
+
+
+# ---- main ----------------------------------------------------------------------
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="pr-context", description="Everything about one PR in one call.")
+    p.add_argument("pr", metavar="PR", help="PR number or URL")
+    p.add_argument("-R", "--repo", metavar="OWNER/REPO", help="repository (default: from the URL or the current clone)")
+    p.add_argument("--json", action="store_true", help="emit one JSON object instead of the text report")
+    return p.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        repo, num = parse_target(args.pr, args.repo)
+        slug = resolve_repo(repo)
+        got = fetch(slug, num)
+        ctx = build_context(slug, got, local_state(slug, str(got["pr"].get("headRefOid") or "")))
+    except NotFound as e:
+        print(f"pr-context: {e}", file=sys.stderr)
+        return 1
+    except Failure as e:
+        print(f"pr-context: {e}", file=sys.stderr)
+        return 2
+    print(json.dumps(ctx, indent=2) if args.json else render_text(ctx))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

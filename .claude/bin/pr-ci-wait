@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""pr-ci-wait: wait for a PR's checks to finish, quietly.
+
+Polls `gh pr checks N --json name,state,bucket,link,workflow` with exponential
+backoff (--interval-start doubling up to --interval-max) and prints one table
+line only when a check's state changes: elapsed time, check, old -> new.
+Checks are terminal when none has bucket "pending". The same terminal snapshot
+must appear on two consecutive polls (flicker guard) before the verdict, and
+the confirming poll is taken after --interval-start seconds.
+
+Usage: pr-ci-wait <PR#> [-R owner/repo] [--max-minutes 30]
+                  [--interval-start 30] [--interval-max 120]
+
+Exit codes:
+  0  every check passed or was skipped
+  1  a check failed or was cancelled; for each failed check whose link contains
+     /actions/runs/<id>, the last 40 lines of `gh run view <id> --log-failed`
+     are printed first
+  2  timeout (--max-minutes); the still-pending checks are listed
+  3  no checks reported by the first 3 polls
+  4  gh failed 3 polls in a row (not a CI verdict)
+
+Environment:
+  GH                    gh binary (default `gh`)
+  PR_CI_WAIT_SLEEP=N    sleep N seconds per wait instead of the backoff interval
+                        (0 = no sleeping); for tests
+  PR_CI_WAIT_FAKE_CLOCK=S  elapsed time is S seconds per poll instead of the real
+                        clock; for tests
+Read-only: only `gh pr checks` and `gh run view`. Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from typing import Any, Callable
+
+RUN_LINK = re.compile(r"/actions/runs/(\d+)")
+BAD_BUCKETS = {"fail", "cancel"}
+EMPTY_POLL_LIMIT = 3
+ERROR_POLL_LIMIT = 3
+LOG_TAIL = 40
+
+
+class GhError(Exception):
+    pass
+
+
+def gh_bin() -> str:
+    return os.environ.get("GH") or "gh"
+
+
+def gh(args: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run([gh_bin(), *args], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        raise GhError(f"the gh CLI ({gh_bin()}) is not installed or not on PATH") from None
+
+
+def repo_args(repo: str | None) -> list[str]:
+    return ["-R", repo] if repo else []
+
+
+def fetch_checks(pr: str, repo: str | None) -> list[dict[str, Any]]:
+    """One poll. gh exits non-zero while checks are pending or failing but still prints the JSON."""
+    proc = gh(["pr", "checks", pr, *repo_args(repo), "--json", "name,state,bucket,link,workflow"])
+    try:
+        doc = json.loads(proc.stdout)
+    except ValueError:
+        doc = None
+    if isinstance(doc, list):
+        return [c for c in doc if isinstance(c, dict)]
+    err = (proc.stderr or proc.stdout or "").strip()
+    if "no checks reported" in err.lower():
+        return []
+    raise GhError(err.splitlines()[0] if err else f"gh exit {proc.returncode}")
+
+
+def key(check: dict[str, Any]) -> str:
+    name = str(check.get("name") or "?")
+    workflow = check.get("workflow")
+    return f"{workflow} / {name}" if workflow else name
+
+
+def state(check: dict[str, Any]) -> str:
+    return str(check.get("state") or check.get("bucket") or "?")
+
+
+def bucket(check: dict[str, Any]) -> str:
+    return str(check.get("bucket") or "").lower()
+
+
+def snapshot(checks: list[dict[str, Any]]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(sorted((key(c), bucket(c), state(c)) for c in checks))
+
+
+def fmt_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    return f"+{s // 60:02d}:{s % 60:02d}"
+
+
+def make_clock() -> tuple[Callable[[], float], Callable[[], None]]:
+    """(elapsed seconds, on_poll). Real monotonic time unless PR_CI_WAIT_FAKE_CLOCK is set."""
+    fake = os.environ.get("PR_CI_WAIT_FAKE_CLOCK")
+    if fake is not None:
+        step, polls = float(fake), [0]
+        return (lambda: step * polls[0]), (lambda: polls.__setitem__(0, polls[0] + 1))
+    start = time.monotonic()
+    return (lambda: time.monotonic() - start), (lambda: None)
+
+
+def sleep(seconds: float) -> None:
+    override = os.environ.get("PR_CI_WAIT_SLEEP")
+    seconds = float(override) if override is not None else seconds
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+def print_changes(prev: dict[str, str], checks: list[dict[str, Any]], elapsed: float) -> dict[str, str]:
+    current = {key(c): state(c) for c in checks}
+    for name in sorted(set(prev) | set(current)):
+        old, new = prev.get(name, "-"), current.get(name, "-")
+        if old != new:
+            print(f"{fmt_elapsed(elapsed)}  {name}  {old} -> {new}", flush=True)
+    return current
+
+
+def print_failure_logs(checks: list[dict[str, Any]], repo: str | None) -> None:
+    seen: set[str] = set()
+    for c in checks:
+        if bucket(c) != "fail":
+            continue
+        m = RUN_LINK.search(str(c.get("link") or ""))
+        if not m or m.group(1) in seen:
+            continue
+        seen.add(m.group(1))
+        run_id = m.group(1)
+        print(f"\n--- {key(c)}: last {LOG_TAIL} lines of failed log (run {run_id})")
+        try:
+            proc = gh(["run", "view", run_id, *repo_args(repo), "--log-failed"])
+        except GhError as e:
+            print(f"(could not fetch log: {e})")
+            continue
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip().splitlines()
+            print(f"(could not fetch log: {detail[0] if detail else f'exit {proc.returncode}'})")
+            continue
+        print("\n".join(proc.stdout.splitlines()[-LOG_TAIL:]))
+
+
+def wait(args: argparse.Namespace) -> int:
+    elapsed, on_poll = make_clock()
+    deadline = args.max_minutes * 60
+    interval = args.interval_start
+    prev: dict[str, str] = {}
+    last_terminal = None
+    polls = errors = 0
+    seen_any = False
+
+    while True:
+        on_poll()
+        polls += 1
+        try:
+            checks = fetch_checks(args.pr, args.repo)
+            errors = 0
+        except GhError as e:
+            errors += 1
+            print(f"pr-ci-wait: poll {polls} failed: {e}", file=sys.stderr)
+            if errors >= ERROR_POLL_LIMIT:
+                print(f"pr-ci-wait: gh failed {errors} polls in a row, giving up", file=sys.stderr)
+                return 4
+            checks = None
+
+        now = elapsed()
+        if checks is not None:
+            seen_any = seen_any or bool(checks)
+            prev = print_changes(prev, checks, now)
+            if not seen_any and polls >= EMPTY_POLL_LIMIT:
+                print(f"pr-ci-wait: no checks reported for PR {args.pr} after {polls} polls")
+                return 3
+            pending = [c for c in checks if bucket(c) == "pending"]
+            if checks and not pending:
+                snap = snapshot(checks)
+                if snap == last_terminal:
+                    return verdict(checks, args.repo)
+                last_terminal = snap
+            else:
+                last_terminal = None
+        else:
+            last_terminal = None
+
+        if now >= deadline:
+            print(f"pr-ci-wait: timed out after {args.max_minutes:g} min; still pending:")
+            still = [c for c in checks or [] if bucket(c) == "pending"]
+            for c in still:
+                print(f"  {key(c)}  {state(c)}")
+            if not still:
+                print("  (none pending; the final state was not yet confirmed by a second poll)")
+            return 2
+
+        confirming = last_terminal is not None
+        wait_s = args.interval_start if confirming else interval
+        sleep(min(wait_s, max(deadline - now, 0)))
+        if not confirming:
+            interval = min(interval * 2, args.interval_max)
+
+
+def verdict(checks: list[dict[str, Any]], repo: str | None) -> int:
+    bad = [c for c in checks if bucket(c) in BAD_BUCKETS]
+    if bad:
+        print(f"pr-ci-wait: {len(bad)} of {len(checks)} check(s) failed or were cancelled:")
+        for c in bad:
+            print(f"  {key(c)}  {state(c)}")
+        print_failure_logs(checks, repo)
+        return 1
+    print(f"pr-ci-wait: all {len(checks)} check(s) passed or were skipped")
+    return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="pr-ci-wait", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("pr", help="pull request number")
+    p.add_argument("-R", "--repo", metavar="OWNER/REPO", help="repository (default: current directory's repo)")
+    p.add_argument("--max-minutes", type=float, default=30, help="give up after this long (default 30)")
+    p.add_argument("--interval-start", type=float, default=30, help="first poll interval, seconds (default 30)")
+    p.add_argument("--interval-max", type=float, default=120, help="backoff ceiling, seconds (default 120)")
+    args = p.parse_args(argv)
+    if not args.pr.isdigit():
+        p.error("PR# must be a number")
+    if args.interval_start <= 0 or args.interval_max < args.interval_start or args.max_minutes <= 0:
+        p.error("need max-minutes > 0 and 0 < interval-start <= interval-max")
+    return args
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        return wait(args)
+    except GhError as e:
+        print(f"pr-ci-wait: {e}", file=sys.stderr)
+        return 4
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
