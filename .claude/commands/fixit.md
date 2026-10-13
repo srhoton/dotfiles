@@ -11,13 +11,19 @@ Follow these steps exactly.
 ## Step 1: Orient
 
 ```bash
-REPO=$(gh repo view --json owner,name --jq '.owner.login + "/" + .name')
-gh pr view $ARGUMENTS --json number,title,state,mergeable,reviewDecision,headRefName,baseRefName,headRefOid,url
+~/.claude/bin/pr-context $ARGUMENTS --json > "$SCRATCH/pr-context.json"   # $SCRATCH = this session's scratchpad
 git branch --show-current
 git status --porcelain
 ```
 
-Save `headRefName`, `baseRefName` and `state`. Then check three things and **stop and report** rather than guessing if any is wrong:
+`pr-context` returns everything Step 1 needs in one call:
+
+- the repo;
+- `pr.state`, `pr.headRefName`, `pr.baseRefName`, `pr.headRefOid` and `pr.mergeable`;
+- `local.inRepo`, `local.headMatchesPr`, `local.uncommittedCount` and `local.unpushedCount`;
+- the Step 2 feedback.
+
+Each thread's `replyToId` is the comment id Step 7a replies to. Save `headRefName`, `baseRefName` and `state`. Then check three things and **stop and report** rather than guessing if any is wrong:
 
 - `state` must be `OPEN`. A merged or closed PR is not to be touched.
 - You must be on the PR's code. A `pr-fix/<N>` branch (created by `pr-fix-queue`, tracking `origin/<headRefName>`) counts — so does the real head branch. If you are on neither, run `gh pr checkout $ARGUMENTS`, but only when the working tree is clean; if it is dirty with unrelated changes, stop.
@@ -28,6 +34,15 @@ If `git log @{u}..HEAD` is non-empty there are already-committed, unpushed commi
 ---
 
 ## Step 2: Gather the actionable feedback
+
+**Use the `pr-context` JSON from Step 1.**
+
+- `actionable.threads` and `actionable.comments` are already filtered by the tests below. They come from `~/.claude/bin/lib/pr_feedback.py`, the same code `pr-fix-queue` runs.
+- Each comment carries `alreadyReplied` (and `alreadyRepliedBy`), applying the already-replied rule below.
+- `changesRequestedReviews` holds the bodies of the standing change requests.
+- `truncated` says whether any threads or comments fell outside the fetched window.
+
+The rules below define what those fields mean, and you still do the actionable/acknowledge-only sorting yourself. Run the GraphQL queries below only if `pr-context` is missing or fails.
 
 Get the unresolved threads with their file, line, body and the numeric comment id needed to reply:
 
@@ -87,7 +102,7 @@ Only my `ROCKET` counts. A thumbs-up of mine, or a reply of mine further down, d
 An unhandled comment can still be **already replied**: an earlier run, my other machine, or I by hand answered it and only the rocket is missing. It counts as already replied **only** when a comment of mine both
 
 - has a `createdAt` newer than the unhandled comment's `lastEditedAt` (or its `createdAt` if it was never edited), and
-- contains `#issuecomment-<that comment's databaseId>` in its body.
+- contains `#issuecomment-<that comment's databaseId>` in its body, not followed by another digit (an anchor for `123` does not answer `12`).
 
 A reply of mine that predates the comment's latest edit does not count: the reviewer changed the ask after I answered, so it needs fresh work and a fresh reply. Position in the conversation is never enough. An already-replied comment needs no Step 4 work — confirm the fix or refutation it describes is really there, then it only needs its rocket in Step 7.
 
@@ -147,7 +162,7 @@ git log --oneline @{u}..HEAD
 
 Skip this step and Step 6 **only if both are empty** — every finding was refuted, or the comments were acknowledge-only or already replied. A merge commit from Step 3 leaves the tree clean but is still unpushed, and so are commits that already existed in Step 1: both have to be verified and pushed. Uncommitted changes that were already there in Step 1 are mine (see Step 1) and do not count as work to push.
 
-Run the full test suite, plus the language gate from CLAUDE.md:
+Run `~/.claude/bin/repo-gate` and confirm it ends `REPO-GATE: PASS`. If that line lists skipped gates, run each one by hand or say in the Step 8 report why it doesn't apply. Never push past a skipped TESTS or TYPECHECK gate silently. It covers the full test suite and the language gate from CLAUDE.md. If the script is missing, run these by hand:
 
 - Java/Quarkus: `./gradlew spotlessApply` then the full `./gradlew build`
 - TypeScript: the project's `typecheck`/`build` script, and `tsc --noEmit` must pass

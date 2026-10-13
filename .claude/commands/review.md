@@ -11,20 +11,11 @@ Follow these steps exactly:
 Determine what files have changed relative to the main branch:
 
 ```bash
-# Get the default branch name
-DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
-
-# Changed files on this branch vs default
-git diff --name-only "$DEFAULT_BRANCH"...HEAD 2>/dev/null || true
-
-# Unstaged changes
-git diff --name-only
-
-# Staged changes
-git diff --name-only --cached
+~/.claude/bin/review-context --no-defects   # base branch, commits, diff stat, uncommitted changes
+~/.claude/bin/review-context --files-only   # the changed-file list, one per line
 ```
 
-Combine and deduplicate all changed files into a single list. If `$ARGUMENTS` is provided, filter the list to only files matching those paths or patterns.
+`--files-only` already combines and deduplicates the branch diff against the default branch, unstaged, staged and untracked files, and leaves out deleted files. Save the `BASE` that the `--no-defects` run prints as `DEFAULT_BRANCH`; Step 5 uses it. If `$ARGUMENTS` is provided, filter the list to only files matching those paths or patterns.
 
 If no changed files are found, report: "No changes detected. Nothing to review." and stop.
 
@@ -37,14 +28,12 @@ Display the list of files that will be reviewed.
 Deterministic checks are cheaper, faster, and more reliable than LLM reviewers, and spending reviewer attention on lint/type errors is precisely what lets judgment-level bugs slip to a later round. Run these first and fix what they find before any agent is dispatched.
 
 ```bash
-# 1. Type check (whatever the project actually uses)
-#    Node: prefer the project's typecheck/type-check script, else `npx tsc --noEmit`
-#    Java: ./gradlew compileJava    Go: go build ./...    Python: mypy
-# 2. Deterministic diff checks: eslint errors on changed files + ReDoS heuristic
-~/.claude/bin/vet-diff
+~/.claude/bin/repo-gate
 ```
 
-Report anything they surface as findings **before** Step 2, and fix them first. Notes:
+`repo-gate` detects the project type (Node, Gradle, Go, Python, Terraform). It runs the typecheck, then `vet-diff` (eslint errors on changed files plus the ReDoS heuristic), then the full test suite. It prints one PASS/FAIL/SKIPPED line per gate, with only an excerpt for each failure. Exit 0 means no gate *failed*; it doesn't mean every gate ran. The final line lists any skipped core gates (`REPO-GATE: PASS (skipped: …)`). Report each skipped gate, and run it by hand if the change touches what it covers. For Gradle repos it runs `spotlessApply`, which can reformat files, so re-run `review-context --files-only` after it.
+
+Report anything it surfaces as findings **before** Step 2, and fix them first. Notes:
 - `vet-diff` is scoped to changed files (and, for the regex check, added lines only), so pre-existing debt elsewhere never blocks you.
 - It reports `SKIPPED` rather than failing when a repo has no eslint config — that is expected in several repos here, not an error.
 - If the gate is clean, say so in one line and continue to Step 2.
@@ -72,6 +61,8 @@ The workflow runs the five specialist reviewers (functional, code-quality, adr-c
 ---
 
 ## Step 3: Display
+
+First run `~/.claude/bin/fanout-report <workflow output file> --repo <repo name>`. It writes the full report to `~/.claude/scratch/<repo>/` (CLAUDE.md's scratch-file rule) and prints the path and counts. Give the user that path.
 
 Using the workflow's returned structure (or your own aggregation in the fallback case), display ALL findings:
 
@@ -127,7 +118,7 @@ Session evidence shows the review loop's dominant failure modes are fix-side, no
    - the four fix-discipline rules above, verbatim.
 
    When it returns, read its `FIXES` and `BLOCKERS` sections. A finding it declined as wrong goes back in the report with its reasoning; don't silently drop it.
-3. **Re-run the Step 1.5 mechanical gate first** (typecheck + `~/.claude/bin/vet-diff`). This is the step that catches fix-induced regressions deterministically — a fix that introduces a lint error, a type error, or a ReDoS-shaped regex is caught here in seconds, instead of costing a whole LLM review round to rediscover. Fix anything it reports before continuing.
+3. **Re-run the Step 1.5 mechanical gate first** (`~/.claude/bin/repo-gate`, which also covers step 4's full suite). This is the step that catches fix-induced regressions deterministically — a fix that introduces a lint error, a type error, or a ReDoS-shaped regex is caught here in seconds, instead of costing a whole LLM review round to rediscover. Fix anything it reports before continuing.
 4. Run the full test suite to verify fixes don't break anything
 5. Re-invoke the review-fanout workflow on the changed files (same as Step 2, fresh run — files changed, so no cache reuse) — the LLM re-review remains the backstop for judgment-level regressions the gate cannot see
 6. Display updated findings and the new `git diff --shortstat`

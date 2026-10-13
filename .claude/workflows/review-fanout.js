@@ -55,7 +55,8 @@ const header =
 
 const checklistNote =
   'Additionally check the diff against EVERY defect class in ~/.claude/knowledge/defect-classes.md ' +
-  '(read that file first) — these are historically recurring fix-round defects.\n\n'
+  '(`~/.claude/bin/review-context -C <repo root>` prints it together with the branch commits and diff stat) ' +
+  '— these are historically recurring fix-round defects.\n\n'
 
 const REVIEWERS = [
   {
