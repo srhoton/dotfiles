@@ -17,13 +17,21 @@ This command composes existing assets. Where it says "follow `<file>`", read tha
 
 ## Phase 2: Implement
 
+You orchestrate this phase; the `implementer` agent writes the code. Do not write the implementation yourself, and do not pass `model` on the dispatch.
+
 1. Branch off the latest default branch (never commit to it directly).
-2. Implement with tests, following the language rules files and existing repo patterns (find 2-3 examples before inventing one).
+2. Dispatch the `implementer` agent. The prompt carries:
+   - the approved plan file path, plus the premise-verification table;
+   - the repo root and the files/directories it may change (the Phase 1 scope);
+   - the **Gates** below, verbatim.
 3. **Gates** (all must pass before Phase 3):
    - Typecheck + lint + **full test suite** (`tsc --noEmit`/eslint, or `./gradlew build spotlessApply`, per repo).
    - **Mutation-probe every new/modified test** with `~/.claude/bin/mutation-probe --test '<scoped test cmd>' <changed-prod-file>...` (add `--together` for multi-file atomic fixes). It reverts the production change via file copy — never `git checkout`/`git restore` — confirms the test FAILS against unfixed code, and restores. Any test it reports VACUOUS is rewritten and re-probed. Report the probe output.
    - **Deterministic test doubles only**: no `Math.random`, `Date.now()`, argless `new Date()`, or real timers in stubs — CI runs under coverage and flakes on them.
-4. Self-check the diff for scope creep (unrequested layers, cleanup handlers, defensive frameworks) and descope it yourself before review.
+4. When the implementer returns:
+   - **BLOCKERS that are plan problems:** revise the plan yourself. A design-level change goes back through the Design Gate before you re-dispatch. Re-dispatch with the revised plan and the prior report's concrete errors, never an identical prompt.
+   - **Otherwise, verify instead of trusting the report:** re-run the typecheck and the full test suite yourself, and read the diff.
+5. Self-check the diff for scope creep (unrequested layers, cleanup handlers, defensive frameworks). Send any descoping back to the implementer as a fix round; don't edit it yourself.
 
 ## Phase 3: Review
 

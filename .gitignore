@@ -1,2 +1,5 @@
 # Compiled micro-status-mcp binary — built from ~/git/micro-status-mcp, not tracked.
 .claude/bin/micro-status-mcp
+
+# Python bytecode from running the generator and its tests.
+__pycache__/

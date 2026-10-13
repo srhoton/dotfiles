@@ -2,6 +2,7 @@
 name: java-quarkus-agent
 description: Specialized subagent for generating Java/Quarkus projects and components following best practices with Gradle, Spotless, and comprehensive testing
 tools: Read, Write, Edit, Bash, Glob, Grep
+model: sonnet
 ---
 
 # Java/Quarkus Development Agent

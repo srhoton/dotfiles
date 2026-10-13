@@ -2,6 +2,7 @@
 name: typescript-agent
 description: Specialized subagent for generating TypeScript projects and components with strict type safety, comprehensive testing, and security-first approach
 tools: Read, Write, Edit, Bash, Glob, Grep
+model: sonnet
 ---
 
 # TypeScript Development Agent
