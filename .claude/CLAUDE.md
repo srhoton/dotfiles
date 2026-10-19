@@ -1,12 +1,7 @@
 # Global Rules
 
 ## Language Rules
-- Java coding rules @~/.claude/java_rules.md
-- Terraform coding rules @~/.claude/terraform_rules.md
-- Python coding rules @~/.claude/python_rules.md
-- Golang coding rules @~/.claude/golang_rules.md
-- Typescript coding rules @~/.claude/typescript_rules.md
-- React coding rules @~/.claude/react_rules.md
+Language and tool rules live in `~/.claude/rules/` and load when matching files are touched.
 
 ## Investigation Scope
 
@@ -58,17 +53,17 @@
 ### AWS Commands
 - Before running any AWS CLI command against an environment, confirm the active SSO profile/account matches the intended target (`aws sts get-caller-identity` or check `AWS_PROFILE`). Never assume the default profile is the right one. Pick the profile from this map; an ARN's account id decides it, so match the ARN against the table before the first call:
 
-  | Target | Profile | Account |
+  | Target | Profile you use | Account |
   |---|---|---|
   | dev | `fb-dev-non-prod/Admin` | 147997133155 |
-  | qa | `fb-qa-non-prod/Admin` | 343218192518 |
-  | stage | `fb-stage-non-prod/Admin` | 528757793739 |
-  | prod | `fb-live-us-prod/Admin` | 211125509520 |
-  | demo | `fb-demo-us-prod/Admin` | 979667334065 |
-  | data lake / Athena | `fb-datalake-prod/Admin` | 230514136789 |
+  | qa | `fb-qa-non-prod/ReadOnly` | 343218192518 |
+  | stage | `fb-stage-non-prod/ReadOnly` | 528757793739 |
+  | prod | `fb-live-us-prod/ReadOnly` | 211125509520 |
+  | demo | `fb-demo-us-prod/ReadOnly` | 979667334065 |
+  | data lake / Athena | `fb-datalake-prod/Admin` (no ReadOnly assignment) | 230514136789 |
 
-  "Prod" means `fb-live-us-prod`, never `fb-demo-us-prod`.
-- **Prod is read-only. With `fb-live-us-prod` (account 211125509520) you NEVER modify data** — no DynamoDB/S3/RDS writes or deletes, no Step Functions starts, stops, or redrives, no Lambda invokes that write, no queue sends or purges, no Terraform apply, no console-equivalent mutations. Only describe/get/list/query/scan and log reads. If a fix needs a prod change, write up the exact change and hand it to me; do not run it, even if asked mid-task to "just fix it".
+  "Prod" means `fb-live-us-prod`, never `fb-demo-us-prod`. The qa/stage/prod/demo `Admin` profiles are for deploys I run myself; never use them, even for a read. If a ReadOnly call is denied, the action needs Admin, so write it up for me instead of switching profiles.
+- **Prod is read-only. With `fb-live-us-prod` (account 211125509520) you NEVER modify data** — no DynamoDB/S3/RDS writes or deletes, no Step Functions starts, stops, or redrives, no Lambda invokes that write, no queue sends or purges, no Terraform apply, no console-equivalent mutations. Only describe/get/list/query/scan and log reads; the `ReadOnly` role enforces this in IAM. If a fix needs a prod change, write up the exact change and hand it to me; do not run it, even if asked mid-task to "just fix it".
 - Confirm the SSO session isn't expired before starting a long AWS/Terraform task — re-authenticate proactively (`aws sso login --profile <p>`) rather than discovering the expiry mid-run on a rejected call or blocked dependency install.
 
 ### AWS Agent Toolkit
@@ -76,7 +71,7 @@
 - If the `aws-data-analytics` `aws-mcp` server fails to connect with `-32602 Invalid request parameters`, the cause is expired credentials, not the plugin. The proxy runs without `--profile`, so it uses `AWS_PROFILE`, which `settings.json` `env` sets to `fb-dev-non-prod/Admin`. Ask me to run `! aws sso login --profile fb-dev-non-prod/Admin`, then reconnect the server via `/mcp`. That `AWS_PROFILE` is also the default for any `aws` CLI call without `--profile`, so pass `--profile` explicitly for every other account.
 - Skill-first: before an AWS task, load the relevant bundled skill (`retrieve_skill` via the AWS-knowledge MCP, or the `Skill` tool for `aws-core:*`/`aws-data-analytics:*` skills) and follow its guidance rather than reasoning from general knowledge.
 - **Secrets Manager (hard rule):** for any secret/credential/API-key/token/password task, load the `aws-secrets-manager` skill first and follow it. Do NOT call `secretsmanager get-secret-value`/`batch-get-secret-value` or hit the Secrets Manager Agent daemon directly — the secret would enter context. Use the skill's runtime-resolution pattern (`{{resolve:secretsmanager:<secret-id>:SecretString:<json-key>}}`, resolved at deploy/runtime) so the value never lands in context.
-- IaC over ad-hoc mutation: create/modify AWS infrastructure through Terraform (per @~/.claude/terraform_rules.md and the Terraform Conventions above), not one-off CLI mutations. (The AWS toolkit suggests CDK/CloudFormation — we standardize on Terraform.)
+- IaC over ad-hoc mutation: create/modify AWS infrastructure through Terraform (per `~/.claude/rules/terraform.md`, including its Terraform Conventions), not one-off CLI mutations. (The AWS toolkit suggests CDK/CloudFormation — we standardize on Terraform.)
 - Do not use em dashes in AWS resource names or descriptions — use hyphens.
 - Keep the AWS plugins current: periodically run `/plugin marketplace update` then `/reload-plugins`. The `agent-toolkit-for-aws` marketplace ships new plugins/skills (e.g. `aws-agents-for-devsecops`) that a stale local clone won't surface.
 
@@ -85,19 +80,6 @@
 - When diagnosing 401s/auth failures or other distributed-system errors, consider consumer-side causes (cold-start JWKS fetch blocking, concurrency races, client clock skew) in addition to the issuer/server side before settling on a root cause.
 - Never label a failure "transient" or "one-off" without metric evidence (CloudWatch/Athena/DynamoDB query over the failure window). Quantify blast radius — a measured count of affected entities/records/executions — before proposing a fix.
 - Every root-cause claim must cite a `file:line`, an execution ARN, or a query result. If I push back on a conclusion, re-derive it from primary sources — do not restate it.
-
-### Terraform Conventions
-- Never use `count = 0` together with `moved` blocks on the same resource — this causes plan errors.
-- Do not change DMS `MaxFullLoadSubTasks` above the current value without explicit approval (known OOM risk).
-- Always run `terraform validate` and `terraform plan` before suggesting a commit.
-- Do not modify IAM roles tagged with governance policies — flag for human approval instead of attempting the change.
-- EventBridge **event-bus** targets reject `retry_policy` and `dead_letter_config` at the `PutTargets` API — omit those blocks for bus-to-bus routing (they're valid only on non-bus targets like Lambda/SQS).
-- Before validating target/permission blocks against AWS, pull the latest state instead of trusting a stale local clone — the API-accepted shape drifts, and a stale clone will generate blocks the live API rejects.
-
-### Descope FGA / Authorization Schemas
-- Validate FGA/ReBAC DSL against the Descope console before considering a schema change done — do not assume the generated syntax is accepted.
-- Common DSL syntax errors to avoid: no bare relation names on the RHS of a relation definition (qualify them), and no `//` comments in the DSL (the parser rejects them).
-- When managing FGA in Terraform, translate the ReBAC requirements into DSL and iterate through console validation rather than trusting a one-shot conversion.
 
 ### Spec-Driven Implementation
 - When implementing from a spec/plan file, read the entire spec first and present a summary plan before making code changes. Make reasonable assumptions and note them rather than asking clarifying questions interactively.
@@ -123,9 +105,7 @@
 ## Deployment Workflow
 
 - Standard end-to-end flow: implement → tests pass → self-review (`/review`) → commit with git notes → push → open PR → address review → ship through dev/stage/prod/demo via Port.io (`/shipit`).
-- **Port.io cache flicker**: action runs can oscillate between IN_PROGRESS and SUCCESS during polling. Poll the same state 2-3 times before reporting a final terminal state.
-- **Stale SHAs in deploys**: before triggering a deploy or terraform apply, confirm the target entity's `short_sha` matches the expected commit on origin. If misaligned, wait 30s and re-fetch — do not fire the action against a stale entity.
-- **Approval gate polling**: treat `approval_status = null` as pending, not failed. `commands/shipit.md` is authoritative for the pipeline's backoff, attempt caps, and stale-gate handling — follow it rather than improvising a retry count here.
+- `commands/shipit.md` is authoritative for Port.io polling, SHA checks, and approval gates — follow it rather than improvising here.
 
 ### New Lambda Repos
 - Every new Node/TypeScript Lambda project must include a `.npmrc` configured for the @fullbay AWS CodeArtifact registry before the first PR is opened. Missing this file is the single most common CI failure pattern (`npm install` returns 404 for `@fullbay/*` packages and the pipeline fails at the install step).
@@ -146,6 +126,9 @@
 - For deploy/pipeline polling, report state changes as a compact table — not narrative prose.
 - This applies to user-visible output. Internal reasoning depth should remain high per the Thinking Depth section.
 - For any single output that would exceed roughly 150 lines or include large code/diff/log blocks (review findings, migration plans, scraped log dumps, multi-file refactor diffs): write the full content to `~/.claude/scratch/<repo-basename>/<topic>-<ISO8601>.md` (`mkdir -p` on demand) and post only a 3-bullet summary in chat with the path. Hard output-token caps have killed prior sessions mid-task; the scratch file is the durable artifact, chat is the index. Applies especially to reviewer output, deployment plans, and long log analyses.
+
+### Compaction
+- When compacting, preserve: modified files, branches and PR numbers, test and gate commands with their last result, the review/fix round count, and every hard constraint stated in the session (prod read-only, secrets, public repo).
 
 ## Code Quality
 - Prefer correct, complete implementations over minimal ones.

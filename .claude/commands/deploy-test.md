@@ -1,3 +1,7 @@
+---
+description: "Test the deployed resource."
+disable-model-invocation: true
+---
 Test the deployed resource: $ARGUMENTS
 
 Rules:

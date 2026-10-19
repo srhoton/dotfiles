@@ -1,3 +1,7 @@
+---
+description: "Validate the deployed resource and autonomously fix any issues."
+disable-model-invocation: true
+---
 Validate the deployed resource and autonomously fix any issues: $ARGUMENTS
 
 This command assumes the code has already been deployed via CI/CD (or locally).

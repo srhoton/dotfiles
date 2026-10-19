@@ -29,7 +29,9 @@ GLOBAL_DIR = "~/.config/opencode"
 
 # Text rewrites applied to AGENTS.md, agent bodies and command bodies.
 COMMON_REWRITES: list[tuple[str, str]] = [
-    (r"~/\.claude/(\w+_rules\.md|<lang>_rules\.md)", GLOBAL_DIR + r"/rules/\1"),
+    # Legacy flat layout (~/.claude/<lang>_rules.md) maps onto the new rules/<lang>.md names.
+    (r"~/\.claude/([\w*]+|<lang>)_rules\.md", GLOBAL_DIR + r"/rules/\1.md"),
+    (r"~/\.claude/rules/", GLOBAL_DIR + "/rules/"),
     (r"~/\.claude/commands/([\w-]+)\.md", GLOBAL_DIR + r"/commands/\1.md"),
     (r"`CLAUDE\.md`", "`AGENTS.md` (or `CLAUDE.md`)"),
     (r"(?<!`)\bCLAUDE\.md\b(?!`)", "AGENTS.md"),
@@ -46,9 +48,11 @@ COMMON_REWRITES: list[tuple[str, str]] = [
 # under the generator and the rule needs updating, so the run fails instead of drifting.
 AGENTS_RULES: list[tuple[str, str, str]] = [
     (
-        "rules includes",
-        r"@~/\.claude/(\w+_rules\.md)",
-        GLOBAL_DIR + r"/rules/\1",
+        # opencode has no path-scoped loading: opencode.json loads every rules/*.md,
+        # and each generated rule opens with an "Applies to:" line instead.
+        "rules pointer",
+        r"^(Language and tool rules live in `)~/\.claude/rules/(`) and load when matching files are touched\.$",
+        r"\1" + GLOBAL_DIR + r"/rules/\2; each file opens with an `Applies to:` line naming the files it covers.",
     ),
     (
         "subagent model tier",
@@ -63,7 +67,8 @@ AGENTS_RULES: list[tuple[str, str, str]] = [
 ]
 
 AGENT_DROP_KEYS = {"name", "model", "color", "tools"}
-COMMAND_DROP_KEYS = {"allowed-tools", "argument-hint", "model", "name"}
+# disable-model-invocation has no opencode equivalent; description is carried over as-is.
+COMMAND_DROP_KEYS = {"allowed-tools", "argument-hint", "disable-model-invocation", "model", "name"}
 WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 TASK_TOOLS = {"Task", "Agent"}
 
@@ -163,6 +168,60 @@ def convert_agent(text: str) -> str:
         lines.extend(permission)
     lines.append("---")
     return "\n".join(lines) + "\n" + apply_common(body)
+
+
+def split_top_level(value: str) -> list[str]:
+    """Split a comma list on commas outside braces, so a glob like `*.{ts,tsx}` stays whole."""
+    items, depth, current = [], 0, []
+    for char in value:
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        if char == "," and depth == 0:
+            items.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    items.append("".join(current))
+    return [item.strip() for item in items if item.strip()]
+
+
+def unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def rule_globs(entries: list[tuple[str, list[str]]]) -> list[str] | None:
+    """Return the `paths:` globs of a rule file, or None when it has no `paths` key."""
+    for name, lines in entries:
+        if name != "paths":
+            continue
+        inline = lines[0].split(":", 1)[1].strip()
+        if inline.startswith("[") and inline.endswith("]"):
+            inline = inline[1:-1]
+        items = split_top_level(inline)
+        for line in lines[1:]:
+            match = re.match(r"^\s*-\s+(.*)$", line)
+            if match:
+                items.append(match.group(1))
+        globs = [unquote(item) for item in items if item.strip()]
+        if not globs:
+            raise GenerationError("rule has a paths key but no globs")
+        return globs
+    return None
+
+
+def convert_rule(text: str) -> str:
+    """Drop the Claude-only `paths:` frontmatter and state the scope in an "Applies to:" line."""
+    entries, body = split_frontmatter(text)
+    globs = rule_globs(entries)
+    body = apply_common(body.lstrip("\n"))
+    if globs is None:
+        return body
+    return "Applies to: " + ", ".join(f"`{glob}`" for glob in globs) + "\n\n" + body
 
 
 def describe_command(body: str) -> str:
@@ -288,9 +347,12 @@ def generate(src: Path, out: Path, claude_home: Path, mcp_sources: list[Path]) -
     out.mkdir(parents=True, exist_ok=True)
     (out / "AGENTS.md").write_text(convert_claude_md((src / "CLAUDE.md").read_text()))
 
+    rules_dir = src / "rules"
+    if not rules_dir.is_dir():
+        raise GenerationError(f"{rules_dir} not found; language rules now live in .claude/rules/")
     (out / "rules").mkdir()
-    for rules in sorted(src.glob("*_rules.md")):
-        shutil.copy2(rules, out / "rules" / rules.name)
+    for rule in sorted(rules_dir.glob("*.md")):
+        (out / "rules" / rule.name).write_text(convert_rule(rule.read_text()))
 
     (out / "agents").mkdir()
     for agent in sorted((src / "agents").glob("*.md")):

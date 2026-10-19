@@ -18,7 +18,7 @@ Operates as a subagent — receives context via dispatch prompt. No conversation
 
 - Read `CLAUDE.md` in current directory and parents for project-specific performance requirements
 - Detect languages in files under review
-- READ the corresponding `~/.claude/<lang>_rules.md` — extract performance-relevant sections only
+- READ the corresponding `~/.claude/rules/<lang>.md` — extract performance-relevant sections only
 - Note any performance SLAs, latency budgets, or scaling targets from project config
 
 ### Step 2: Identify Review Scope
@@ -83,6 +83,8 @@ Quick pattern scans for known performance anti-patterns:
 
 ### Verdict: PASS | FAIL
 [PASS = no Critical or High issues; FAIL = one or more Critical/High performance issues]
+
+Rate a finding CRITICAL or HIGH only if it breaks correctness, data safety, security, or a stated requirement. Style, extra abstraction, and defensive hardening are MEDIUM or LOW at most.
 
 ### Scope
 [Files reviewed and how identified]

@@ -1,6 +1,8 @@
+Applies to: `**/*.tsx`, `**/vite.config.*`
+
 # React Rules
 
-Only non-obvious, shop-specific decisions. See @~/.claude/typescript_rules.md for TS/ESLint/tsconfig.
+Only non-obvious, shop-specific decisions. See @~/.config/opencode/rules/typescript.md for TS/ESLint/tsconfig.
 
 ## Hard requirement
 

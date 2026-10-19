@@ -1,5 +1,5 @@
 ---
-description: "Test the deployed resource: <args>"
+description: "Test the deployed resource."
 ---
 Test the deployed resource: $ARGUMENTS
 

@@ -72,6 +72,8 @@ Severity guidance:
 - **MEDIUM** — needs a backfill or migration note that is missing, but no silent corruption.
 - **LOW** — cosmetic or forward-only; worth noting.
 
+Rate a finding CRITICAL or HIGH only if it breaks correctness, data safety, security, or a stated requirement. Style, extra abstraction, and defensive hardening are MEDIUM or LOW at most.
+
 End with `VERDICT: PASS` or `VERDICT: FAIL` (FAIL if any CRITICAL or HIGH finding stands).
 
 If the change touches no persistence, identity, status, or schema surface, say so in one line and return `VERDICT: PASS` — do not manufacture findings. A clean pass on a UI-only or docs-only change is the correct answer.

@@ -14,7 +14,7 @@ c2o = importlib.util.module_from_spec(_spec)
 _loader.exec_module(c2o)
 
 CLAUDE_MD = """# Global Rules
-- Java coding rules @~/.claude/java_rules.md
+Language and tool rules live in `~/.claude/rules/` and load when matching files are touched.
 
 ### Use of tools
 - **Bounded subagents**: scope every dispatch.
@@ -33,7 +33,38 @@ model: opus
 color: purple
 ---
 
-Use the Task tool. See ~/.claude/java_rules.md.
+Use the Task tool. See ~/.claude/rules/java.md, ~/.claude/rules/<lang>.md and the legacy ~/.claude/java_rules.md.
+"""
+
+JAVA_RULE = """---
+paths:
+  - "**/*.java"
+  - "**/libs.versions.toml"
+---
+
+# Java Rules
+
+Follow ~/.claude/rules/shared.md. Never edit CLAUDE.md here.
+"""
+
+REACT_RULE = """---
+paths:
+  - "**/*.{ts,tsx}"
+  - '**/vite.config.*'
+---
+
+# React Rules
+
+See @~/.claude/rules/java.md for the base rules.
+"""
+
+PLAIN_RULE = "# Shared Rules\n\nNo scope here.\n"
+
+DELIVER_COMMAND = """---
+description: "Deliver a ticket."
+disable-model-invocation: true
+---
+You are a delivery pipeline for `$ARGUMENTS`.
 """
 
 ROUTER_AGENT = """---
@@ -53,12 +84,16 @@ def make_source(root: Path, kagi_value: str = "") -> tuple[Path, Path, list[Path
     (src / "agents").mkdir(parents=True)
     (src / "commands").mkdir()
     (src / "CLAUDE.md").write_text(CLAUDE_MD)
-    (src / "java_rules.md").write_text("# Java\n")
+    (src / "rules").mkdir()
+    (src / "rules" / "java.md").write_text(JAVA_RULE)
+    (src / "rules" / "react.md").write_text(REACT_RULE)
+    (src / "rules" / "shared.md").write_text(PLAIN_RULE)
     (src / "agents" / "functional-reviewer.md").write_text(READ_ONLY_AGENT)
     (src / "agents" / "routing-agent.md").write_text(ROUTER_AGENT)
     (src / "commands" / "shipit.md").write_text(
         "You are a deployer. Deploy `$ARGUMENTS` now.\n"
     )
+    (src / "commands" / "deliver.md").write_text(DELIVER_COMMAND)
     (src / "commands" / "vlt.md").write_text("Ok. Lint it.\n")
     (src / "settings.json").write_text(
         json.dumps(
@@ -125,8 +160,13 @@ class GenerateTest(unittest.TestCase):
 
     def test_agents_md_rewrites_and_drops_model_tier(self) -> None:
         text = (self.run_generate() / "AGENTS.md").read_text()
-        self.assertIn("~/.config/opencode/rules/java_rules.md", text)
-        self.assertNotIn("@~/.claude", text)
+        self.assertIn(
+            "Language and tool rules live in `~/.config/opencode/rules/`;"
+            " each file opens with an `Applies to:` line",
+            text,
+        )
+        self.assertNotIn("load when matching files are touched", text)
+        self.assertNotIn("~/.claude", text)
         self.assertNotIn("Subagent model tier", text)
         self.assertNotIn("haiku", text)
         self.assertIn("Bounded subagents", text)
@@ -152,7 +192,12 @@ class GenerateTest(unittest.TestCase):
         for dropped in ("name:", "model:", "color:", "tools:"):
             self.assertNotIn(dropped, front)
         self.assertIn("Use the task tool", text)
-        self.assertIn("~/.config/opencode/rules/java_rules.md", text)
+        self.assertIn(
+            "See ~/.config/opencode/rules/java.md, ~/.config/opencode/rules/<lang>.md"
+            " and the legacy ~/.config/opencode/rules/java.md.",
+            text,
+        )
+        self.assertNotIn("_rules.md", text)
 
     def test_router_agent_keeps_block_description_and_full_permissions(self) -> None:
         text = (self.run_generate() / "agents" / "routing-agent.md").read_text()
@@ -165,7 +210,8 @@ class GenerateTest(unittest.TestCase):
     def test_disabled_commands_skipped_and_description_derived(self) -> None:
         out = self.run_generate()
         self.assertEqual(
-            sorted(p.name for p in (out / "commands").iterdir()), ["shipit.md"]
+            sorted(p.name for p in (out / "commands").iterdir()),
+            ["deliver.md", "shipit.md"],
         )
         text = (out / "commands" / "shipit.md").read_text()
         self.assertTrue(
@@ -174,6 +220,73 @@ class GenerateTest(unittest.TestCase):
             )
         )
         self.assertIn("$ARGUMENTS", text.split("---\n", 2)[2])
+
+    def test_command_frontmatter_drops_model_invocation_key_and_keeps_description(
+        self,
+    ) -> None:
+        text = (self.run_generate() / "commands" / "deliver.md").read_text()
+        self.assertEqual(
+            text,
+            '---\ndescription: "Deliver a ticket."\n---\n'
+            "You are a delivery pipeline for `$ARGUMENTS`.\n",
+        )
+        self.assertNotIn("disable-model-invocation", text)
+
+    def test_rules_strip_paths_and_state_scope(self) -> None:
+        rules = self.run_generate() / "rules"
+        self.assertEqual(
+            sorted(p.name for p in rules.iterdir()),
+            ["java.md", "react.md", "shared.md"],
+        )
+        java = (rules / "java.md").read_text()
+        self.assertTrue(
+            java.startswith(
+                "Applies to: `**/*.java`, `**/libs.versions.toml`\n\n# Java Rules\n"
+            )
+        )
+        self.assertNotIn("paths:", java)
+        self.assertNotIn("---", java)
+        self.assertIn("~/.config/opencode/rules/shared.md", java)
+        self.assertIn("AGENTS.md", java)
+        self.assertNotIn("CLAUDE.md", java)
+        react = (rules / "react.md").read_text()
+        self.assertTrue(
+            react.startswith(
+                "Applies to: `**/*.{ts,tsx}`, `**/vite.config.*`\n\n# React Rules\n"
+            )
+        )
+        self.assertIn("@~/.config/opencode/rules/java.md", react)
+        self.assertEqual((rules / "shared.md").read_text(), PLAIN_RULE)
+
+    def test_convert_rule_accepts_inline_paths_forms(self) -> None:
+        flow = '---\npaths: ["**/*.{ts,tsx}", "**/x.json"]\n---\nBody\n'
+        self.assertEqual(
+            c2o.convert_rule(flow), "Applies to: `**/*.{ts,tsx}`, `**/x.json`\n\nBody\n"
+        )
+        scalar = "---\npaths: **/*.{py,pyi}\n---\nBody\n"
+        self.assertEqual(
+            c2o.convert_rule(scalar), "Applies to: `**/*.{py,pyi}`\n\nBody\n"
+        )
+
+    def test_rule_with_empty_paths_fails(self) -> None:
+        with self.assertRaisesRegex(c2o.GenerationError, "no globs"):
+            c2o.convert_rule("---\npaths:\n---\nBody\n")
+
+    def test_missing_rules_directory_fails(self) -> None:
+        src, home, mcp = make_source(self.root)
+        for rule in (src / "rules").iterdir():
+            rule.unlink()
+        (src / "rules").rmdir()
+        with self.assertRaisesRegex(c2o.GenerationError, "rules"):
+            c2o.generate(src, self.root / "out", home, mcp)
+
+    def test_missing_rules_pointer_fails(self) -> None:
+        src, home, mcp = make_source(self.root)
+        (src / "CLAUDE.md").write_text(
+            CLAUDE_MD.replace("Language and tool rules live", "Rules are")
+        )
+        with self.assertRaisesRegex(c2o.GenerationError, "rules pointer"):
+            c2o.generate(src, self.root / "out", home, mcp)
 
     def test_skills_only_from_enabled_plugins(self) -> None:
         out = self.run_generate()
@@ -204,7 +317,9 @@ class GenerateTest(unittest.TestCase):
         config = json.loads((out / "opencode.json").read_text())
         mcp = config["mcp"]
         self.assertEqual(sorted(mcp), ["Atlassian", "Kagi", "Port", "aws-mcp"])
-        self.assertEqual(mcp["Port"], {"type": "remote", "url": "https://mcp.us.port.io/v1"})
+        self.assertEqual(
+            mcp["Port"], {"type": "remote", "url": "https://mcp.us.port.io/v1"}
+        )
         self.assertEqual(
             mcp["Kagi"]["environment"]["KAGI_API_KEY"], "{env:KAGI_API_KEY}"
         )

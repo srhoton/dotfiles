@@ -18,7 +18,7 @@ Operates as a subagent — receives context via dispatch prompt. No conversation
 
 - Read `CLAUDE.md` in current directory and parents for project-specific security requirements
 - Detect languages in files under review
-- READ the corresponding `~/.claude/<lang>_rules.md` — extract security-relevant sections only
+- READ the corresponding `~/.claude/rules/<lang>.md` — extract security-relevant sections only
 - Note any compliance requirements, auth mechanisms, or trust boundaries from project config
 
 ### Step 2: Identify Review Scope

@@ -1,3 +1,5 @@
+Applies to: `**/*.{ts,tsx,mts,cts}`, `**/tsconfig*.json`, `**/package.json`, `**/eslint.config.*`
+
 # TypeScript Rules
 
 Only non-obvious, shop-specific decisions. Standard TS/testing/security practice is assumed.
@@ -36,7 +38,7 @@ Rules we set beyond the presets:
 ## Dependencies
 
 - **Exact versions in `package.json`** — no `^` or `~`.
-- Every new Node/TS Lambda repo needs an `.npmrc` pointed at the @fullbay AWS CodeArtifact registry before the first PR (see CLAUDE.md → New Lambda Repos). A 404 on `@fullbay/*` is almost always a stale CodeArtifact token, not a missing package.
+- Every new Node/TS Lambda repo needs an `.npmrc` pointed at the @fullbay AWS CodeArtifact registry before the first PR (see AGENTS.md → New Lambda Repos). A 404 on `@fullbay/*` is almost always a stale CodeArtifact token, not a missing package.
 
 ## Tests
 

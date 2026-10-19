@@ -131,6 +131,8 @@ For each applicable ADR:
 
 - **INFO:** Observations or improvement suggestions
 
+Rate a finding CRITICAL or HIGH only if it breaks correctness, data safety, security, or a stated requirement. Style, extra abstraction, and defensive hardening are MEDIUM or LOW at most.
+
 ## Output Format
 
 Generate your report in this exact format:

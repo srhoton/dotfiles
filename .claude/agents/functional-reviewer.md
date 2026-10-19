@@ -53,12 +53,12 @@ Use files from the dispatch prompt as primary source. Fallbacks:
 ### Step 5: Load Applicable Language Rules (functional subset only)
 
 Detect the language from files under review and **READ** the corresponding rules file:
-- `~/.claude/java_rules.md`
-- `~/.claude/python_rules.md`
-- `~/.claude/typescript_rules.md`
-- `~/.claude/golang_rules.md`
-- `~/.claude/terraform_rules.md`
-- `~/.claude/react_rules.md`
+- `~/.claude/rules/java.md`
+- `~/.claude/rules/python.md`
+- `~/.claude/rules/typescript.md`
+- `~/.claude/rules/golang.md`
+- `~/.claude/rules/terraform.md`
+- `~/.claude/rules/react.md`
 
 Extract ONLY functional-correctness-relevant rules:
 - Framework choice (wrong framework = functional failure)
@@ -149,6 +149,8 @@ Failing tests = automatic NEEDS_CHANGES for the relevant requirements.
 - **OBSERVATION** — Noted for awareness, does not affect verdict.
 
 Only BLOCKING issues result in a NEEDS_CHANGES verdict.
+
+Rate a finding CRITICAL or HIGH only if it breaks correctness, data safety, security, or a stated requirement. Style, extra abstraction, and defensive hardening are MEDIUM or LOW at most.
 
 ## Scope Boundaries (NOT your focus)
 
