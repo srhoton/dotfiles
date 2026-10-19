@@ -53,17 +53,17 @@ Language and tool rules live in `~/.claude/rules/` and load when matching files 
 ### AWS Commands
 - Before running any AWS CLI command against an environment, confirm the active SSO profile/account matches the intended target (`aws sts get-caller-identity` or check `AWS_PROFILE`). Never assume the default profile is the right one. Pick the profile from this map; an ARN's account id decides it, so match the ARN against the table before the first call:
 
-  | Target | Profile | Account |
+  | Target | Profile you use | Account |
   |---|---|---|
   | dev | `fb-dev-non-prod/Admin` | 147997133155 |
-  | qa | `fb-qa-non-prod/Admin` | 343218192518 |
-  | stage | `fb-stage-non-prod/Admin` | 528757793739 |
-  | prod | `fb-live-us-prod/Admin` | 211125509520 |
-  | demo | `fb-demo-us-prod/Admin` | 979667334065 |
-  | data lake / Athena | `fb-datalake-prod/Admin` | 230514136789 |
+  | qa | `fb-qa-non-prod/ReadOnly` | 343218192518 |
+  | stage | `fb-stage-non-prod/ReadOnly` | 528757793739 |
+  | prod | `fb-live-us-prod/ReadOnly` | 211125509520 |
+  | demo | `fb-demo-us-prod/ReadOnly` | 979667334065 |
+  | data lake / Athena | `fb-datalake-prod/Admin` (no ReadOnly assignment) | 230514136789 |
 
-  "Prod" means `fb-live-us-prod`, never `fb-demo-us-prod`.
-- **Prod is read-only. With `fb-live-us-prod` (account 211125509520) you NEVER modify data** — no DynamoDB/S3/RDS writes or deletes, no Step Functions starts, stops, or redrives, no Lambda invokes that write, no queue sends or purges, no Terraform apply, no console-equivalent mutations. Only describe/get/list/query/scan and log reads. If a fix needs a prod change, write up the exact change and hand it to me; do not run it, even if asked mid-task to "just fix it".
+  "Prod" means `fb-live-us-prod`, never `fb-demo-us-prod`. The qa/stage/prod/demo `Admin` profiles are for deploys I run myself; never use them, even for a read. If a ReadOnly call is denied, the action needs Admin, so write it up for me instead of switching profiles.
+- **Prod is read-only. With `fb-live-us-prod` (account 211125509520) you NEVER modify data** — no DynamoDB/S3/RDS writes or deletes, no Step Functions starts, stops, or redrives, no Lambda invokes that write, no queue sends or purges, no Terraform apply, no console-equivalent mutations. Only describe/get/list/query/scan and log reads; the `ReadOnly` role enforces this in IAM. If a fix needs a prod change, write up the exact change and hand it to me; do not run it, even if asked mid-task to "just fix it".
 - Confirm the SSO session isn't expired before starting a long AWS/Terraform task — re-authenticate proactively (`aws sso login --profile <p>`) rather than discovering the expiry mid-run on a rejected call or blocked dependency install.
 
 ### AWS Agent Toolkit
