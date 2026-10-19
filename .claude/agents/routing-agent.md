@@ -328,7 +328,7 @@ Implement the following component as part of a larger project:
 **Original Requirements** (verbatim from ./sdlc-plan.md — this is the spec you will be reviewed against):
 [Original Request excerpt + this component's full plan section]
 
-**Before writing code**: read `./sdlc-plan.md` and the project's `CLAUDE.md` / applicable `~/.claude/<lang>_rules.md`; survey existing code in the repo and follow its conventions rather than scaffolding greenfield structure.
+**Before writing code**: read `./sdlc-plan.md` and the project's `CLAUDE.md` / applicable `~/.claude/rules/<lang>.md`; survey existing code in the repo and follow its conventions rather than scaffolding greenfield structure.
 
 **Requirements**:
 1. Write the implementation code following best practices for [technology]

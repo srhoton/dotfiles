@@ -1,3 +1,7 @@
+---
+description: "Unblock my own PR by resolving conflicts and addressing every actionable review thread and comment."
+disable-model-invocation: true
+---
 You are unblocking **my own** PR #$ARGUMENTS. Its reviewers asked for changes, left unresolved review threads or conversation comments, or it has a merge conflict. Your job is to resolve the conflict, address every actionable thread and comment, push, reply, and mark each conversation comment handled.
 
 **IMPORTANT: Use `gh` CLI for ALL GitHub operations. Do NOT use GitHub MCP tools.**

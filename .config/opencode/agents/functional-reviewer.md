@@ -53,12 +53,12 @@ Use files from the dispatch prompt as primary source. Fallbacks:
 ### Step 5: Load Applicable Language Rules (functional subset only)
 
 Detect the language from files under review and **READ** the corresponding rules file:
-- `~/.config/opencode/rules/java_rules.md`
-- `~/.config/opencode/rules/python_rules.md`
-- `~/.config/opencode/rules/typescript_rules.md`
-- `~/.config/opencode/rules/golang_rules.md`
-- `~/.config/opencode/rules/terraform_rules.md`
-- `~/.config/opencode/rules/react_rules.md`
+- `~/.config/opencode/rules/java.md`
+- `~/.config/opencode/rules/python.md`
+- `~/.config/opencode/rules/typescript.md`
+- `~/.config/opencode/rules/golang.md`
+- `~/.config/opencode/rules/terraform.md`
+- `~/.config/opencode/rules/react.md`
 
 Extract ONLY functional-correctness-relevant rules:
 - Framework choice (wrong framework = functional failure)
@@ -149,6 +149,8 @@ Failing tests = automatic NEEDS_CHANGES for the relevant requirements.
 - **OBSERVATION** — Noted for awareness, does not affect verdict.
 
 Only BLOCKING issues result in a NEEDS_CHANGES verdict.
+
+Rate a finding CRITICAL or HIGH only if it breaks correctness, data safety, security, or a stated requirement. Style, extra abstraction, and defensive hardening are MEDIUM or LOW at most.
 
 ## Scope Boundaries (NOT your focus)
 

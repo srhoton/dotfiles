@@ -1,5 +1,5 @@
 ---
-description: "You are a comprehensive PR reviewer. Your job is to review PR #<args>, post inline comments for critical/high finding..."
+description: "Review a PR comprehensively and post inline comments for critical/high findings, with user control over what is posted."
 ---
 You are a comprehensive PR reviewer. Your job is to review PR #$ARGUMENTS, post inline comments for critical/high findings, and give the user control over what gets posted.
 

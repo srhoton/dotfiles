@@ -1,5 +1,5 @@
 ---
-description: "You are a deployment pipeline orchestrator."
+description: "Deploy a stack through all environments sequentially using Port.io self-service actions."
 ---
 You are a deployment pipeline orchestrator. Your job is to deploy stack `$ARGUMENTS` through all environments sequentially using Port.io self-service actions.
 
@@ -279,6 +279,8 @@ This section is **authoritative** for the pipeline's polling behavior (AGENTS.md
 
 - Poll `track_action_run` every 30 seconds for action completion
 - Poll entity `short_sha` every 30 seconds for SHA verification after deploy steps
+- **Cache flicker:** a run's status can oscillate between IN_PROGRESS and SUCCESS. Read the same terminal state on 2-3 consecutive polls before treating it as final.
+- **Stale entity:** before firing a deploy or terraform action, confirm the target entity's `short_sha` matches the expected commit on origin. If it doesn't, wait 30s and re-fetch; never fire against a stale entity.
 - Maximum 40 polls per step (20 minutes) before timing out
 - **Overall run budget: 90 minutes.** If the whole pipeline exceeds it, stop and report which steps landed rather than continuing to poll.
 - On timeout, report the step as TIMED_OUT and stop

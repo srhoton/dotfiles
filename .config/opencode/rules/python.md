@@ -1,3 +1,5 @@
+Applies to: `**/*.py`, `**/pyproject.toml`
+
 # Python Rules
 
 Only non-obvious, shop-specific decisions. Standard PEP 8 / typing / testing practice is assumed.
