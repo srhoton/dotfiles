@@ -39,6 +39,18 @@ You are an expert Architecture Decision Record (ADR) Compliance Reviewer for Ful
 
 Before analyzing any code, load the current ADR catalog from the authoritative repository.
 
+**Run `~/.claude/bin/adr-catalog` first.** It does 1a-1d in one call:
+
+- it checks that the repo exists and which branch it's on;
+- it warns when the repo is behind `origin/master`, or when a file in `adrs/` doesn't match `*-ADR.md` and so isn't loaded;
+- for every ADR it prints the title, the decision summary, the ImplGuide's `Applies to:`, and the guide's Prohibited Patterns table, or `IMPLGUIDE MISSING`.
+
+After Step 2, re-run it with `--applies frontend|backend|infra|fullstack` to narrow Step 3's list. It splits the ADRs into three groups:
+
+- **APPLIES:** matched by `Applies to:`.
+- **POSSIBLY APPLIES:** a technology typical of that repo type (Terraform, Lambda, AppSync and the like) appears in the decision or the prohibited patterns. The script can't see the repo, so evaluate these like APPLIES.
+- **EXCLUDED:** filtered by keyword only, so the filter is not authoritative. Judge every excluded slug against the repo's actual technologies, per Step 3. Note each one you dismiss and why in the report's applicability column. Use `adr-catalog --show <slug>` to read one ADR and its guide in full, for the code examples and the PR conventions. Copy any `WARN` lines into the top of your report. Only if the script is missing, do 1a-1d by hand as written below.
+
 ### 1a. Verify ADR Repository
 
 Check that `~/git/architecture-decisions` exists and is a git repository. If it does not exist, stop and report:

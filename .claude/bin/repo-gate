@@ -1,0 +1,674 @@
+#!/bin/bash
+#
+# repo-gate - run a repo's install/typecheck/lint/test gates in one call.
+#
+# Replaces the "detect the runner, typecheck, lint, run tests, tail the output"
+# dance. Detects every project type at the repo root (a repo can have several),
+# runs each type's gates, prints ONE line per gate, and on failure a short
+# excerpt (failing test names + ~20 lines of the first failure). Full logs go
+# to a temp dir whose path is printed before the final line.
+#
+# Usage:
+#   repo-gate [--changed] [--no-install] [--json] [-C dir]
+#
+#   --changed     Node only: run only tests related to changed files
+#                 (jest --findRelatedTests / vitest related --run). Changed =
+#                 default-branch...HEAD + unstaged + staged + untracked.
+#                 Other project types always run their full suite.
+#   --no-install  Never install dependencies (Node frozen install, terraform init).
+#   --json        Print one JSON object instead of text lines:
+#                 {repo, gates:[{type,gate,status,seconds,detail,excerpt}],
+#                  logDir, status}
+#   -C dir        Run against the git repo containing dir (default: cwd).
+#   -h, --help    Show this help.
+#
+# Project types (all detected at the repo root):
+#   node       package.json. Package manager from the lockfile: pnpm-lock.yaml
+#              (via `mise exec -- pnpm` when a mise config exists and mise is on
+#              PATH), package-lock.json (npm), yarn.lock (yarn).
+#              PACKAGE    package.json must parse (FAIL if not; nothing else runs).
+#              INSTALL    frozen install when node_modules is missing or the lockfile
+#                         is newer than the install marker in node_modules (stale
+#                         deps); with --no-install a stale lockfile is a visible SKIP.
+#              TYPECHECK  package.json typecheck / type-check script, else
+#                         node_modules/.bin/tsc --noEmit when tsconfig.json exists
+#                         (FAIL, not SKIPPED, if tsconfig.json exists but no tsc).
+#              LINT       bin/vet-diff (eslint on changed files + ReDoS check).
+#              TESTS      package.json test script.
+#   gradle     gradlew + build.gradle[.kts]. BUILD = ./gradlew [spotlessApply] build
+#              (spotlessApply REFORMATS source files in the working tree);
+#              counts and failing tests come from build/test-results XML.
+#   go         go.mod. TYPECHECK go build, LINT golangci-lint (if configured),
+#              TESTS go test ./...
+#   python     pyproject.toml. TYPECHECK uv run --frozen mypy, LINT uv run --frozen
+#              ruff check (each only if configured in pyproject), TESTS uv run
+#              --frozen pytest -q. --frozen so a gate never rewrites uv.lock.
+#   terraform  *.tf at the root and/or in terraform/. LINT terraform fmt -check
+#              -recursive, TYPECHECK terraform validate (terraform init
+#              -backend=false first when .terraform is missing; that may create
+#              .terraform.lock.hcl). Never plans.
+#
+# Output: `<TYPE> <GATE> PASS|FAIL|SKIPPED (<duration>) [detail]`, then
+# `logs: <dir>`, then the final line `REPO-GATE: PASS` or
+# `REPO-GATE: FAIL (<n> gates)`. A PASS lists gates that did not run so a green
+# result built from skips is visible: `REPO-GATE: PASS (skipped: node TYPECHECK,
+# node LINT)`. --json carries the same list in a `skipped` array.
+#
+# Exit codes: 0 = no gate failed; 1 = at least one gate failed; 2 = usage error,
+# not a git repo, or no recognizable project.
+#
+# Environment (for tests):
+#   REPO_GATE_FAKE_BIN   directory prepended to PATH (stub pnpm/mise/jest/...)
+#   REPO_GATE_VET_DIFF   path to use instead of the sibling vet-diff
+#
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$SELF"; }
+die_usage() { echo "repo-gate: $1" >&2; echo "usage: repo-gate [--changed] [--no-install] [--json] [-C dir]" >&2; exit 2; }
+
+CHANGED=0; NO_INSTALL=0; JSON=0; DIR="."
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --changed) CHANGED=1 ;;
+    --no-install) NO_INSTALL=1 ;;
+    --json) JSON=1 ;;
+    -C) [ $# -ge 2 ] || die_usage "-C needs a directory"; DIR="$2"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die_usage "unknown argument: $1" ;;
+  esac
+  shift
+done
+
+if [ -n "${REPO_GATE_FAKE_BIN:-}" ]; then PATH="$REPO_GATE_FAKE_BIN:$PATH"; export PATH; fi
+export NO_COLOR=1 FORCE_COLOR=0
+
+[ -d "$DIR" ] || { echo "repo-gate: not a directory: $DIR" >&2; exit 2; }
+ROOT="$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null)" || ROOT=""
+[ -n "$ROOT" ] || { echo "repo-gate: not inside a git repository: $DIR" >&2; exit 2; }
+
+# ---- detect project types ----------------------------------------------------
+has_tf() { compgen -G "$1/*.tf" >/dev/null 2>&1; }
+HAS_NODE=0; HAS_GRADLE=0; HAS_GO=0; HAS_PY=0; TF_DIRS=()
+[ -f "$ROOT/package.json" ] && HAS_NODE=1
+if [ -f "$ROOT/gradlew" ] && { [ -f "$ROOT/build.gradle" ] || [ -f "$ROOT/build.gradle.kts" ]; }; then HAS_GRADLE=1; fi
+[ -f "$ROOT/go.mod" ] && HAS_GO=1
+[ -f "$ROOT/pyproject.toml" ] && HAS_PY=1
+has_tf "$ROOT" && TF_DIRS+=(".")
+has_tf "$ROOT/terraform" && TF_DIRS+=("terraform")
+
+if [ $((HAS_NODE + HAS_GRADLE + HAS_GO + HAS_PY + ${#TF_DIRS[@]})) -eq 0 ]; then
+  echo "repo-gate: no recognizable project at $ROOT (looked for package.json, gradlew+build.gradle, go.mod, pyproject.toml, *.tf)" >&2
+  exit 2
+fi
+
+LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/repo-gate.XXXXXX")" || { echo "repo-gate: cannot create log dir" >&2; exit 2; }
+RESULTS="$LOGDIR/results.tsv"
+: > "$RESULTS"
+FAILS=0
+RUN_DIR="$ROOT"
+LOGTAG=""
+RC=0; SECS=0; LOG=""
+ANSI_SED=$'s/\033\\[[0-9;?]*[A-Za-z]//g'
+
+# ---- plumbing ----------------------------------------------------------------
+fmt_dur() {
+  local s=$1
+  if [ "$s" -ge 60 ]; then printf '%dm%02ds' $((s / 60)) $((s % 60)); else printf '%ds' "$s"; fi
+}
+
+# emit TYPE GATE STATUS SECONDS [DETAIL] [EXCERPT_FILE]  (excerpt used for FAIL only)
+emit() {
+  local type=$1 gate=$2 status=$3 secs=$4 detail=${5:-} ex=${6:-}
+  detail="$(printf '%s' "$detail" | tr '\t\r\n' '   ')"
+  if [ "$status" != FAIL ] || [ ! -s "$ex" ]; then ex=""; fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$type" "$gate" "$status" "$secs" "$detail" "$ex" >> "$RESULTS"
+  if [ "$status" = FAIL ]; then FAILS=$((FAILS + 1)); fi
+  if [ "$JSON" -eq 0 ]; then
+    printf '%s %s %s (%s)%s\n' "$type" "$gate" "$status" "$(fmt_dur "$secs")" "${detail:+ $detail}"
+    if [ -n "$ex" ]; then head -40 "$ex" | sed 's/^/    /'; fi
+  fi
+}
+
+# run_cmd TYPE GATE CMD... : run in $RUN_DIR, log to $LOGDIR; sets RC SECS LOG.
+run_cmd() {
+  local type=$1 gate=$2; shift 2
+  LOG="$LOGDIR/$type-$gate${LOGTAG:+-$LOGTAG}.log"
+  local t0=$SECONDS
+  ( cd "$RUN_DIR" && "$@" ) > "$LOG" 2>&1 < /dev/null
+  RC=$?
+  SECS=$((SECONDS - t0))
+  LC_ALL=C sed "$ANSI_SED" "$LOG" > "$LOG.clean" && mv "$LOG.clean" "$LOG"
+}
+
+# simple_gate TYPE GATE head|tail DETAIL CMD... : PASS on exit 0, else FAIL + excerpt.
+simple_gate() {
+  local type=$1 gate=$2 mode=$3 detail=$4; shift 4
+  run_cmd "$type" "$gate" "$@"
+  if [ "$RC" -eq 0 ]; then
+    emit "$type" "$gate" PASS "$SECS" "$detail"
+  else
+    local ex="$LOG.excerpt"
+    if [ "$mode" = head ]; then head -20 "$LOG" > "$ex"; else tail -20 "$LOG" > "$ex"; fi
+    emit "$type" "$gate" FAIL "$SECS" "${detail:+$detail, }exit $RC" "$ex"
+  fi
+}
+
+count_of() { printf '%s' "$1" | grep -Eo "[0-9]+ $2" | head -1 | grep -Eo '^[0-9]+'; }
+
+# ---- Node --------------------------------------------------------------------
+PKG_PY='
+import json, sys
+# Exit 3 = package.json unusable (distinct from exit 1 = "no such script").
+try:
+    with open(sys.argv[1]) as fh:
+        pkg = json.load(fh)
+    if not isinstance(pkg, dict):
+        raise ValueError("top-level value is not a JSON object")
+    for key in ("scripts", "dependencies", "devDependencies"):
+        if not isinstance(pkg.get(key) or {}, dict):
+            raise ValueError("%s is not a JSON object" % key)
+except Exception as exc:
+    sys.stderr.write("package.json: %s\n" % exc)
+    sys.exit(3)
+mode = sys.argv[2]
+scripts = pkg.get("scripts") or {}
+if mode == "check":
+    sys.exit(0)
+if mode == "has":
+    sys.exit(0 if sys.argv[3] in scripts else 1)
+if mode == "runner":
+    text = str(scripts.get("test", ""))
+    deps = {}
+    deps.update(pkg.get("dependencies") or {})
+    deps.update(pkg.get("devDependencies") or {})
+    for name in ("vitest", "jest"):
+        if name in text:
+            print(name); sys.exit(0)
+    for name in ("vitest", "jest"):
+        if name in deps:
+            print(name); sys.exit(0)
+'
+pkg_has_script() { python3 -c "$PKG_PY" "$ROOT/package.json" has "$1" 2>/dev/null; }
+pkg_check() { python3 -c "$PKG_PY" "$ROOT/package.json" check 2> "$LOGDIR/package-json.err"; }
+pkg_runner() { python3 -c "$PKG_PY" "$ROOT/package.json" runner 2>/dev/null; }
+
+NODE_PM_NAME=npm; NODE_PM=(npm); NODE_LOCK=0; NODE_LOCKFILE=""; NODE_EXEC=(npx --no-install)
+node_detect_pm() {
+  local mise_cfg=0
+  { [ -f "$ROOT/mise.toml" ] || [ -f "$ROOT/.mise.toml" ] || [ -f "$ROOT/.tool-versions" ]; } && mise_cfg=1
+  if [ -f "$ROOT/pnpm-lock.yaml" ]; then
+    NODE_PM_NAME=pnpm; NODE_LOCK=1; NODE_LOCKFILE="$ROOT/pnpm-lock.yaml"
+    if [ "$mise_cfg" -eq 1 ] && command -v mise >/dev/null 2>&1; then NODE_PM=(mise exec -- pnpm); else NODE_PM=(pnpm); fi
+    NODE_EXEC=("${NODE_PM[@]}" exec)
+  elif [ -f "$ROOT/package-lock.json" ]; then
+    NODE_PM_NAME=npm; NODE_PM=(npm); NODE_LOCK=1; NODE_LOCKFILE="$ROOT/package-lock.json"; NODE_EXEC=(npx --no-install)
+  elif [ -f "$ROOT/yarn.lock" ]; then
+    NODE_PM_NAME=yarn; NODE_PM=(yarn); NODE_LOCK=1; NODE_LOCKFILE="$ROOT/yarn.lock"; NODE_EXEC=(yarn)
+  fi
+}
+
+# node_modules_stale: true when the lockfile is newer than the package manager's
+# install marker inside node_modules (a missing marker counts as stale).
+node_modules_stale() {
+  local marker="" m
+  case "$NODE_PM_NAME" in
+    pnpm) set -- "$ROOT/node_modules/.modules.yaml" ;;
+    yarn) set -- "$ROOT/node_modules/.yarn-integrity" "$ROOT/node_modules/.yarn-state.yml" ;;
+    *)    set -- "$ROOT/node_modules/.package-lock.json" ;;
+  esac
+  for m in "$@"; do
+    if [ -f "$m" ]; then marker="$m"; break; fi
+  done
+  [ -n "$marker" ] || return 0
+  [ "$NODE_LOCKFILE" -nt "$marker" ]
+}
+
+default_base() {
+  local b cand
+  b="$(git -C "$ROOT" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+  for cand in ${b:+"$b" "origin/$b"} master main origin/master origin/main; do
+    if git -C "$ROOT" rev-parse --verify -q "$cand^{commit}" >/dev/null 2>&1; then printf '%s' "$cand"; return 0; fi
+  done
+  return 1
+}
+
+CH_FILES=()
+collect_changed_src() {
+  local base f
+  CH_FILES=()
+  base="$(default_base)" || base=""
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      *.ts|*.tsx|*.js|*.jsx|*.mts|*.cts|*.mjs|*.cjs) ;;
+      *) continue ;;
+    esac
+    [ -f "$ROOT/$f" ] || continue
+    CH_FILES+=("$f")
+  done < <( {
+    if [ -n "$base" ]; then git -C "$ROOT" diff --name-only --diff-filter=ACMR "$base"...HEAD 2>/dev/null; fi
+    git -C "$ROOT" diff --name-only --diff-filter=ACMR 2>/dev/null
+    git -C "$ROOT" diff --cached --name-only --diff-filter=ACMR 2>/dev/null
+    git -C "$ROOT" ls-files --others --exclude-standard 2>/dev/null
+  } | sort -u )
+}
+
+# node_excerpt LOG OUT : failing test names (jest bullets, else vitest FAIL/x lines)
+# plus ~20 lines starting at the first failure; falls back to the log tail.
+node_excerpt() {
+  local log=$1 out=$2 names
+  names="$(grep -E '^[[:space:]]*● ' "$log" | grep -v '● Console' | sed -E 's/^[[:space:]]*● //' | awk '!s[$0]++' | head -15)"
+  if [ -z "$names" ]; then
+    names="$(grep -E '^[[:space:]]*(FAIL|×)[[:space:]]' "$log" | sed -E 's/^[[:space:]]*(FAIL|×)[[:space:]]+//' | awk '!s[$0]++' | head -15)"
+  fi
+  {
+    if [ -n "$names" ]; then
+      echo "Failing tests:"
+      printf '%s\n' "$names" | sed 's/^/  - /'
+      echo "First failure:"
+      awk '!f && /^[[:space:]]*(● |FAIL|×)/ && !/● Console/ {f=1} f {print; if (++n >= 20) exit}' "$log" | sed 's/^/  /'
+    else
+      echo "Output tail:"
+      tail -20 "$log" | sed 's/^/  /'
+    fi
+  } > "$out"
+}
+
+node_tests() {
+  if ! pkg_has_script test; then emit node TESTS SKIPPED 0 "no test script"; return; fi
+  local suffix="" runner
+  local -a cmd
+  cmd=("${NODE_PM[@]}" run test)
+  if [ "$CHANGED" -eq 1 ]; then
+    collect_changed_src
+    if [ "${#CH_FILES[@]}" -eq 0 ]; then emit node TESTS SKIPPED 0 "--changed: no changed source files"; return; fi
+    runner="$(pkg_runner)"
+    case "$runner" in
+      jest)
+        cmd=("${NODE_EXEC[@]}" jest --passWithNoTests --findRelatedTests "${CH_FILES[@]}")
+        suffix="jest related to ${#CH_FILES[@]} changed file(s)" ;;
+      vitest)
+        cmd=("${NODE_EXEC[@]}" vitest related --run --passWithNoTests "${CH_FILES[@]}")
+        suffix="vitest related to ${#CH_FILES[@]} changed file(s)" ;;
+      *) suffix="--changed: runner unknown, full suite" ;;
+    esac
+  fi
+  run_cmd node TESTS "${cmd[@]}"
+  local line passed failed skipped detail
+  line="$(grep -E '^[[:space:]]*Tests:?[[:space:]]' "$LOG" | tail -1)"
+  passed="$(count_of "$line" passed)"; failed="$(count_of "$line" failed)"; skipped="$(count_of "$line" skipped)"
+  if [ -n "$line" ]; then
+    detail="${passed:-0} passed, ${failed:-0} failed"
+    if [ -n "$skipped" ] && [ "$skipped" != 0 ]; then detail="$detail, $skipped skipped"; fi
+  else
+    detail=""
+  fi
+  detail="$detail${suffix:+${detail:+ }($suffix)}"
+  if [ "$RC" -eq 0 ]; then
+    emit node TESTS PASS "$SECS" "$detail"
+  else
+    node_excerpt "$LOG" "$LOG.excerpt"
+    emit node TESTS FAIL "$SECS" "${detail:+$detail, }exit $RC" "$LOG.excerpt"
+  fi
+}
+
+node_lint() {
+  local vet="${REPO_GATE_VET_DIFF:-$SELF_DIR/vet-diff}"
+  if [ ! -x "$vet" ]; then emit node LINT SKIPPED 0 "vet-diff not found at $vet"; return; fi
+  run_cmd node LINT "$vet"
+  if [ "$RC" -eq 0 ]; then
+    if grep -q 'nothing to check' "$LOG"; then
+      emit node LINT SKIPPED "$SECS" "no changed JS/TS files"
+    elif grep -q 'eslint — SKIPPED' "$LOG" && ! grep -q 'eslint — clean' "$LOG"; then
+      emit node LINT SKIPPED "$SECS" "$(grep 'eslint — SKIPPED' "$LOG" | head -1 | sed 's/^vet-diff: eslint — SKIPPED //')"
+    else
+      emit node LINT PASS "$SECS" "vet-diff"
+    fi
+  else
+    grep -v '^$' "$LOG" | head -30 > "$LOG.excerpt"
+    emit node LINT FAIL "$SECS" "vet-diff exit $RC" "$LOG.excerpt"
+  fi
+}
+
+run_node() {
+  if ! pkg_check; then
+    emit node PACKAGE FAIL 0 "package.json unparseable" "$LOGDIR/package-json.err"
+    return
+  fi
+  node_detect_pm
+  local install_failed=0 need_install=0 reason=""
+  if [ ! -d "$ROOT/node_modules" ]; then
+    need_install=1; reason="node_modules missing"
+  elif [ "$NODE_LOCK" -eq 1 ] && node_modules_stale; then
+    need_install=1; reason="lockfile newer than node_modules"
+  fi
+  if [ "$need_install" -eq 0 ]; then
+    emit node INSTALL SKIPPED 0 "node_modules present"
+  elif [ "$NO_INSTALL" -eq 1 ]; then
+    if [ "$reason" = "node_modules missing" ]; then
+      emit node INSTALL SKIPPED 0 "--no-install"
+    else
+      emit node INSTALL SKIPPED 0 "$reason (--no-install)"
+    fi
+  elif [ "$NODE_LOCK" -eq 0 ]; then
+    emit node INSTALL SKIPPED 0 "no lockfile; refusing an unfrozen install"
+  else
+    local -a cmd
+    case "$NODE_PM_NAME" in
+      pnpm) cmd=("${NODE_PM[@]}" install --frozen-lockfile) ;;
+      yarn) cmd=(yarn install --immutable) ;;
+      *)    cmd=(npm ci) ;;
+    esac
+    local idetail="${cmd[*]}"
+    [ "$reason" = "node_modules missing" ] || idetail="$idetail ($reason)"
+    simple_gate node INSTALL tail "$idetail" "${cmd[@]}"
+    [ "$RC" -eq 0 ] || install_failed=1
+  fi
+  if [ "$install_failed" -eq 1 ]; then
+    emit node TYPECHECK SKIPPED 0 "install failed"
+    emit node LINT SKIPPED 0 "install failed"
+    emit node TESTS SKIPPED 0 "install failed"
+    return
+  fi
+
+  local tc=""
+  if pkg_has_script typecheck; then tc=typecheck; elif pkg_has_script type-check; then tc=type-check; fi
+  if [ -n "$tc" ]; then
+    simple_gate node TYPECHECK head "script $tc" "${NODE_PM[@]}" run "$tc"
+  elif [ -f "$ROOT/tsconfig.json" ]; then
+    if [ -x "$ROOT/node_modules/.bin/tsc" ]; then
+      simple_gate node TYPECHECK head "tsc --noEmit" ./node_modules/.bin/tsc --noEmit
+    else
+      emit node TYPECHECK FAIL 0 "tsconfig.json present but no tsc (no typecheck script, node_modules/.bin/tsc missing)"
+    fi
+  else
+    emit node TYPECHECK SKIPPED 0 "no typecheck script or tsconfig.json"
+  fi
+
+  node_lint
+  node_tests
+}
+
+# ---- Gradle ------------------------------------------------------------------
+GRADLE_PY='
+import sys, xml.etree.ElementTree as ET
+lst, out = sys.argv[1], sys.argv[2]
+t = f = e = s = bad_files = 0
+names, first = [], None
+def num(v):
+    try:
+        return int(v)
+    except Exception:
+        return 0
+for p in open(lst).read().splitlines():
+    try:
+        root = ET.parse(p).getroot()
+    except Exception:
+        bad_files += 1
+        continue
+    suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
+    for su in suites:
+        if su.tag != "testsuite":
+            continue
+        t += num(su.get("tests")); f += num(su.get("failures"))
+        e += num(su.get("errors")); s += num(su.get("skipped"))
+        for tc in su.iter("testcase"):
+            bad = tc.find("failure")
+            if bad is None:
+                bad = tc.find("error")
+            if bad is not None:
+                names.append("%s.%s" % (tc.get("classname") or "", tc.get("name") or ""))
+                if first is None:
+                    first = ((bad.get("message") or "") + "\n" + (bad.text or "")).strip()
+print(t, f, e, s, bad_files)
+with open(out, "w") as fh:
+    if names:
+        fh.write("Failing tests:\n")
+        for n in names[:15]:
+            fh.write("  - %s\n" % n)
+        fh.write("First failure:\n")
+        for ln in (first or "").splitlines()[:20]:
+            fh.write("  %s\n" % ln)
+'
+
+make_marker() { # backdated 2s so same-second writes still count as newer
+  local m=$1 ts
+  : > "$m"
+  ts="$(date -r $(( $(date +%s) - 2 )) +%Y%m%d%H%M.%S 2>/dev/null)" || ts=""
+  if [ -n "$ts" ]; then touch -t "$ts" "$m" 2>/dev/null; fi
+}
+
+run_gradle() {
+  local -a cmd=(./gradlew build)
+  if grep -Eqs 'spotless' "$ROOT/build.gradle" "$ROOT/build.gradle.kts"; then cmd=(./gradlew spotlessApply build); fi
+  local marker="$LOGDIR/gradle.marker" list="$LOGDIR/gradle-xml.list"
+  make_marker "$marker"
+  run_cmd gradle BUILD "${cmd[@]}"
+  local build_rc=$RC build_secs=$SECS build_log=$LOG
+  find "$ROOT" -type d \( -name node_modules -o -name .git \) -prune -o \
+    -type f -name '*.xml' -path '*/build/test-results/*' -newer "$marker" -print > "$list" 2>/dev/null
+  local detail="" counts t=0 f=0 e=0 s=0 u=0 ex="$build_log.excerpt"
+  if [ -s "$list" ]; then
+    counts="$(python3 -c "$GRADLE_PY" "$list" "$ex" 2>/dev/null)"
+    if [ -z "$counts" ]; then
+      u=1; detail="could not parse test result XML"
+      : > "$ex"
+    else
+      read -r t f e s u <<< "$counts"
+      detail="${t:-0} tests, ${f:-0} failures, ${e:-0} errors, ${s:-0} skipped"
+      if [ "${u:-0}" -gt 0 ]; then detail="$detail, ${u} unparseable result file(s)"; fi
+    fi
+  else
+    detail="no test results found"
+    : > "$ex"
+  fi
+  local bad=$(( ${f:-0} + ${e:-0} + ${u:-0} ))
+  if [ "$build_rc" -eq 0 ] && [ "$bad" -eq 0 ]; then
+    emit gradle BUILD PASS "$build_secs" "$detail"
+    return
+  fi
+  if [ ! -s "$ex" ]; then
+    awk '/What went wrong/ {f=1} f {print; if (++n >= 20) exit}' "$build_log" > "$ex"
+    [ -s "$ex" ] || tail -20 "$build_log" > "$ex"
+  fi
+  [ "$build_rc" -eq 0 ] || detail="$detail, exit $build_rc"
+  emit gradle BUILD FAIL "$build_secs" "$detail" "$ex"
+}
+
+# ---- Go ----------------------------------------------------------------------
+run_go() {
+  simple_gate go TYPECHECK head "go build ./..." go build ./...
+
+  run_cmd go TESTS go test ./...
+  local okp failp failt detail ex="$LOG.excerpt"
+  okp="$(grep -c '^ok' "$LOG")"
+  failp="$(grep -cE '^FAIL[[:space:]]+[^[:space:]]+' "$LOG")"
+  failt="$(grep -cE '^[[:space:]]*--- FAIL' "$LOG")"
+  detail="$okp ok packages, $failp failed packages, $failt failing tests"
+  if [ "$RC" -eq 0 ]; then
+    emit go TESTS PASS "$SECS" "$detail"
+  else
+    {
+      if [ "$failt" -gt 0 ]; then
+        echo "Failing tests:"
+        grep -E '^[[:space:]]*--- FAIL' "$LOG" | sed -E 's/^[[:space:]]*--- FAIL: //' | awk '!s[$0]++' | head -15 | sed 's/^/  - /'
+        echo "First failure:"
+        awk '!f && /^[[:space:]]*--- FAIL/ {f=1} f {print; if (++n >= 20) exit}' "$LOG" | sed 's/^/  /'
+      else
+        echo "Output tail:"
+        tail -20 "$LOG" | sed 's/^/  /'
+      fi
+    } > "$ex"
+    emit go TESTS FAIL "$SECS" "$detail, exit $RC" "$ex"
+  fi
+
+  if { [ -f "$ROOT/.golangci.yml" ] || [ -f "$ROOT/.golangci.yaml" ]; }; then
+    if command -v golangci-lint >/dev/null 2>&1; then
+      simple_gate go LINT head "golangci-lint run" golangci-lint run
+    else
+      emit go LINT SKIPPED 0 "golangci-lint not installed"
+    fi
+  else
+    emit go LINT SKIPPED 0 "no .golangci.yml"
+  fi
+}
+
+# ---- Python ------------------------------------------------------------------
+run_python() {
+  if grep -Eq '^\[tool\.mypy' "$ROOT/pyproject.toml"; then
+    simple_gate python TYPECHECK head "uv run --frozen mypy ." uv run --frozen mypy .
+  else
+    emit python TYPECHECK SKIPPED 0 "mypy not configured in pyproject.toml"
+  fi
+  if grep -Eq '^\[tool\.ruff' "$ROOT/pyproject.toml"; then
+    simple_gate python LINT head "uv run --frozen ruff check ." uv run --frozen ruff check .
+  else
+    emit python LINT SKIPPED 0 "ruff not configured in pyproject.toml"
+  fi
+
+  run_cmd python TESTS uv run --frozen pytest -q
+  local summary p f er sk detail ex="$LOG.excerpt"
+  summary="$(grep -E '[0-9]+ (passed|failed|error)' "$LOG" | grep -E ' in [0-9.]+s' | tail -1)"
+  p="$(count_of "$summary" passed)"; f="$(count_of "$summary" failed)"
+  er="$(count_of "$summary" 'errors?')"; sk="$(count_of "$summary" skipped)"
+  detail=""
+  if [ -n "$summary" ]; then
+    detail="${p:-0} passed, ${f:-0} failed"
+    if [ -n "$er" ] && [ "$er" != 0 ]; then detail="$detail, $er error(s)"; fi
+    if [ -n "$sk" ] && [ "$sk" != 0 ]; then detail="$detail, $sk skipped"; fi
+  fi
+  if [ "$RC" -eq 0 ]; then
+    emit python TESTS PASS "$SECS" "$detail"
+  elif [ "$RC" -eq 5 ]; then
+    emit python TESTS SKIPPED "$SECS" "no tests collected"
+  else
+    {
+      if grep -q '^FAILED ' "$LOG"; then
+        echo "Failing tests:"
+        grep '^FAILED ' "$LOG" | sed 's/^FAILED //' | awk '!s[$0]++' | head -15 | sed 's/^/  - /'
+        echo "First failure:"
+        awk '!f && /^_{3,} .* _{3,}$/ {f=1} f {print; if (++n >= 20) exit}' "$LOG" | sed 's/^/  /'
+      else
+        echo "Output tail:"
+        tail -20 "$LOG" | sed 's/^/  /'
+      fi
+    } > "$ex"
+    emit python TESTS FAIL "$SECS" "${detail:+$detail, }exit $RC" "$ex"
+  fi
+}
+
+# ---- Terraform ---------------------------------------------------------------
+# validate output that means "run terraform init", not "your code is wrong"
+TF_INIT_HINT='Missing required provider|Module not installed|Inconsistent dependency lock file|terraform init|Required plugins are not installed|Module source has changed'
+run_terraform_dir() {
+  local d=$1 label=""
+  if [ "$d" = "." ]; then RUN_DIR="$ROOT"; LOGTAG="root"; else RUN_DIR="$ROOT/$d"; LOGTAG="$d"; label="$d/"; fi
+
+  run_cmd terraform LINT terraform fmt -check -recursive
+  if [ "$RC" -eq 0 ]; then
+    emit terraform LINT PASS "$SECS" "${label}terraform fmt -check"
+  else
+    local n; n="$(grep -c . "$LOG")"
+    head -20 "$LOG" > "$LOG.excerpt"
+    if [ "$RC" -eq 3 ]; then
+      emit terraform LINT FAIL "$SECS" "${label:+$label: }$n file(s) need formatting" "$LOG.excerpt"
+    else
+      emit terraform LINT FAIL "$SECS" "${label:+$label: }fmt exit $RC" "$LOG.excerpt"
+    fi
+  fi
+
+  local init_failed=0 did_init=0
+  if [ ! -d "$RUN_DIR/.terraform" ]; then
+    if [ "$NO_INSTALL" -eq 1 ]; then
+      emit terraform TYPECHECK SKIPPED 0 "${label:+$label: }--no-install and .terraform missing"
+      RUN_DIR="$ROOT"; LOGTAG=""
+      return
+    fi
+    run_cmd terraform INIT terraform init -backend=false -input=false
+    did_init=1
+    if [ "$RC" -ne 0 ]; then
+      tail -20 "$LOG" > "$LOG.excerpt"
+      emit terraform TYPECHECK FAIL "$SECS" "${label:+$label: }init -backend=false exit $RC" "$LOG.excerpt"
+      init_failed=1
+    fi
+  fi
+  if [ "$init_failed" -eq 0 ]; then
+    run_cmd terraform VALIDATE terraform validate
+    local note=""
+    # A stale .terraform (provider/module added since init) is an environment
+    # problem, not a code failure: re-init once and re-validate, or SKIP under
+    # --no-install. Only when we did not just init ourselves.
+    if [ "$RC" -ne 0 ] && [ "$did_init" -eq 0 ] && grep -Eq "$TF_INIT_HINT" "$LOG"; then
+      if [ "$NO_INSTALL" -eq 1 ]; then
+        emit terraform TYPECHECK SKIPPED "$SECS" "${label:+$label: }needs terraform init (stale .terraform)"
+        RUN_DIR="$ROOT"; LOGTAG=""
+        return
+      fi
+      local first_secs=$SECS
+      run_cmd terraform REINIT terraform init -backend=false -input=false
+      if [ "$RC" -ne 0 ]; then
+        tail -20 "$LOG" > "$LOG.excerpt"
+        emit terraform TYPECHECK FAIL "$((first_secs + SECS))" "${label:+$label: }re-init exit $RC" "$LOG.excerpt"
+        RUN_DIR="$ROOT"; LOGTAG=""
+        return
+      fi
+      run_cmd terraform VALIDATE2 terraform validate
+      SECS=$((first_secs + SECS))
+      note="re-initialised"
+    fi
+    if [ "$RC" -eq 0 ]; then
+      emit terraform TYPECHECK PASS "$SECS" "${label}terraform validate${note:+ ($note)}"
+    else
+      head -20 "$LOG" > "$LOG.excerpt"
+      emit terraform TYPECHECK FAIL "$SECS" "${label:+$label: }validate exit $RC${note:+ ($note)}" "$LOG.excerpt"
+    fi
+  fi
+  RUN_DIR="$ROOT"; LOGTAG=""
+}
+
+# ---- main --------------------------------------------------------------------
+[ "$HAS_NODE" -eq 1 ] && run_node
+[ "$HAS_GRADLE" -eq 1 ] && run_gradle
+[ "$HAS_GO" -eq 1 ] && run_go
+[ "$HAS_PY" -eq 1 ] && run_python
+if [ "${#TF_DIRS[@]}" -gt 0 ]; then
+  for tfd in "${TF_DIRS[@]}"; do run_terraform_dir "$tfd"; done
+fi
+
+if [ "$FAILS" -eq 0 ]; then STATUS=PASS; else STATUS=FAIL; fi
+
+# Skipped gates worth surfacing: every SKIPPED gate except a routine INSTALL
+# skip (node_modules present / no lockfile); a stale-lockfile INSTALL skip counts.
+SKIPPED_LIST="$(awk -F'\t' '$3 == "SKIPPED" && ($2 != "INSTALL" || $5 ~ /lockfile newer/) { k = $1 " " $2; if (!seen[k]++) { printf "%s%s", sep, k; sep = ", " } }' "$RESULTS")"
+
+if [ "$JSON" -eq 1 ]; then
+  python3 - "$RESULTS" "$ROOT" "$LOGDIR" "$STATUS" "$SKIPPED_LIST" <<'PY' || { echo "repo-gate: failed to render JSON" >&2; exit 2; }
+import json, sys
+results, repo, logdir, status, skipped = sys.argv[1:6]
+gates = []
+for line in open(results).read().splitlines():
+    f = line.split("\t")
+    f += [""] * (6 - len(f))
+    excerpt = ""
+    if f[5]:
+        with open(f[5]) as fh:
+            excerpt = fh.read()
+    gates.append({"type": f[0], "gate": f[1], "status": f[2], "seconds": int(f[3] or 0),
+                  "detail": f[4], "excerpt": excerpt})
+print(json.dumps({"repo": repo, "gates": gates, "skipped": [x for x in skipped.split(", ") if x],
+                  "logDir": logdir, "status": status}, indent=2))
+PY
+else
+  echo "logs: $LOGDIR"
+  if [ "$FAILS" -eq 0 ]; then
+    echo "REPO-GATE: PASS${SKIPPED_LIST:+ (skipped: $SKIPPED_LIST)}"
+  else
+    echo "REPO-GATE: FAIL ($FAILS gates)"
+  fi
+fi
+
+[ "$FAILS" -eq 0 ] && exit 0
+exit 1

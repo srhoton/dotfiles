@@ -1,0 +1,170 @@
+#!/bin/bash
+#
+# review-context - the git context a reviewer needs, in one call.
+#
+# Replaces the hand-run `git log master..HEAD; git diff master...HEAD --stat;
+# cat defect-classes.md` sequence and /review's changed-file detection.
+#
+# Usage:
+#   review-context [--base BRANCH] [--files-only] [--no-defects] [-C DIR]
+#
+#   --base BRANCH   compare against BRANCH (a local ref, else origin/BRANCH).
+#                   Default: the branch origin/HEAD points at, else master, else main;
+#                   the default prefers origin/<branch> over a possibly stale local one.
+#   --files-only    print ONLY the deduped changed-file list, one path per line,
+#                   relative to the repo root (for feeding the review workflow).
+#   --no-defects    omit the defect-classes checklist (path: $DEFECT_CLASSES, default
+#                   ~/.claude/knowledge/defect-classes.md)
+#   -C DIR          run as if started in DIR
+#   -h, --help      this text
+#
+# Output: repo root, branch, base, merge-base; commits on the branch; branch diff
+# stat; uncommitted (staged / unstaged / untracked) stat; CHANGED FILES = dedup of
+# base...HEAD + unstaged + staged + untracked, minus files that no longer exist on
+# disk (those are listed separately as DELETED); then the defect classes.
+#
+# Exit 0 = ok (an unresolvable base only warns on stderr and skips the branch
+# diff). Exit 2 = not in a git repo, or bad usage. Read-only.
+
+set -uo pipefail
+
+BASE_ARG=""
+FILES_ONLY=0
+NO_DEFECTS=0
+DIR=""
+
+usage() { awk 'NR >= 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base)       [ $# -ge 2 ] || { echo "review-context: --base needs a value" >&2; exit 2; }
+                  BASE_ARG="$2"; shift 2 ;;
+    --files-only) FILES_ONLY=1; shift ;;
+    --no-defects) NO_DEFECTS=1; shift ;;
+    -C)           [ $# -ge 2 ] || { echo "review-context: -C needs a value" >&2; exit 2; }
+                  DIR="$2"; shift 2 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            echo "review-context: unknown argument: $1 (see --help)" >&2; exit 2 ;;
+  esac
+done
+
+if [ -n "$DIR" ]; then
+  cd "$DIR" 2>/dev/null || { echo "review-context: cannot cd to $DIR" >&2; exit 2; }
+fi
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "review-context: not inside a git repository" >&2; exit 2; }
+cd "$ROOT" || exit 2
+
+# ---- resolve the base ---------------------------------------------------------
+# Name the user asked for (or detected); BASE_REF is what git can actually resolve.
+# An explicit --base is taken literally (local ref first). A detected default prefers
+# origin/<name>: a local master that lags origin would otherwise drag already-merged
+# commits into the branch log and diff.
+resolve_ref() {
+  local name="$1" prefer_origin="${2:-0}" first second
+  if [ "$prefer_origin" -eq 1 ]; then first="origin/$name"; second="$name"; else first="$name"; second="origin/$name"; fi
+  if git rev-parse --verify -q "$first^{commit}" >/dev/null 2>&1; then echo "$first"
+  elif git rev-parse --verify -q "$second^{commit}" >/dev/null 2>&1; then echo "$second"
+  fi
+}
+
+BASE_NAME="$BASE_ARG"
+BASE_REF=""
+if [ -n "$BASE_NAME" ]; then
+  BASE_REF="$(resolve_ref "$BASE_NAME")"
+else
+  BASE_NAME="$(git symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
+  [ -n "$BASE_NAME" ] && BASE_REF="$(resolve_ref "$BASE_NAME" 1)"
+  if [ -z "$BASE_REF" ]; then
+    for cand in master main; do
+      BASE_REF="$(resolve_ref "$cand" 1)"
+      if [ -n "$BASE_REF" ]; then BASE_NAME="$cand"; break; fi
+    done
+  fi
+fi
+if [ -z "$BASE_REF" ]; then
+  echo "review-context: WARN base branch '${BASE_NAME:-master/main}' not found; branch diff skipped, listing working-tree changes only" >&2
+fi
+
+# ---- collect changed paths (NUL-safe) ----------------------------------------
+# name-status with --no-renames: a rename is a delete of the old path plus an add of
+# the new one, so the old path is reported as deleted and the new one as changed.
+CANDIDATES=()
+add_name_status() {
+  local status path
+  while IFS= read -r -d '' status && IFS= read -r -d '' path; do
+    CANDIDATES+=("$path")
+  done
+}
+
+if [ -n "$BASE_REF" ]; then
+  add_name_status < <(git diff --name-status -z --no-renames "$BASE_REF"...HEAD 2>/dev/null)
+fi
+add_name_status < <(git diff --name-status -z --no-renames 2>/dev/null)
+add_name_status < <(git diff --cached --name-status -z --no-renames 2>/dev/null)
+while IFS= read -r -d '' path; do CANDIDATES+=("$path"); done \
+  < <(git ls-files --others --exclude-standard -z 2>/dev/null)
+
+CHANGED=()
+DELETED=()
+if [ "${#CANDIDATES[@]}" -gt 0 ]; then
+  while IFS= read -r -d '' path; do
+    if [ -e "$path" ] || [ -L "$path" ]; then CHANGED+=("$path"); else DELETED+=("$path"); fi
+  done < <(printf '%s\0' "${CANDIDATES[@]}" | LC_ALL=C sort -zu)
+fi
+
+if [ "$FILES_ONLY" -eq 1 ]; then
+  [ "${#CHANGED[@]}" -eq 0 ] || printf '%s\n' "${CHANGED[@]}"
+  exit 0
+fi
+
+# ---- report -------------------------------------------------------------------
+BRANCH="$(git branch --show-current 2>/dev/null)"
+echo "REPO:       $ROOT"
+echo "BRANCH:     ${BRANCH:-(detached HEAD)}"
+if [ -n "$BASE_REF" ]; then
+  MB="$(git merge-base "$BASE_REF" HEAD 2>/dev/null)"
+  [ -n "$MB" ] && MB="$(git rev-parse --short "$MB")"
+  echo "BASE:       $BASE_REF"
+  echo "MERGE-BASE: ${MB:-none (unrelated histories)}"
+else
+  echo "BASE:       (not found: ${BASE_NAME:-master/main})"
+  echo "MERGE-BASE: n/a"
+fi
+
+if [ -n "$BASE_REF" ]; then
+  echo
+  echo "=== COMMITS ($BASE_REF..HEAD) ==="
+  LOG="$(git log --oneline "$BASE_REF"..HEAD 2>/dev/null)"
+  echo "${LOG:-(none)}"
+  echo
+  echo "=== BRANCH DIFF STAT ($BASE_REF...HEAD) ==="
+  STAT="$(git diff --stat "$BASE_REF"...HEAD 2>/dev/null)"
+  echo "${STAT:-(none)}"
+fi
+
+echo
+echo "=== UNCOMMITTED ==="
+echo "--- staged ---"
+OUT="$(git diff --cached --stat 2>/dev/null)"; echo "${OUT:-(none)}"
+echo "--- unstaged ---"
+OUT="$(git diff --stat 2>/dev/null)"; echo "${OUT:-(none)}"
+echo "--- untracked ---"
+OUT="$(git ls-files --others --exclude-standard 2>/dev/null)"; echo "${OUT:-(none)}"
+
+echo
+echo "=== CHANGED FILES (${#CHANGED[@]}) ==="
+if [ "${#CHANGED[@]}" -eq 0 ]; then echo "(none)"; else printf '%s\n' "${CHANGED[@]}"; fi
+if [ "${#DELETED[@]}" -gt 0 ]; then
+  echo
+  echo "=== DELETED (${#DELETED[@]}, not in the list above) ==="
+  printf '%s\n' "${DELETED[@]}"
+fi
+
+if [ "$NO_DEFECTS" -eq 0 ]; then
+  DEFECTS="${DEFECT_CLASSES:-$HOME/.claude/knowledge/defect-classes.md}"
+  echo
+  echo "=== DEFECT CLASSES ($DEFECTS) ==="
+  if [ -r "$DEFECTS" ]; then cat "$DEFECTS"; else echo "WARN: defect-classes file not readable: $DEFECTS"; fi
+fi
+exit 0

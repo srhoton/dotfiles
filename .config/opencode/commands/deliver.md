@@ -25,12 +25,12 @@ You orchestrate this phase; the `implementer` agent writes the code. Do not writ
    - the repo root and the files/directories it may change (the Phase 1 scope);
    - the **Gates** below, verbatim.
 3. **Gates** (all must pass before Phase 3):
-   - Typecheck + lint + **full test suite** (`tsc --noEmit`/eslint, or `./gradlew build spotlessApply`, per repo).
+   - Typecheck + lint + **full test suite**: `~/.claude/bin/repo-gate`, which must end `REPO-GATE: PASS`. If that line lists skipped gates, run each skipped gate by hand, or say why it doesn't apply.
    - **Mutation-probe every new/modified test** with `~/.claude/bin/mutation-probe --test '<scoped test cmd>' <changed-prod-file>...` (add `--together` for multi-file atomic fixes). It reverts the production change via file copy — never `git checkout`/`git restore` — confirms the test FAILS against unfixed code, and restores. Any test it reports VACUOUS is rewritten and re-probed. Report the probe output.
    - **Deterministic test doubles only**: no `Math.random`, `Date.now()`, argless `new Date()`, or real timers in stubs — CI runs under coverage and flakes on them.
 4. When the implementer returns:
    - **BLOCKERS that are plan problems:** revise the plan yourself. A design-level change goes back through the Design Gate before you re-dispatch. Re-dispatch with the revised plan and the prior report's concrete errors, never an identical prompt.
-   - **Otherwise, verify instead of trusting the report:** re-run the typecheck and the full test suite yourself, and read the diff.
+   - **Otherwise, verify instead of trusting the report:** re-run `~/.claude/bin/repo-gate` yourself, and read the diff.
 5. Self-check the diff for scope creep (unrequested layers, cleanup handlers, defensive frameworks). Send any descoping back to the implementer as a fix round; don't edit it yourself.
 
 ## Phase 3: Review
@@ -42,7 +42,7 @@ Follow `~/.config/opencode/commands/review.md` exactly — mechanical gate, five
 1. Merge or rebase onto the latest `origin/<default branch>` and re-run the full test suite, so concurrent-merge breakage surfaces locally (AGENTS.md PR rules).
 2. Follow `~/.config/opencode/commands/trueup.md`: commit (message via tempfile + `git commit -F`), attach session prompts via git notes, push, and open the PR with `gh pr create --body-file <tmpfile>` — the body describing the full diff against the target branch.
 3. **Jira** (Atlassian MCP tools, never browser automation): comment the PR link + a one-paragraph summary on `$ARGUMENTS` with `addOrEditJiraIssueComment`; ensure the ticket is linked under its epic (`editJiraIssue`/`createJiraIssueLink`); transition status with `listJiraIssueTransitions` + `transitionJiraIssue` if the workflow expects it. (Rovo MCP v2 names; a v1 server lists these as `addCommentToJiraIssue`, `createIssueLink`, `getTransitionsForJiraIssue`.)
-4. **Monitor CI to green.** Poll with backoff; if CI fails, fix and push (the Phase 3 cap logic applies — don't grind past 2 fix rounds without escalating).
+4. **Monitor CI to green** with `~/.claude/bin/pr-ci-wait <PR#>`. It polls with backoff, needs a terminal state twice before trusting it, and prints the failed jobs' log tails. Exit codes: 0 green, 1 failed, 2 timed out, 3 no checks reported, 4 `gh` itself kept failing. On 2-4, report and escalate; don't start another wait loop. If CI fails, the implementer fixes it, then push (the Phase 3 cap logic applies — don't grind past 2 fix rounds without escalating).
 5. **Review comments**: for each incoming comment, verify the claim against code/data first — refute with evidence if it doesn't hold, fix it if it does (fix discipline applies) — and post a threaded reply on every thread.
 
 ## Wrap-up

@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""pr-review-post: post review findings to a PR as one review plus one fallback comment.
+
+Findings whose (file, line) is a RIGHT-side line of the PR diff (an added or
+context line inside a hunk) go into ONE pull request review as inline comments.
+Findings that are not in the diff go into ONE conversation comment, so nothing
+is dropped. If the review POST fails (for example a 422), every finding is
+re-posted once in the conversation comment (led by the --body-file text, if any).
+That retry exits 0 only when --event is COMMENT; any other event cannot be applied
+to a failed review, so it exits 1 with a WARN. If the review posts but the fallback
+conversation comment then fails, it prints the review URL, warns not to re-run
+without removing that review, and exits 1.
+When run inside a clone of the PR's repo whose HEAD is not the PR head, it warns on
+stderr that line numbers may come from a stale checkout.
+
+Comment body format (same as commands/reviewit.md Step 5):
+  **[SEVERITY]** `file:line`
+
+  <description>
+
+  **Suggested fix:** <suggestion>        (only when a suggestion is given)
+
+  _Reviewed by Claude (<reviewers>)_
+
+Usage: pr-review-post <PR#> <findings.json> [-R owner/repo]
+                      [--event COMMENT|REQUEST_CHANGES|APPROVE]
+                      [--body-file F] [-n]
+  findings.json  {"reviewers": "...", "findings": [{severity, file, line,
+                 description, suggestion?}]} or a bare list of findings
+  -R             repository (default: the repo of the current directory)
+  --event        review event (default COMMENT)
+  --body-file    review body (default: a one-line summary). With no inline
+                 findings the review is only posted when this is given or the
+                 event is not COMMENT.
+  -n             dry run: fetch PR data (read-only), print both payloads, post nothing
+
+Bodies always travel through temp files (`--input` / `--body-file`), never as
+inline arguments. The GH env var overrides the gh binary (default `gh`).
+Exit 0 on success, 1 on a failed post or fetch, 2 on bad usage or input.
+Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+DEFAULT_REVIEWERS = (
+    "functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + "
+    "performance-reviewer + data-side-effects-reviewer"
+)
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+class PostError(Exception):
+    pass
+
+
+class InputError(Exception):
+    pass
+
+
+def gh_bin() -> str:
+    return os.environ.get("GH") or "gh"
+
+
+def gh(args: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run([gh_bin(), *args], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        raise PostError(f"the gh CLI ({gh_bin()}) is not installed or not on PATH") from None
+
+
+def first_line(proc: subprocess.CompletedProcess[str]) -> str:
+    detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+    return detail[0] if detail else f"exit {proc.returncode}"
+
+
+# ---- findings ------------------------------------------------------------------
+
+def load_findings(path: str) -> tuple[str, list[dict[str, Any]]]:
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise InputError(f"cannot read findings {path}: {e}") from None
+    reviewers = DEFAULT_REVIEWERS
+    if isinstance(doc, dict):
+        if isinstance(doc.get("reviewers"), str) and doc["reviewers"].strip():
+            reviewers = doc["reviewers"].strip()
+        doc = doc.get("findings")
+    if not isinstance(doc, list):
+        raise InputError('findings must be a list or {"findings": [...]}')
+    findings = []
+    for n, f in enumerate(doc, 1):
+        if not isinstance(f, dict) or not f.get("file") or not f.get("description"):
+            raise InputError(f"finding {n} needs at least file and description")
+        findings.append(f)
+    return reviewers, findings
+
+
+def finding_line(f: dict[str, Any]) -> int | None:
+    try:
+        line = int(f.get("line"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return line if line > 0 else None
+
+
+def finding_path(f: dict[str, Any]) -> str:
+    path = str(f["file"])
+    return path[2:] if path.startswith("./") else path
+
+
+def comment_body(f: dict[str, Any], reviewers: str) -> str:
+    where = f"{finding_path(f)}:{f.get('line')}" if f.get("line") is not None else finding_path(f)
+    body = f"**[{str(f.get('severity') or 'INFO').upper()}]** `{where}`\n\n{f['description']}"
+    if f.get("suggestion"):
+        body += f"\n\n**Suggested fix:** {f['suggestion']}"
+    return body + f"\n\n_Reviewed by Claude ({reviewers})_"
+
+
+def fallback_body(findings: list[dict[str, Any]], reviewers: str, note: str) -> str:
+    parts = [comment_body(f, reviewers) for f in findings]
+    return f"{note}\n\n" + "\n\n---\n\n".join(parts) + "\n"
+
+
+# ---- diff ----------------------------------------------------------------------
+
+def commentable_lines(patch: str) -> set[int]:
+    """RIGHT-side line numbers a review comment can anchor to: added and context lines."""
+    lines: set[int] = set()
+    right = None
+    # Split on "\n" only: str.splitlines() also breaks on \x0c, \x1c-\x1e, \x85 and U+2028/9,
+    # which can occur inside a source line and would shift every later line number.
+    rows = patch.split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()
+    for raw in rows:
+        m = HUNK.match(raw)
+        if m:
+            right = int(m.group(1))
+            continue
+        if right is None or raw.startswith("\\"):
+            continue
+        if raw.startswith("-"):
+            continue
+        lines.add(right)
+        right += 1
+    return lines
+
+
+def parse_json_stream(text: str) -> list[Any]:
+    """gh api --paginate prints one JSON document per page, concatenated."""
+    decoder = json.JSONDecoder()
+    docs, pos = [], 0
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos >= len(text):
+            return docs
+        doc, pos = decoder.raw_decode(text, pos)
+        docs.append(doc)
+
+
+def fetch_diff_lines(repo: str, number: str) -> dict[str, set[int]]:
+    proc = gh(["api", f"repos/{repo}/pulls/{number}/files", "--paginate"])
+    if proc.returncode != 0:
+        raise PostError(f"fetching PR files failed: {first_line(proc)}")
+    try:
+        pages = parse_json_stream(proc.stdout)
+    except ValueError:
+        raise PostError("PR files response was not JSON") from None
+    out: dict[str, set[int]] = {}
+    for page in pages:
+        for entry in page if isinstance(page, list) else [page]:
+            if isinstance(entry, dict) and entry.get("filename"):
+                out[entry["filename"]] = commentable_lines(entry.get("patch") or "")
+    return out
+
+
+def fetch_head_sha(repo: str, number: str) -> str:
+    proc = gh(["api", f"repos/{repo}/pulls/{number}"])
+    if proc.returncode != 0:
+        raise PostError(f"fetching PR failed: {first_line(proc)}")
+    try:
+        sha = json.loads(proc.stdout)["head"]["sha"]
+    except (ValueError, KeyError, TypeError):
+        raise PostError("PR response had no head.sha") from None
+    return str(sha)
+
+
+def resolve_repo(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    proc = gh(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+    repo = proc.stdout.strip()
+    if proc.returncode != 0 or "/" not in repo:
+        raise PostError("cannot determine the repository; pass -R owner/repo")
+    return repo
+
+
+# ---- posting -------------------------------------------------------------------
+
+def post_review(repo: str, number: str, payload: dict[str, Any], tmp: Path) -> str:
+    path = tmp / "review.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    proc = gh(["api", f"repos/{repo}/pulls/{number}/reviews", "--method", "POST", "--input", str(path)])
+    if proc.returncode != 0:
+        raise PostError(first_line(proc))
+    try:
+        return str(json.loads(proc.stdout).get("html_url") or "(no url returned)")
+    except (ValueError, AttributeError):
+        return "(no url returned)"
+
+
+def post_comment(repo: str, number: str, body: str, tmp: Path, name: str) -> str:
+    path = tmp / name
+    path.write_text(body, encoding="utf-8")
+    proc = gh(["pr", "comment", number, "-R", repo, "--body-file", str(path)])
+    if proc.returncode != 0:
+        raise PostError(first_line(proc))
+    return (proc.stdout.strip().splitlines() or ["(no url returned)"])[-1]
+
+
+def git_out(*args: str) -> str:
+    try:
+        proc = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+REMOTE_SLUG = re.compile(r"[:/]([^/:\s]+)/([^/\s]+?)(?:\.git)?/?$")
+
+
+def in_clone_of(repo: str) -> bool:
+    """True when any git remote points at owner/repo, whatever the host form: https, scp-style
+    (git@github-work:owner/repo.git, an SSH host alias) or ssh://host:443/owner/repo."""
+    for line in git_out("remote", "-v").splitlines():
+        fields = line.split()
+        m = REMOTE_SLUG.search(fields[1]) if len(fields) >= 2 else None
+        if m and f"{m.group(1)}/{m.group(2)}".lower() == repo.lower():
+            return True
+    return False
+
+
+def warn_stale_checkout(repo: str, sha: str) -> None:
+    if in_clone_of(repo):
+        head = git_out("rev-parse", "HEAD")
+        if head and head != sha:
+            print(f"pr-review-post: WARN: local HEAD {head[:12]} is not the PR head {sha[:12]}; "
+                  "line numbers may be from a stale checkout", file=sys.stderr)
+
+
+def relativize_paths(findings: list[dict[str, Any]]) -> None:
+    """Strip the git repo root from absolute finding paths so they match diff filenames."""
+    top = git_out("rev-parse", "--show-toplevel")
+    roots = {top, os.path.realpath(top)} if top else set()
+    for f in findings:
+        path = str(f["file"])
+        if not path.startswith("/"):
+            continue
+        for root in sorted(roots, key=len, reverse=True):
+            if path.startswith(root.rstrip("/") + "/"):
+                f["file"] = path[len(root.rstrip("/")) + 1:]
+                break
+
+
+def split_findings(findings: list[dict[str, Any]], diff: dict[str, set[int]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    inline, fallback = [], []
+    for f in findings:
+        line = finding_line(f)
+        (inline if line is not None and line in diff.get(finding_path(f), set()) else fallback).append(f)
+    return inline, fallback
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="pr-review-post", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("pr", help="pull request number")
+    p.add_argument("findings", help="findings JSON file")
+    p.add_argument("-R", "--repo", metavar="OWNER/REPO", help="repository (default: current directory's repo)")
+    p.add_argument("--event", choices=["COMMENT", "REQUEST_CHANGES", "APPROVE"], default="COMMENT")
+    p.add_argument("--body-file", metavar="F", help="review body file (default: one-line summary)")
+    p.add_argument("-n", "--dry-run", action="store_true", help="print payloads, post nothing")
+    args = p.parse_args(argv)
+    if not args.pr.isdigit():
+        p.error("PR# must be a number")
+    return args
+
+
+def run(args: argparse.Namespace, tmp: Path) -> int:
+    try:
+        reviewers, findings = load_findings(args.findings)
+        review_body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else None
+    except InputError as e:
+        print(f"pr-review-post: {e}", file=sys.stderr)
+        return 2
+    except OSError as e:
+        print(f"pr-review-post: cannot read body file: {e.strerror or e}", file=sys.stderr)
+        return 2
+
+    relativize_paths(findings)
+    repo = resolve_repo(args.repo)
+    sha = fetch_head_sha(repo, args.pr)
+    warn_stale_checkout(repo, sha)
+    inline, fallback = split_findings(findings, fetch_diff_lines(repo, args.pr))
+
+    if review_body is None:
+        review_body = f"Claude review ({reviewers}): {len(inline)} inline finding(s)"
+        if fallback:
+            review_body += f"; {len(fallback)} more in a conversation comment (not in the diff)"
+        review_body += "."
+    payload = {
+        "commit_id": sha,
+        "event": args.event,
+        "body": review_body,
+        "comments": [
+            {"path": finding_path(f), "line": finding_line(f), "side": "RIGHT", "body": comment_body(f, reviewers)}
+            for f in inline
+        ],
+    }
+    send_review = bool(inline) or args.body_file is not None or args.event != "COMMENT"
+    fallback_note = "**Claude review findings not anchored to the PR diff**"
+    comment = fallback_body(fallback, reviewers, fallback_note) if fallback else None
+
+    if args.dry_run:
+        print(f"DRY RUN (nothing posted). PR {repo}#{args.pr}, head {sha}")
+        if send_review:
+            print(f"--- review payload: POST repos/{repo}/pulls/{args.pr}/reviews")
+            print(json.dumps(payload, indent=2))
+        else:
+            print("--- no review (no inline findings, no --body-file, event COMMENT)")
+        if comment:
+            print(f"--- conversation comment body: gh pr comment {args.pr} -R {repo}")
+            print(comment)
+        print(f"would post inline {len(inline)}, fallback {len(fallback)}")
+        return 0
+
+    if not findings and not send_review:
+        print("pr-review-post: no findings, nothing to post")
+        return 0
+
+    url = "-"
+    if send_review:
+        try:
+            url = post_review(repo, args.pr, payload, tmp)
+        except PostError as e:
+            return repost_all(args, repo, findings, reviewers, tmp, e)
+    if comment:
+        try:
+            fb_url = post_comment(repo, args.pr, comment, tmp, "fallback.md")
+        except PostError as e:
+            if send_review:
+                print(f"pr-review-post: inline review already posted ({url}) - do not re-run without "
+                      "removing it, or the inline comments will be duplicated", file=sys.stderr)
+            print(f"pr-review-post: fallback comment failed: {e}; {len(fallback)} finding(s) not posted",
+                  file=sys.stderr)
+            return 1
+        print(f"posted inline {len(inline)}, fallback {len(fallback)}, review {url}, comment {fb_url}")
+    else:
+        print(f"posted inline {len(inline)}, fallback 0, review {url}")
+    return 0
+
+
+def repost_all(args: argparse.Namespace, repo: str, findings: list[dict[str, Any]], reviewers: str,
+               tmp: Path, cause: PostError) -> int:
+    """The review POST failed: put every finding (and the --body-file text) in one conversation comment."""
+    print(f"pr-review-post: review POST failed ({cause}); re-posting all {len(findings)} "
+          "finding(s) as one conversation comment", file=sys.stderr)
+    note = "**Claude review findings** (the inline review could not be posted, so every finding is listed here)"
+    body = fallback_body(findings, reviewers, note)
+    if args.body_file:
+        body = Path(args.body_file).read_text(encoding="utf-8").rstrip("\n") + "\n\n" + body
+    url = post_comment(repo, args.pr, body, tmp, "retry.md")
+    print(f"posted inline 0, fallback {len(findings)} (after review failure), comment {url}")
+    if args.event != "COMMENT":
+        print(f"pr-review-post: WARN: review event {args.event} could not be applied because the review "
+              "POST failed; the findings are in a plain comment only", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    with tempfile.TemporaryDirectory(prefix="pr-review-post-") as d:
+        try:
+            return run(args, Path(d))
+        except PostError as e:
+            print(f"pr-review-post: {e}", file=sys.stderr)
+            return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

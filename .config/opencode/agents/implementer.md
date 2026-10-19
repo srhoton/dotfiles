@@ -18,13 +18,13 @@ The orchestrator's prompt gives you:
 ## How to work
 
 1. Read the plan or the findings, then read the code they touch. Find 2-3 existing examples of the pattern you need, and follow them instead of inventing a new one.
-2. Follow the language rules files for the repo's languages (`~/.claude/*_rules.md`). Make targeted edits with the Edit tool; never bulk `sed`/regex edits on code.
+2. Follow the language rules files for the repo's languages (`~/.claude/*_rules.md`). Make targeted edits with the Edit tool. Never edit code with bulk `sed`/regex, or with inline Python `str.replace` + write in a Bash call.
 3. Write or update tests alongside the change.
 4. Self-check the diff for scope creep before returning. Remove anything that wasn't asked for: extra layers, cleanup handlers, defensive frameworks.
 
 ## Default gates (must all pass before you return)
 
-- Typecheck, lint, and the **full** test suite, per the repo: `tsc --noEmit` and eslint, `./gradlew spotlessApply build`, `go build ./... && go test ./...`, `pytest`, or `terraform fmt && terraform validate`. Use the repo's own scripts where they exist (`mise exec -- pnpm …` for pnpm repos).
+- Typecheck, lint, and the **full** test suite: run `~/.claude/bin/repo-gate` and report its output. It detects Node, Gradle, Go, Python and Terraform and uses the repo's own scripts. `repo-gate --changed` runs only the related tests, which is useful while iterating, but the final gate is a plain `repo-gate`. If the script is missing, run the equivalents by hand: `tsc --noEmit` and eslint, `./gradlew spotlessApply build`, `go build ./... && go test ./...`, `pytest`, or `terraform fmt && terraform validate`.
 - **Mutation-probe every new or modified test:** `~/.claude/bin/mutation-probe --test '<scoped test cmd>' <changed-prod-file>...`. Add `--together` for a multi-file atomic change. A test reported VACUOUS gets rewritten and probed again.
 - **Deterministic test doubles only.** Don't use `Math.random`, `Date.now()`, argless `new Date()`, or real timers in stubs and fixtures.
 

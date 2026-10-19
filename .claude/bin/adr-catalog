@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+#
+# adr-catalog - load the ADR catalog the adr-compliance-reviewer needs (its Step 1).
+#
+# Verifies the ADR repository (exists, is a git repo, on master, not behind
+# origin/master) and prints, for every adrs/*-ADR.md: slug, title, Status (if
+# present), a Decision summary, the matching implGuides/*-ImplGuide.md (or
+# "IMPLGUIDE MISSING"), the guide's "Applies to:" value, and its "Prohibited
+# Patterns" table verbatim. Ends with loaded / with-guide / missing counts.
+#
+# Usage:
+#   adr-catalog [--applies frontend|backend|infra|fullstack] [--show SLUG]
+#               [--no-fetch] [--root DIR]
+#
+#   --applies T   split the catalog for repo type T into three groups:
+#                   APPLIES           the guide's "Applies to:" mentions T (case-
+#                                     insensitive; synonyms: frontend=react/ui/
+#                                     micro-frontend, backend=lambda/java/service/
+#                                     api/appsync, infra=terraform/iac, fullstack=
+#                                     frontend+backend). "all"/"any"/a missing
+#                                     field apply to everything and are marked.
+#                   POSSIBLY APPLIES  not by Applies to, but the Applies-to text,
+#                                     Decision, or Prohibited Patterns mention a T
+#                                     technology (terraform, cloudwatch, eventbridge,
+#                                     dynamodb, react, zustand, ...). Shown in full,
+#                                     marked "[possible: matched <terms>]".
+#                   EXCLUDED          neither; listed by slug + Applies-to value.
+#                 Exclusion is by keyword only: the reviewer must confirm it.
+#   --show SLUG   print the full ADR and full guide for the single ADR whose slug
+#                 contains SLUG (exact slug wins). 0 or >1 matches: list
+#                 candidates, exit 1.
+#   --no-fetch    skip `git fetch -q origin` (offline-tolerant either way: a
+#                 failed fetch only warns)
+#   --root DIR    ADR repository (default: $ADR_ROOT, else ~/git/architecture-decisions)
+#   -h, --help    this text
+#
+# Exit 0 = catalog printed (warnings may be present). Exit 1 = ADR repo missing
+# or unusable, or --show did not resolve to exactly one ADR. Exit 2 = bad usage.
+# Read-only apart from `git fetch`. Standard library only.
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+DEFAULT_ROOT = "~/git/architecture-decisions"
+TYPES = ("frontend", "backend", "infra", "fullstack")
+SUMMARY_LINES = 6
+CONTEXT_LINES = 4
+FETCH_TIMEOUT_S = 30
+
+FRONTEND = r"front-?end|react|\bui\b|micro-?frontend|module federation"
+BACKEND = r"back-?end|lambda|java|quarkus|service|\bapis?\b|appsync"
+TYPE_PATTERNS = {
+    "frontend": FRONTEND,
+    "backend": BACKEND,
+    "infra": r"infra|terraform|\biac\b",
+    "fullstack": rf"full-?stack|{FRONTEND}|{BACKEND}",
+}
+# Technology vocabulary for the POSSIBLY APPLIES group: (label, regex) pairs.
+SERVICE_VOCAB = [
+    ("cloudwatch", r"cloudwatch"), ("alarm", r"\balarms?\b"), ("eventbridge", r"event-?bridge"),
+    ("event bus", r"\bevent buses\b|\bevent bus\b"), ("api gateway", r"api gateway"),
+    ("apigw", r"\bapigw\b"), ("appsync", r"appsync"), ("lambda", r"lambda"),
+    ("dynamodb", r"dynamo-?db"), ("s3", r"\bs3\b"), ("iam", r"\biam\b"), ("sqs", r"\bsqs\b"),
+    ("sns", r"\bsns\b"), ("step function", r"step functions?"), ("sfn", r"\bsfn\b"),
+]
+FRONTEND_VOCAB = [
+    ("react", r"\breact\b|reactdom"), ("ui", r"\bui\b"), ("vite", r"\bvite\b"),
+    ("micro-frontend", r"micro-?frontends?"), ("module federation", r"module federation"),
+    ("zustand", r"zustand"), ("tailwind", r"tailwind"),
+]
+BACKEND_VOCAB = SERVICE_VOCAB + [
+    ("java", r"\bjava\b"), ("quarkus", r"quarkus"), ("api", r"\bapis?\b"),
+    ("service", r"\bservices?\b"), ("graphql", r"graphql"),
+]
+TECH_VOCAB = {
+    "frontend": FRONTEND_VOCAB,
+    "backend": BACKEND_VOCAB,
+    "infra": [("terraform", r"terraform"), ("iac", r"\biac\b")] + SERVICE_VOCAB,
+    "fullstack": [("full-stack", r"full-?stack")] + FRONTEND_VOCAB + BACKEND_VOCAB,
+}
+UNIVERSAL = re.compile(
+    r"^(all|any|everything|\*)"
+    r"( (repos?|repositories|repo types?|types|services|projects|codebases))?$"
+)
+HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+FENCE = re.compile(r"^\s*(```|~~~)")
+APPLIES = re.compile(r"^\s*(?:[-*]\s*)?\*{0,2}Applies to:?\*{0,2}:?\s*(.*?)\s*$", re.I)
+STATUS_INLINE = re.compile(r"^\s*\*{0,2}Status(?::\*{0,2}|\*{0,2}:)\s*(\S.*?)\s*$", re.I)
+
+
+class Usage(Exception):
+    pass
+
+
+def print_help() -> None:
+    lines = Path(__file__).read_text().splitlines()[1:]
+    for line in lines:
+        if not line.startswith("#"):
+            break
+        print(line[2:] if line.startswith("# ") else "")
+
+
+def parse_args(argv: list[str]) -> dict:
+    opts = {"applies": None, "show": None, "fetch": True,
+            "root": os.environ.get("ADR_ROOT") or DEFAULT_ROOT}
+    it = iter(argv)
+    for arg in it:
+        if arg in ("-h", "--help"):
+            print_help()
+            sys.exit(0)
+        elif arg == "--no-fetch":
+            opts["fetch"] = False
+        elif arg in ("--applies", "--show", "--root"):
+            value = next(it, None)
+            if value is None or value.startswith("--"):
+                raise Usage(f"{arg} needs a value")
+            opts[arg[2:]] = value
+        else:
+            raise Usage(f"unknown argument: {arg}")
+    if opts["applies"] is not None and opts["applies"].lower() not in TYPES:
+        raise Usage(f"--applies must be one of: {', '.join(TYPES)}")
+    if opts["applies"]:
+        opts["applies"] = opts["applies"].lower()
+    return opts
+
+
+# ---- git ----------------------------------------------------------------------
+
+def git(root: Path, *args: str, timeout: int | None = None) -> tuple[int, str]:
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o ConnectTimeout=10")
+    try:
+        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                              text=True, check=False, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    except FileNotFoundError:
+        return 127, "git is not installed or not on PATH"
+    return proc.returncode, (proc.stdout if proc.returncode == 0 else proc.stderr or proc.stdout).strip()
+
+
+def repo_header(root: Path, fetch: bool) -> list[str]:
+    """Header lines for the ADR repo: path, branch, and WARN lines. Caller verified it is a git repo."""
+    out = [f"ADR repository: {root}"]
+    warns = []
+    rc, branch = git(root, "branch", "--show-current")
+    branch = branch if rc == 0 else ""
+    out.append(f"Branch: {branch or '(detached HEAD)'}")
+    if branch != "master":
+        warns.append(f"ADR repository is on branch `{branch or 'detached HEAD'}`, not `master`. "
+                     "Compliance results may not reflect the accepted baseline.")
+
+    rc, _ = git(root, "remote", "get-url", "origin")
+    if rc != 0:
+        warns.append("no `origin` remote; cannot check whether the catalog is behind origin/master.")
+    else:
+        if fetch:
+            rc, msg = git(root, "fetch", "-q", "origin", timeout=FETCH_TIMEOUT_S)
+            if rc != 0:
+                first = msg.splitlines()[0] if msg else f"exit {rc}"
+                warns.append(f"`git fetch -q origin` failed ({first}); behind-check uses the last "
+                             "known origin/master and may be stale.")
+        rc, behind = git(root, "rev-list", "--count", "HEAD..origin/master")
+        if rc != 0:
+            warns.append("origin/master not found locally; cannot check whether the catalog is behind it.")
+        elif behind != "0":
+            warns.append(f"ADR repository is {behind} commit(s) behind origin/master. "
+                         f"Run `git -C {root} pull --ff-only` on master for the current accepted baseline.")
+    out += [f"WARN: {w}" for w in warns]
+    return out
+
+
+# ---- markdown parsing ---------------------------------------------------------
+
+def headings(lines: list[str]) -> list[tuple[int, int, str]]:
+    """(line index, level, text) for every heading outside fenced code."""
+    found, fenced = [], False
+    for i, line in enumerate(lines):
+        if FENCE.match(line):
+            fenced = not fenced
+            continue
+        m = None if fenced else HEADING.match(line)
+        if m:
+            found.append((i, len(m.group(1)), m.group(2)))
+    return found
+
+
+def section(lines: list[str], name: str) -> list[str] | None:
+    """Body of the first heading whose text matches `name`, up to the next heading of equal or higher level."""
+    hs = headings(lines)
+    for n, (idx, level, text) in enumerate(hs):
+        if re.match(name, text, re.I):
+            end = len(lines)
+            for nidx, nlevel, _ in hs[n + 1:]:
+                if nlevel <= level:
+                    end = nidx
+                    break
+            return lines[idx + 1:end]
+    return None
+
+
+def title_of(lines: list[str], slug: str) -> str:
+    for line in lines:
+        m = re.match(r"^#\s+(?:ADR:\s*)?(.+?)\s*$", line)
+        if m:
+            return m.group(1)
+    return f"(no title; slug {slug})"
+
+
+def status_of(lines: list[str]) -> str | None:
+    body = section(lines, r"status$")
+    if body:
+        first = next((b.strip() for b in body if b.strip()), "")
+        if first:
+            return first
+    fenced = False
+    for line in lines:
+        if FENCE.match(line):
+            fenced = not fenced
+        m = None if fenced else STATUS_INLINE.match(line)
+        if m:
+            return m.group(1).strip("* ")
+    return None
+
+
+def summary(lines: list[str], heading: str, limit: int) -> list[str]:
+    """First `limit` non-blank lines of the named section, with a marker when truncated."""
+    body = section(lines, rf"{heading}$")
+    if body is None:
+        return [f"(no {heading.capitalize()} section found)"]
+    text = [b.rstrip() for b in body if b.strip()]
+    if not text:
+        return [f"({heading.capitalize()} section is empty)"]
+    out = text[:limit]
+    if len(text) > limit:
+        out.append(f"... (+{len(text) - limit} more lines; use --show)")
+    return out
+
+
+def decision_text(lines: list[str]) -> str:
+    return "\n".join(section(lines, r"decision$") or [])
+
+
+def applies_of(lines: list[str]) -> str | None:
+    for line in lines:
+        m = APPLIES.match(line)
+        if m:
+            return m.group(1) or None
+    return None
+
+
+def prohibited_table(lines: list[str]) -> list[str] | None:
+    """Verbatim `|` rows of the Prohibited Patterns section; None when the section is absent."""
+    body = section(lines, r"prohibited patterns")
+    if body is None:
+        return None
+    return [b.rstrip() for b in body if b.lstrip().startswith("|")]
+
+
+def universal(value: str | None) -> bool:
+    if not value:
+        return True
+    norm = re.sub(r"[`*_]", "", value).strip().rstrip(".;:").lower()
+    return bool(UNIVERSAL.match(norm))
+
+
+# ---- catalog ------------------------------------------------------------------
+
+def load_adrs(root: Path) -> tuple[list[dict], list[str]]:
+    adrs_dir = root / "adrs"
+    files = sorted(adrs_dir.glob("*-ADR.md")) if adrs_dir.is_dir() else []
+    stray = sorted(p.name for p in adrs_dir.glob("*.md") if not p.name.endswith("-ADR.md")) if adrs_dir.is_dir() else []
+    adrs = []
+    for path in files:
+        slug = path.name[: -len("-ADR.md")]
+        lines = path.read_text(errors="replace").splitlines()
+        guide = root / "implGuides" / f"{slug}-ImplGuide.md"
+        glines = guide.read_text(errors="replace").splitlines() if guide.is_file() else None
+        adrs.append({
+            "slug": slug, "path": path, "lines": lines,
+            "title": title_of(lines, slug), "status": status_of(lines),
+            "guide": guide if glines is not None else None,
+            "guide_rel": f"implGuides/{slug}-ImplGuide.md", "glines": glines,
+            "applies": applies_of(glines) if glines is not None else None,
+        })
+    return adrs, stray
+
+
+def tech_terms(adr: dict, kind: str) -> list[str]:
+    """Labels of `kind` technologies mentioned in Applies-to, the Decision, or the Prohibited Patterns rows."""
+    haystack = "\n".join([adr["applies"] or "", decision_text(adr["lines"]),
+                          *(prohibited_table(adr["glines"] or []) or [])])
+    return [label for label, rx in TECH_VOCAB[kind] if re.search(rx, haystack, re.I)]
+
+
+def classify(adr: dict, kind: str | None) -> tuple[str, str]:
+    """(group, marker): group is applies | possible | excluded; marker annotates the Applies to line."""
+    value = adr["applies"]
+    if value is None:
+        return "applies", "[no Applies to: field - treated as applying to everything]"
+    if universal(value):
+        return "applies", "[ALL: treated as applying to everything]"
+    if kind is None:
+        return "applies", ""
+    if re.search(TYPE_PATTERNS[kind], value, re.I):
+        return "applies", f"[matches {kind}]"
+    terms = tech_terms(adr, kind)
+    if terms:
+        return "possible", f"[possible: matched {', '.join(terms)}]"
+    return "excluded", ""
+
+
+def render_adr(adr: dict, marker: str) -> list[str]:
+    head = f"== {adr['slug']}"
+    if adr["status"]:
+        head += f"  [Status: {adr['status']}]"
+    out = [head, f"Title: {adr['title']}", "Context:"]
+    out += [f"  {line}" for line in summary(adr["lines"], "context", CONTEXT_LINES)]
+    out += ["Decision:"]
+    out += [f"  {line}" for line in summary(adr["lines"], "decision", SUMMARY_LINES)]
+    if adr["glines"] is None:
+        out += [f"Guide: IMPLGUIDE MISSING ({adr['guide_rel']})"]
+        out += [f"Applies to: (none - no guide) {marker}".rstrip()]
+        return out + [""]
+    out += [f"Guide: {adr['guide_rel']}"]
+    out += [f"Applies to: {adr['applies'] or '(not stated)'} {marker}".rstrip()]
+    table = prohibited_table(adr["glines"])
+    if table is None:
+        out += ["Prohibited Patterns: (no Prohibited Patterns section in guide)"]
+    elif not table:
+        out += ["Prohibited Patterns: (section present but no table rows)"]
+    else:
+        out += ["Prohibited Patterns:"] + table
+    return out + [""]
+
+
+def show(adrs: list[dict], needle: str) -> int:
+    n = needle.lower()
+    exact = [a for a in adrs if a["slug"].lower() == n]
+    hits = exact or [a for a in adrs if n in a["slug"].lower()]
+    if len(hits) != 1:
+        what = "no ADR slug matches" if not hits else "multiple ADR slugs match"
+        print(f"adr-catalog: {what} '{needle}'.", file=sys.stderr)
+        for a in (hits or adrs):
+            print(f"  {a['slug']}", file=sys.stderr)
+        return 1
+    adr = hits[0]
+    print(f"===== ADR: {adr['path']}")
+    print("\n".join(adr["lines"]))
+    print()
+    if adr["glines"] is None:
+        print(f"===== IMPLGUIDE MISSING: {adr['guide_rel']}")
+    else:
+        print(f"===== GUIDE: {adr['guide']}")
+        print("\n".join(adr["glines"]))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    try:
+        opts = parse_args(argv)
+    except Usage as e:
+        print(f"adr-catalog: {e} (see --help)", file=sys.stderr)
+        return 2
+    root = Path(opts["root"]).expanduser()
+    shown_root = opts["root"] if opts["root"].startswith("~") else str(root)
+    rc, _ = git(root, "rev-parse", "--is-inside-work-tree") if root.is_dir() else (1, "")
+    if rc != 0:
+        print(f"Error: ADR repository not found at `{shown_root}`. "
+              "Clone the repository before running compliance checks.", file=sys.stderr)
+        return 1
+
+    print("\n".join(repo_header(root, opts["fetch"])))
+    adrs, stray = load_adrs(root)
+    if stray:
+        print(f"WARN: {len(stray)} file(s) in adrs/ do not match *-ADR.md and were NOT loaded: "
+              + ", ".join(stray))
+    if not adrs:
+        print("Error: no adrs/*-ADR.md files found; the catalog is empty.", file=sys.stderr)
+        return 1
+    print()
+
+    if opts["show"]:
+        return show(adrs, opts["show"])
+
+    kind = opts["applies"]
+    groups: dict[str, list[tuple[dict, str]]] = {"applies": [], "possible": [], "excluded": []}
+    for adr in adrs:
+        group, marker = classify(adr, kind)
+        groups[group].append((adr, marker))
+
+    titles = {"applies": "APPLIES", "possible": "POSSIBLY APPLIES", "excluded": "EXCLUDED"}
+    for group in ("applies", "possible"):
+        if kind:
+            print(f"### {titles[group]} ({len(groups[group])})\n")
+        for adr, marker in groups[group]:
+            print("\n".join(render_adr(adr, marker)))
+    if kind:
+        print(f"### EXCLUDED ({len(groups['excluded'])})")
+        for adr, _ in groups["excluded"]:
+            print(f"{adr['slug']} | Applies to: {adr['applies']}")
+        print()
+
+    with_guide = sum(1 for a in adrs if a["glines"] is not None)
+    print(f"Loaded: {len(adrs)} | with guide: {with_guide} | IMPLGUIDE MISSING: {len(adrs) - with_guide}")
+    if kind:
+        n = len(groups["excluded"])
+        print(f"Filter --applies {kind}: applies {len(groups['applies'])}, "
+              f"possible {len(groups['possible'])}, excluded {n}")
+        if n:
+            print(f"REVIEWER MUST CONFIRM: the {n} excluded ADRs above were filtered by keyword only.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
