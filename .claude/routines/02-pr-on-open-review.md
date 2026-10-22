@@ -42,7 +42,7 @@ Steps:
 
    QUALITY: hardcoded secrets, missing error handling on external/network/database calls, unbounded loops, eval/exec/dangerouslySetInnerHTML, SQL injection vectors, missing input validation.
 
-   ADR: WebFetch https://api.github.com/repos/fullbay/architecture-decisions/contents/adrs and https://api.github.com/repos/fullbay/architecture-decisions/contents/implGuides. For each changed file, check the matching ImplGuide's "Prohibited Patterns" table for regex/pattern matches in the diff.
+   ADR: WebFetch https://api.github.com/repos/fb-architecture/architecture-decisions/contents/adrs and https://api.github.com/repos/fb-architecture/architecture-decisions/contents/implGuides. For each changed file, check the matching ImplGuide's "Prohibited Patterns" table for regex/pattern matches in the diff.
 
    For each finding, assign severity: CRITICAL (security/correctness bug), HIGH (ADR violation or clear quality issue), MEDIUM (best-practice deviation), LOW (style nit).
 
