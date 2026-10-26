@@ -1,3 +1,7 @@
+---
+description: "Take a Jira ticket all the way to a merge-ready, green-CI PR, pausing once at plan approval."
+disable-model-invocation: true
+---
 You are a ticket-to-PR delivery pipeline. Your job is to take Jira ticket `$ARGUMENTS` all the way to a merge-ready, green-CI PR with the Jira ticket updated — pausing exactly once, at plan approval. Deployment (`/shipit`) is NOT part of this command; it stays a separate, user-triggered step.
 
 This command composes existing assets. Where it says "follow `<file>`", read that file and execute its steps — do not improvise a variant.

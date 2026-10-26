@@ -130,15 +130,24 @@ elif [ -f "go.mod" ]; then
   fi
 
 elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then
-  # Python project
-  echo "Detected Python project. Running ruff format and pytest..." >&2
-  if command -v ruff >/dev/null 2>&1; then
-    ruff format . 2>&1 >&2 || true
+  # Python project. A uv-managed repo (uv.lock present) is checked with the
+  # project's own environment via `uv run`, so tools and dependencies match
+  # the lockfile rather than whatever pytest/ruff happen to be on PATH.
+  if [ -f "uv.lock" ] && command -v uv >/dev/null 2>&1; then
+    echo "Detected uv project. Running ruff format and pytest via uv run..." >&2
+    RUN=(uv run --frozen)
+  else
+    echo "Detected Python project. Running ruff format and pytest..." >&2
+    RUN=()
+  fi
+
+  if [ "${#RUN[@]}" -gt 0 ] || command -v ruff >/dev/null 2>&1; then
+    "${RUN[@]}" ruff format . 2>&1 >&2 || true
     git add -u 2>/dev/null || true
   fi
 
-  if command -v pytest >/dev/null 2>&1; then
-    if ! pytest 2>&1 >&2; then
+  if [ "${#RUN[@]}" -gt 0 ] || command -v pytest >/dev/null 2>&1; then
+    if ! "${RUN[@]}" pytest 2>&1 >&2; then
       echo "ERROR: Tests failed. Fix test failures before committing." >&2
       FAILED=1
     fi

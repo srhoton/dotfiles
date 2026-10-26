@@ -326,7 +326,7 @@ Implement the following component as part of a larger project:
 **Original Requirements** (verbatim from ./sdlc-plan.md — this is the spec you will be reviewed against):
 [Original Request excerpt + this component's full plan section]
 
-**Before writing code**: read `./sdlc-plan.md` and the project's `AGENTS.md` (or `CLAUDE.md`) / applicable `~/.config/opencode/rules/<lang>_rules.md`; survey existing code in the repo and follow its conventions rather than scaffolding greenfield structure.
+**Before writing code**: read `./sdlc-plan.md` and the project's `AGENTS.md` (or `CLAUDE.md`) / applicable `~/.config/opencode/rules/<lang>.md`; survey existing code in the repo and follow its conventions rather than scaffolding greenfield structure.
 
 **Requirements**:
 1. Write the implementation code following best practices for [technology]

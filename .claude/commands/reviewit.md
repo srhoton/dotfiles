@@ -1,3 +1,7 @@
+---
+description: "Review a PR comprehensively and post inline comments for critical/high findings, with user control over what is posted."
+disable-model-invocation: true
+---
 You are a comprehensive PR reviewer. Your job is to review PR #$ARGUMENTS, post inline comments for critical/high findings, and give the user control over what gets posted.
 
 **IMPORTANT: Use `gh` CLI for ALL GitHub operations. Do NOT use GitHub MCP tools.**

@@ -1,3 +1,11 @@
+---
+paths:
+  - "**/*.java"
+  - "**/*.gradle"
+  - "**/*.gradle.kts"
+  - "**/libs.versions.toml"
+---
+
 # Java Rules
 
 Only non-obvious, shop-specific decisions. Standard Java naming/exception/logging practice is assumed.

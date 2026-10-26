@@ -27,7 +27,7 @@ Both are optional — if not provided, the agent performs static review only.
 ### Step 1: Load Context
 
 - Read `AGENTS.md` (or `CLAUDE.md`) for project-specific Lambda configuration, memory targets, latency SLAs
-- Read `~/.config/opencode/rules/java_rules.md` for Quarkus patterns
+- Read `~/.config/opencode/rules/java.md` for Quarkus patterns
 - Read `sdlc-plan.md` if present for architecture context
 - Identify Lambda handler(s), Quarkus configuration, and Terraform/SAM/CDK infra files
 - Extract SSO profile and Lambda ARN from dispatch prompt

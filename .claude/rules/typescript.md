@@ -1,3 +1,11 @@
+---
+paths:
+  - "**/*.{ts,tsx,mts,cts}"
+  - "**/tsconfig*.json"
+  - "**/package.json"
+  - "**/eslint.config.*"
+---
+
 # TypeScript Rules
 
 Only non-obvious, shop-specific decisions. Standard TS/testing/security practice is assumed.

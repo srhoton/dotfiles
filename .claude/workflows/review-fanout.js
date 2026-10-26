@@ -48,10 +48,16 @@ const VERDICT_SCHEMA = {
   },
 }
 
+// Shared severity calibration; part of `header`, so all five reviewers get it (the verify prompt does not).
+const severityNote =
+  'Rate a finding CRITICAL or HIGH only if it breaks correctness, data safety, security, or a stated requirement. ' +
+  'Style, extra abstraction, and defensive hardening are MEDIUM or LOW at most.'
+
 const header =
   `Repo root: ${repoRoot}\n` +
   `Changed files (your ENTIRE review scope):\n${files.map(f => `- ${f}`).join('\n')}\n\n` +
-  `${scopeNote}\n\n`
+  `${scopeNote}\n\n` +
+  `${severityNote}\n\n`
 
 const checklistNote =
   'Additionally check the diff against EVERY defect class in ~/.claude/knowledge/defect-classes.md ' +

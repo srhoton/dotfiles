@@ -1,6 +1,12 @@
+---
+paths:
+  - "**/*.tsx"
+  - "**/vite.config.*"
+---
+
 # React Rules
 
-Only non-obvious, shop-specific decisions. See @~/.claude/typescript_rules.md for TS/ESLint/tsconfig.
+Only non-obvious, shop-specific decisions. See @~/.claude/rules/typescript.md for TS/ESLint/tsconfig.
 
 ## Hard requirement
 

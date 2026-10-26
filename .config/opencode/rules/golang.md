@@ -1,3 +1,5 @@
+Applies to: `**/*.go`, `**/go.mod`, `**/.golangci.yml`
+
 # Go Rules
 
 Only non-obvious, shop-specific decisions. Effective Go / standard error-wrapping / naming conventions are assumed.

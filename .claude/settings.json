@@ -4,7 +4,23 @@
     "AWS_PROFILE": "fb-dev-non-prod/Admin"
   },
   "permissions": {
-    "defaultMode": "auto"
+    "defaultMode": "auto",
+    "deny": [
+      "Bash(aws secretsmanager get-secret-value*)",
+      "Bash(aws secretsmanager batch-get-secret-value*)",
+      "Bash(git commit * --no-verify*)",
+      "Bash(git commit --no-verify*)",
+      "Bash(git push * --no-verify*)",
+      "Bash(git push --no-verify*)",
+      "Bash(git commit -n*)",
+      "Bash(git commit * -n *)",
+      "Bash(git commit * -n)",
+      "Bash(git -C * commit *--no-verify*)",
+      "Bash(git -C * push *--no-verify*)",
+      "Bash(git -C * commit -n*)",
+      "Bash(git -C * commit * -n *)",
+      "Bash(git -C * commit * -n)"
+    ]
   },
   "model": "opus",
   "skillOverrides": {
@@ -117,6 +133,16 @@
             "type": "command",
             "command": "bash $HOME/.claude/hooks/guard-npm-install.sh",
             "timeout": 10000
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|mcp__.*[Aa][Ww][Ss].*run_script",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $HOME/.claude/hooks/guard-prod-readonly.sh",
+            "timeout": 10
           }
         ]
       },
@@ -251,10 +277,10 @@
     "aws-core@agent-toolkit-for-aws": false,
     "aws-data-analytics@agent-toolkit-for-aws": true,
     "discord@claude-plugins-official": false,
-    "gopls-lsp@claude-plugins-official": false,
-    "jdtls-lsp@claude-plugins-official": false,
-    "pyright-lsp@claude-plugins-official": false,
-    "typescript-lsp@claude-plugins-official": false
+    "gopls-lsp@claude-plugins-official": true,
+    "jdtls-lsp@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true
   },
   "extraKnownMarketplaces": {
     "agent-toolkit-for-aws": {

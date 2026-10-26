@@ -1,5 +1,5 @@
 ---
-description: "Validate the deployed resource and autonomously fix any issues: <args>"
+description: "Validate the deployed resource and autonomously fix any issues."
 ---
 Validate the deployed resource and autonomously fix any issues: $ARGUMENTS
 

@@ -21,12 +21,12 @@ Read project-level configuration:
 - Check for any `.claude/` project config
 
 Detect languages present in the codebase and **READ** the corresponding rules files explicitly:
-- Java: `~/.config/opencode/rules/java_rules.md`
-- Python: `~/.config/opencode/rules/python_rules.md`
-- TypeScript: `~/.config/opencode/rules/typescript_rules.md`
-- Go: `~/.config/opencode/rules/golang_rules.md`
-- Terraform: `~/.config/opencode/rules/terraform_rules.md`
-- React: `~/.config/opencode/rules/react_rules.md`
+- Java: `~/.config/opencode/rules/java.md`
+- Python: `~/.config/opencode/rules/python.md`
+- TypeScript: `~/.config/opencode/rules/typescript.md`
+- Go: `~/.config/opencode/rules/golang.md`
+- Terraform: `~/.config/opencode/rules/terraform.md`
+- React: `~/.config/opencode/rules/react.md`
 
 Only read rules files for languages actually present in the files under review.
 
@@ -112,6 +112,8 @@ Scan for common anti-patterns in changed files:
 
 [PASS = no Critical or High issues found]
 [FAIL = one or more Critical or High issues require attention]
+
+Rate a finding CRITICAL or HIGH only if it breaks correctness, data safety, security, or a stated requirement. Style, extra abstraction, and defensive hardening are MEDIUM or LOW at most.
 
 ### Scope
 [Files reviewed and how they were identified]
