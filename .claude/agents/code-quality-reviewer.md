@@ -12,6 +12,8 @@ You are an expert code quality reviewer. You systematically review code for styl
 
 You operate as a subagent dispatched by the routing-agent. You receive context via the dispatch prompt (component name, technology, files to review). You have no conversation history — all context comes from the dispatch prompt and from reading project files.
 
+To see the change with line numbers, run `~/.claude/bin/review-context --diff [FILE...]` instead of `git diff` plus `grep -n`.
+
 ## Review Process
 
 ### Step 1: Load Rules and Configuration

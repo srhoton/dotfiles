@@ -87,11 +87,30 @@ cat > "$STUB" <<'EOS'
 case "$1" in
   repo) echo "acme/repo" ;;
   api)  cat "$STUB_JSON"; exit "${STUB_RC:-0}" ;;
+  pr)   if [ "$2" = view ]; then
+          # The post-diff head recheck. STUB_VIEW_HEADS is a file of one head per call (the
+          # last line repeats); without it the fixture's own headRefOid is returned.
+          echo "$*" >> "$STUB_VIEW_ARGS"
+          [ "${STUB_VIEW_RC:-0}" = 0 ] || { echo "boom: view failed" >&2; exit "$STUB_VIEW_RC"; }
+          if [ -n "${STUB_VIEW_HEADS:-}" ]; then
+            n=$(wc -l < "$STUB_VIEW_ARGS" | tr -d ' ')
+            total=$(wc -l < "$STUB_VIEW_HEADS" | tr -d ' ')
+            [ "$n" -le "$total" ] || n=$total
+            sed -n "${n}p" "$STUB_VIEW_HEADS"
+          else
+            grep -o '"headRefOid": "[^"]*"' "$STUB_JSON" | cut -d'"' -f4
+          fi
+          exit 0
+        fi
+        echo "$*" >> "$STUB_PR_ARGS"
+        [ "${STUB_DIFF_RC:-0}" = 0 ] || { echo "boom: HTTP 406 diff too large" >&2; exit "$STUB_DIFF_RC"; }
+        cat "$STUB_DIFF" ;;
   *)    echo "unexpected gh call: $*" >&2; exit 9 ;;
 esac
 EOS
 chmod +x "$STUB"
 
+export STUB_DIFF="$WORK/pr7.diff" STUB_PR_ARGS="$WORK/pr-args.log" STUB_VIEW_ARGS="$WORK/view-args.log"
 ctx() {  # FIXTURE-NAME [pr-context args...]   (stdout+stderr, run outside any git repo)
   local name="$1"; shift
   ( cd "$WORK" && GH="$STUB" STUB_JSON="$WORK/$name.json" "$CTX" "$@" 2>&1 )
@@ -321,6 +340,288 @@ out=$(ctx matching 7 -R acme/repo)
 expect "outside the repo's clone it says so" "$out" "^local: not this repo$"
 out=$(inrepo matching 7 -R other/repo)
 expect "inside a clone of a different repo it says so" "$out" "^local: not this repo$"
+
+# ---- --body / --diff ------------------------------------------------------------
+# A synthetic multi-file `gh pr diff`: modified (2 hunks, a deleted line, an "@@" inside added
+# content, a no-newline marker), new, deleted, renamed with an edit, and binary.
+cat > "$STUB_DIFF" <<'EOD'
+diff --git a/src/app.ts b/src/app.ts
+index 1111111..2222222 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,4 +1,5 @@
+ import a
+-import b
++import b2
++import c
+ const x = 1
+ const y = 2
+@@ -20,3 +21,4 @@ function f() {
+   return 1
+-}
++// @@ -1 +1 @@ in a comment
++}
+ end
+\ No newline at end of file
+diff --git a/src/new.ts b/src/new.ts
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/src/new.ts
+@@ -0,0 +1,2 @@
++export const n = 1
++export const m = 2
+diff --git a/src/old.ts b/src/old.ts
+deleted file mode 100644
+index 4444444..0000000
+--- a/src/old.ts
++++ /dev/null
+@@ -1,2 +0,0 @@
+-gone one
+-gone two
+diff --git a/src/before.ts b/src/after.ts
+similarity index 90%
+rename from src/before.ts
+rename to src/after.ts
+index 5555555..6666666 100644
+--- a/src/before.ts
++++ b/src/after.ts
+@@ -3,3 +3,3 @@
+ keep
+-old line
++new line
+ keep2
+diff --git a/img/logo.png b/img/logo.png
+index 7777777..8888888 100644
+Binary files a/img/logo.png and b/img/logo.png differ
+EOD
+EXPECT_DIFF='=== src/app.ts (+4 -2) ===
+1|  import a
+    -| -import b
+2| +import b2
+3| +import c
+4|  const x = 1
+5|  const y = 2
+21|    return 1
+    -| -}
+22| +// @@ -1 +1 @@ in a comment
+23| +}
+24|  end
+    \| \ No newline at end of file
+
+=== src/new.ts (+2 -0, new file) ===
+1| +export const n = 1
+2| +export const m = 2
+
+=== src/old.ts (+0 -2, deleted) ===
+    -| -gone one
+    -| -gone two
+
+=== src/after.ts (+1 -1, renamed from src/before.ts) ===
+3|  keep
+    -| -old line
+4| +new line
+5|  keep2
+
+img/logo.png: binary file changed'
+
+fixture bodied 'pr(body="MARK-body first line\n\nsecond paragraph")'
+fixture emptybody 'pr(body="")'
+fixture longbody 'pr(body="x" * 2500 + " MARK-tail")'
+
+# defaults unchanged: no new sections, no gh pr diff call, no new json fields
+rm -f "$STUB_PR_ARGS"
+out=$(ctx bodied 7 -R acme/repo)
+reject "default text has no Numbered diff section" "$out" "## Numbered diff"
+reject "default text has no ## Body section" "$out" "## Body"
+expect "default text still has the old BODY section" "$out" "^BODY$"
+if [ ! -e "$STUB_PR_ARGS" ]; then ok "default run does not call gh pr diff"; else bad "default run called gh pr diff" "$(cat "$STUB_PR_ARGS")"; fi
+printf '%s' "$(ctx bodied 7 -R acme/repo --json)" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert sorted(d) == ["actionable", "changesRequestedBy", "changesRequestedReviews", "checks", "files", "local",
+                     "pr", "repo", "reviews", "skipped", "truncated", "viewer"], sorted(d)
+' && ok "default --json has exactly the original top-level keys" || bad "default --json keys" "$(ctx bodied 7 -R acme/repo --json | head -c 300)"
+
+# --diff
+out=$(ctx bodied 7 -R acme/repo --diff)
+expect "--diff adds a Numbered diff heading" "$out" "^## Numbered diff$"
+got=$(printf '%s\n' "$out" | awk '/^## Numbered diff$/{on=1; next} on')
+if [ "$got" = "$EXPECT_DIFF" ]; then ok "--diff renders every file kind with exact numbering"; else bad "--diff body" "$got"; fi
+expect "--diff asks gh for the PR's diff without colour" "$(cat "$STUB_PR_ARGS")" "^pr diff 7 -R acme/repo --color=never$"
+reject "--diff alone does not add the ## Body section" "$out" "## Body"
+
+# --diff numbering is exactly the set pr-review-post treats as commentable (its dry run is the oracle)
+cat > "$WORK/gh-post" <<'EOS'
+#!/bin/bash
+case "$1 $2" in
+  "api repos/acme/repo/pulls/7") echo '{"head":{"sha":"abc123"}}' ;;
+  "api repos/acme/repo/pulls/7/files") cat "$STUB_FILES" ;;
+  *) echo "unexpected gh call: $*" >&2; exit 9 ;;
+esac
+EOS
+chmod +x "$WORK/gh-post"
+# The files API serves each file's patch (from its first @@ on); binary files have none.
+python3 - "$STUB_DIFF" "$WORK/files.json" "$WORK/findings.json" <<'PY'
+import json, re, sys
+diff, files_out, findings_out = sys.argv[1:4]
+files = []
+for section in re.split(r"(?m)^(?=diff --git )", open(diff).read()):
+    if not section.strip():
+        continue
+    name = re.match(r"diff --git a/\S+ b/(\S+)", section).group(1)
+    entry = {"filename": name}
+    at = section.find("\n@@")
+    if at >= 0:
+        entry["patch"] = section[at + 1:].rstrip("\n")
+    files.append(entry)
+json.dump(files, open(files_out, "w"))
+json.dump({"findings": [{"severity": "low", "file": f["filename"], "line": n, "description": "probe"}
+                        for f in files for n in range(1, 61)]}, open(findings_out, "w"))
+PY
+STUB_FILES="$WORK/files.json" GH="$WORK/gh-post" "$HERE/../pr-review-post" 7 "$WORK/findings.json" -R acme/repo -n > "$WORK/dry.txt" 2>&1
+python3 - "$WORK/dry.txt" "$EXPECT_DIFF" <<'PY' && ok "every +/context line number printed is commentable in pr-review-post, and vice versa" || bad "cross-check against pr-review-post" "$(head -c 600 "$WORK/dry.txt")"
+import json, re, sys
+dry, rendered = open(sys.argv[1]).read(), sys.argv[2]
+payload, _ = json.JSONDecoder().raw_decode(dry, dry.index("{", dry.index("--- review payload")))
+commentable = {(c["path"], c["line"]) for c in payload["comments"]}
+printed, path = set(), None
+for row in rendered.split("\n"):
+    h = re.match(r"^=== (.+?) \(\+\d+ -\d+", row)
+    if h:
+        path = h.group(1)
+    m = re.match(r"^(\d+)\| [+ ]", row)
+    if m:
+        printed.add((path, int(m.group(1))))
+assert printed and printed == commentable, (sorted(printed ^ commentable))
+PY
+
+# the real --diff output, not just the expected text, is what feeds that comparison
+python3 - "$out" "$EXPECT_DIFF" <<'PY' && ok "the rendered section equals the expectation the cross-check used" || bad "section vs expectation" "$out"
+import sys
+assert sys.argv[1].split("## Numbered diff\n", 1)[1] == sys.argv[2]
+PY
+
+# gh pr diff failing (e.g. HTTP 406, diff too large) is loud but keeps the report
+out=$(STUB_DIFF_RC=22 ctx bodied 7 -R acme/repo --diff); rc=$?
+if [ "$rc" = 0 ]; then ok "failing gh pr diff still exits 0"; else bad "failing gh pr diff exit code" "rc=$rc"; fi
+expect "  the rest of the report is printed" "$out" "^PR acme/repo#7"
+expect "  the diff section says it is unavailable and why" "$(printf '%s\n' "$out" | awk '/^## Numbered diff$/{on=1; next} on')" "^unavailable: gh pr diff failed: boom: HTTP 406 diff too large$"
+expect "  a WARNING goes to stderr too" "$out" "^pr-context: WARNING: numbered diff unavailable \(gh pr diff failed: boom"
+out=$(STUB_DIFF_RC=22 ctx bodied 7 -R acme/repo --diff --body)
+expect "  --body still works next to a failed diff" "$out" "^## Body$"
+printf '%s' "$(cd "$WORK" && STUB_DIFF_RC=22 GH="$STUB" STUB_JSON="$WORK/bodied.json" "$CTX" 7 -R acme/repo --json --diff 2>/dev/null)" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["diff"] is None, d["diff"]
+assert d["diff_error"].startswith("gh pr diff failed: boom"), d["diff_error"]
+assert d["pr"]["number"] == 7 and "actionable" in d
+' && ok "  --json: diff is null, diff_error has the reason, report intact" || bad "  json diff failure" "$(STUB_DIFF_RC=22 ctx bodied 7 -R acme/repo --json --diff | head -c 300)"
+printf '%s' "$(ctx bodied 7 -R acme/repo --json --diff)" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert "diff_error" not in d, sorted(d)
+' && ok "  a successful --json --diff has no diff_error field" || bad "  diff_error on success" ""
+
+# The diff is fetched after the GraphQL context, so the head is re-read afterwards: a push
+# in between would leave a diff that does not match pr.headRefOid, and the numbers would
+# anchor review comments to the wrong lines.
+rm -f "$STUB_VIEW_ARGS"
+out=$(ctx bodied 7 -R acme/repo --diff)
+reject "head unchanged during the fetch: no unavailable note" "$out" "unavailable"
+expect "  the recheck asked gh for the PR's headRefOid" "$(cat "$STUB_VIEW_ARGS")" "^pr view 7 -R acme/repo --json headRefOid --jq \.headRefOid$"
+rm -f "$STUB_VIEW_ARGS"; out=$(ctx bodied 7 -R acme/repo)
+if [ ! -e "$STUB_VIEW_ARGS" ]; then ok "  without --diff there is no recheck call"; else bad "recheck without --diff" "$(cat "$STUB_VIEW_ARGS")"; fi
+printf 'bbbbbbb2222222\n' > "$WORK/moved-heads"
+rm -f "$STUB_VIEW_ARGS"
+out=$(STUB_VIEW_HEADS="$WORK/moved-heads" ctx bodied 7 -R acme/repo --diff); rc=$?
+eq_rc() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3" "rc=$1"; fi; }
+eq_rc "$rc" 0 "head moved during the fetch: the report is still printed, exit 0"
+expect "  the diff section says the head moved, with both short SHAs" "$(printf '%s\n' "$out" | awk '/^## Numbered diff$/{on=1; next} on')" "^unavailable: head moved during fetch \(aaaaaaa -> bbbbbbb\); re-run$"
+reject "  no stale diff is shown" "$out" "=== src/app.ts"
+expect "  a WARNING goes to stderr too" "$out" "^pr-context: WARNING: numbered diff unavailable \(head moved during fetch \(aaaaaaa -> bbbbbbb\); re-run\)"
+expect "  the rest of the report is intact" "$out" "^PR acme/repo#7  OPEN"
+printf '%s' "$(cd "$WORK" && STUB_VIEW_HEADS="$WORK/moved-heads" GH="$STUB" STUB_JSON="$WORK/bodied.json" "$CTX" 7 -R acme/repo --json --body --diff 2>/dev/null)" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["diff"] is None, d["diff"]
+assert d["diff_error"] == "head moved during fetch (aaaaaaa -> bbbbbbb); re-run", d["diff_error"]
+assert d["pr"]["headRefOid"] == "aaaaaaaaaaaa1111" and d["body"].startswith("MARK-body"), d["pr"]
+' && ok "  --json: diff null, diff_error names both heads, context and body kept" || bad "json head moved" ""
+out=$(STUB_VIEW_RC=1 ctx bodied 7 -R acme/repo --diff); rc=$?
+eq_rc "$rc" 0 "recheck itself failing: the report is still printed, exit 0"
+expect "  the diff is withheld as unverified, not shown" "$(printf '%s\n' "$out" | awk '/^## Numbered diff$/{on=1; next} on')" "^unavailable: could not re-check the PR head after the diff fetch \(boom: view failed\); re-run$"
+
+# gh output that is not valid UTF-8 (a Latin-1 byte in a diff line or a PR body) is decoded
+# with replacement characters instead of crashing the whole command.
+printf 'diff --git a/src/l.ts b/src/l.ts\n--- a/src/l.ts\n+++ b/src/l.ts\n@@ -1 +1,2 @@\n keep\n+caf\xe9 au lait\n' > "$WORK/latin.diff"
+out=$(STUB_DIFF="$WORK/latin.diff" ctx bodied 7 -R acme/repo --diff); rc=$?
+eq_rc "$rc" 0 "a Latin-1 byte in the gh pr diff output: exit 0, no crash"
+expect "  the line is rendered with the replacement character" "$out" "caf.{1,3} au lait"
+reject "  no Python traceback" "$out" "Traceback|UnicodeDecodeError"
+python3 - "$WORK/bodied.json" "$WORK/bodied-latin.json" <<'PY'
+import sys
+raw = open(sys.argv[1], "rb").read()
+assert b"second paragraph" in raw
+open(sys.argv[2], "wb").write(raw.replace(b"second paragraph", b"s\xe9cond paragraph"))
+PY
+out=$(ctx bodied-latin 7 -R acme/repo --body); rc=$?
+eq_rc "$rc" 0 "a Latin-1 byte in the GraphQL response: exit 0, no crash"
+expect "  the body is rendered with the replacement character" "$out" "s.{1,3}cond paragraph"
+reject "  no Python traceback" "$out" "Traceback|UnicodeDecodeError"
+
+# --only PATH restricts the numbered diff (repeatable; a rename matches by either side)
+out=$(ctx bodied 7 -R acme/repo --diff --only src/new.ts)
+got=$(printf '%s\n' "$out" | awk '/^## Numbered diff$/{on=1; next} on')
+if [ "$got" = "=== src/new.ts (+2 -0, new file) ===
+1| +export const n = 1
+2| +export const m = 2" ]; then ok "--diff --only PATH renders just that file"; else bad "--diff --only" "$got"; fi
+out=$(ctx bodied 7 -R acme/repo --diff --only src/new.ts --only src/before.ts)
+got=$(printf '%s\n' "$out" | awk '/^## Numbered diff$/{on=1; next} on')
+expect "--only is repeatable and matches a rename by its old path" "$got" "^=== src/after.ts \(\+1 -1, renamed from src/before.ts\) ===$"
+expect "  and keeps the other --only file" "$got" "^=== src/new.ts "
+reject "  and leaves out files not asked for" "$got" "src/app.ts|src/old.ts|logo.png"
+printf '%s' "$(ctx bodied 7 -R acme/repo --json --diff --only src/old.ts)" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["diff"] == "=== src/old.ts (+0 -2, deleted) ===\n    -| -gone one\n    -| -gone two", d["diff"]
+' && ok "--json --diff --only filters the diff field" || bad "json --only" ""
+out=$(ctx bodied 7 -R acme/repo --only src/new.ts); rc=$?
+if [ "$rc" != 0 ]; then ok "--only without --diff is a usage error (exit $rc)"; else bad "--only without --diff" "rc=0"; fi
+expect "  and says what is wrong" "$out" "--only needs --diff"
+
+# --body
+out=$(ctx bodied 7 -R acme/repo --body)
+expect "--body adds a Body heading" "$out" "^## Body$"
+expect "  with the description text" "$(section "$out" "## Body")" "MARK-body first line"
+expect "  and its second paragraph" "$out" "^second paragraph$"
+reject "--body alone adds no diff" "$out" "## Numbered diff"
+out=$(ctx emptybody 7 -R acme/repo --body)
+expect "--body with an empty description says so" "$(section "$out" "## Body")" "^\(no description\)$"
+out=$(ctx longbody 7 -R acme/repo)
+reject "default text still truncates a 2500-char body" "$out" "MARK-tail"
+out=$(ctx longbody 7 -R acme/repo --body)
+expect "--body is not truncated" "$out" "MARK-tail$"
+
+# --json
+printf '%s' "$(ctx bodied 7 -R acme/repo --json --body --diff)" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["body"] == "MARK-body first line\n\nsecond paragraph", d["body"]
+assert d["diff"].startswith("=== src/app.ts (+4 -2) ==="), d["diff"][:60]
+assert d["diff"].endswith("img/logo.png: binary file changed"), d["diff"][-60:]
+assert d["pr"]["body"] == d["body"]
+' && ok "--json --body --diff adds string fields body and diff" || bad "json body/diff" "$(ctx bodied 7 -R acme/repo --json --body --diff | head -c 400)"
+printf '%s' "$(ctx bodied 7 -R acme/repo --json --diff)" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert "diff" in d and "body" not in d, sorted(d)
+' && ok "--json --diff alone adds only diff" || bad "json diff only" ""
+printf '%s' "$(ctx emptybody 7 -R acme/repo --json --body)" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["body"] == "" and "diff" not in d, sorted(d)
+' && ok "--json --body with no description gives an empty string" || bad "json empty body" ""
 
 echo
 echo "passed=$PASS failed=$FAIL"

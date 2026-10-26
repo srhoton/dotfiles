@@ -35,8 +35,9 @@ Helper executables on `PATH` for Claude Code workflows.
   - Exit codes: 0 green, 1 failed or cancelled, 2 timed out (`--max-minutes`, default 30), 3 no checks reported, 4 `gh` kept failing.
 - `pr-context` — everything about one PR in one call: header, head SHA vs local HEAD, mergeability, reviews, standing change requests, checks summary, files, and the **actionable** review threads and conversation comments (`--json`, `-R`).
   - "Actionable" uses the classifier in `lib/pr_feedback.py`, the same one `pr-fix-queue` uses, so `/fixit` and the queue agree.
+  - `--body` adds the full PR description. `--diff [--only PATH]` adds the `gh pr diff` with new-file line numbers (the numbers `pr-review-post` accepts as inline anchors); if the diff can't be fetched, or the head moves while fetching, the report still prints with `diff_error` / `unavailable`.
   - Tests: `bin/tests/pr-context.sh`.
-- `pr-review-post` — posts review findings from a JSON file, using the `/reviewit` comment format.
+- `pr-review-post` — posts review findings from a JSON file, using the `/reviewit` comment format. Its patch splitter lives in `lib/numbered_diff.py`.
   - Findings on commentable diff lines go out as **one** PR review; the rest go into one conversation comment, so nothing is lost.
   - If the review POST fails, it retries with every finding in the fallback comment.
   - `-n` is a dry run; `--event`, `--body-file`. Bodies are always sent through files, never `@path`.
@@ -50,6 +51,7 @@ Helper executables on `PATH` for Claude Code workflows.
 - `review-context` — reviewer orientation.
   - Prints the base branch (preferring `origin/<default>`), merge base, commits, diff stat and uncommitted changes, then `~/.claude/knowledge/defect-classes.md`.
   - `--files-only` prints just the deduplicated changed-file list for the review workflow: branch diff, staged, unstaged and untracked, with deleted files left out.
+  - `--diff [-U N] [FILE...]` prints only a numbered diff (merge base to working tree, untracked files as all-added) as `<new-file line>| +added`, so reviewers don't need `git diff` plus `grep -n`. A path that isn't changed exits 3.
   - `--base`, `--no-defects`, `-C`.
 - `sha-relation` — classifies a deployed SHA as ahead/behind/equal for env-drift checks.
 - `stale-prs` — lists open PRs being ignored in the current repo.

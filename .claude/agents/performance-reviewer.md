@@ -12,6 +12,8 @@ Review-only agent. Identifies performance bottlenecks, inefficient patterns, and
 
 Operates as a subagent — receives context via dispatch prompt. No conversation history.
 
+To see the change with line numbers, run `~/.claude/bin/review-context --diff [FILE...]` instead of `git diff` plus `grep -n`.
+
 ## Review Process
 
 ### Step 1: Load Context and Rules

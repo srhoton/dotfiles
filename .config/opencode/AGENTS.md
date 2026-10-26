@@ -41,6 +41,7 @@ Language and tool rules live in `~/.config/opencode/rules/`; each file opens wit
 - Right before opening a PR, merge (or rebase onto) the latest `origin/master`/default branch and re-run the full test suite, so CI breakage from concurrently-merged changes (e.g. strict `toEqual` assertion drift) surfaces locally rather than in the pipeline.
 - For multiline PR bodies, prefer `gh pr create --body-file <tmpfile>` over inline heredocs. Heredocs containing backticks corrupt PR content.
 - Same rule applies to multiline commit messages: write to a tempfile and use `git commit -F <tmpfile>` rather than `-m "$(cat <<EOF ...`.
+- Read a PR with `~/.claude/bin/pr-context <N> [--body] [--diff]` (one call: state, checks, actionable threads, body, numbered diff) rather than several `gh pr view --json` calls.
 - PR comment and review-reply bodies go through `--body-file <tmpfile>` or `gh api ... --input <payload.json>`. `gh` does not expand `@path` in a body argument, so it posts the literal path.
 - Commit, notes and push with `~/.claude/bin/commit-notes` (stages only the paths you name, shows the staged stat, never skips hooks, warns on a stacked or closed PR).
 
