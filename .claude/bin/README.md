@@ -10,6 +10,9 @@ Helper executables on `PATH` for Claude Code workflows.
   - `--applies frontend|backend|infra|fullstack` filters, and lists the ADRs it excluded.
   - `--show <slug>` prints one ADR and its guide in full.
   - `--no-fetch`, `--root`. Read-only apart from `git fetch`.
+- `ca-token` — fetches the CodeArtifact authorization token and caches it under `${XDG_CACHE_HOME:-~/.cache}/claude-bin/` (files 0600, dir 0700) until the earlier of 30 minutes before expiry and 11 hours.
+  - Prints nothing secret by default. `eval "$(ca-token --env gradle|npm)"` puts the token in the environment (`ORG_GRADLE_PROJECT_codeartifactToken` / `AWS_CODEARTIFACT_TOKEN`); `--print` is the explicit opt-in; `--check` tests the cache without calling aws.
+  - A failed fetch never falls back to a stale token: it prints `aws sso login --profile <P>` and exits 4 (3 = usage or no `aws`). `repo-gate` calls it for Gradle and Node repos that need it. Tests: `bin/tests/ca-token.sh`.
 - `agent-msg` — inter-Claude mailbox CLI (legacy filesystem mailbox).
 - `fanout-report` — turns a `review-fanout` workflow output file (the wrapped, bare, or embedded result) into a markdown report under `~/.claude/scratch/<repo>/`.
   - The report holds numbered actionable findings with verified yes/NO, refuted findings with their refutations, informational findings, and skipped reviewers.
@@ -35,6 +38,7 @@ Helper executables on `PATH` for Claude Code workflows.
   - Prints one `PASS`/`FAIL`/`SKIPPED` line per gate with a short excerpt on failure, and ends `REPO-GATE: PASS|FAIL`; a PASS lists any skipped core gates as `PASS (skipped: …)`. Exit 0 or 1, and 2 when there's no project.
   - A stale `.terraform` is re-initialised with `-backend=false`, or reported SKIPPED with `--no-install`.
   - `--changed` runs only the related tests; `--json`, `-C`.
+  - Gradle and Node repos that need a CodeArtifact token get one from `ca-token` automatically when it isn't already set (Node only when an install will run).
 - `review-context` — reviewer orientation.
   - Prints the base branch (preferring `origin/<default>`), merge base, commits, diff stat and uncommitted changes, then `~/.claude/knowledge/defect-classes.md`.
   - `--files-only` prints just the deduplicated changed-file list for the review workflow: branch diff, staged, unstaged and untracked, with deleted files left out.

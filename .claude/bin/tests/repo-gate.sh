@@ -19,6 +19,11 @@ OUT=""; RC=0
 ESC=$(printf '\033')
 
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com
+# a real token in the caller's environment would skip the CodeArtifact cases below
+unset ORG_GRADLE_PROJECT_codeartifactToken AWS_CODEARTIFACT_TOKEN REPO_GATE_CA_TOKEN
+# the caller's ~/.gradle/gradle.properties must not decide the CodeArtifact cases below
+mkdir -p "$WORK/gradle-home"
+export GRADLE_USER_HOME="$WORK/gradle-home"
 
 ok()  { PASS=$((PASS + 1)); echo "PASS  $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL  $1"; echo "      $2"; echo "$OUT" | sed 's/^/      | /' | head -40; }
@@ -609,6 +614,200 @@ t = [g for g in d["gates"] if g["gate"] == "TESTS"][0]
 print(d["status"], t["type"], t["status"], isinstance(t["seconds"], int), "adds numbers" in t["excerpt"], bool(d["logDir"]), bool(d["repo"]))
 ' 2>&1)
 assert_eq "json - fields populated" "FAIL node FAIL True True True True" "$J"
+
+# ---- 12b. CodeArtifact token (ca-token) -------------------------------------------
+# Fake ca-token: logs its argv, prints the export line for the requested --env, or
+# fails (FAKE_CA_MODE=fail) with a login hint, or prints junk (FAKE_CA_MODE=junk).
+# All values are synthetic.
+CA_TOK="FAKE-CA-TOKEN-ZZ9"
+FAKE_CA="$WORK/fake-ca-token"
+cat > "$FAKE_CA" <<'EOF'
+#!/bin/bash
+echo "ca-token $*" >> "$CA_CALLS"
+case "${FAKE_CA_MODE:-ok}" in
+  fail) echo "ca-token: aws codeartifact get-authorization-token failed (exit 255):" >&2
+        echo "ca-token: if the SSO session expired, run: aws sso login --profile fake-profile/Test" >&2
+        exit 4 ;;
+  junk) echo "hello from a broken ca-token"; exit 0 ;;
+esac
+case "$2" in
+  gradle) echo "export ORG_GRADLE_PROJECT_codeartifactToken='FAKE-CA-TOKEN-ZZ9'" ;;
+  npm)    echo "export AWS_CODEARTIFACT_TOKEN='FAKE-CA-TOKEN-ZZ9'" ;;
+esac
+EOF
+chmod +x "$FAKE_CA"
+
+# gradle repo whose gradlew records the token it was given (never prints it)
+ca_gradle_repo() { # name build-file-name build-file-content
+  local d; d=$(newrepo "$1")
+  printf '%s\n' "$3" > "$d/$2"
+  [ "$2" = build.gradle ] || echo "plugins { id 'java' }" > "$d/build.gradle"
+  stub "$d/gradlew" <<'EOF'
+#!/bin/bash
+echo "gradlew $*" >> "$STUB_LOG"
+echo "${ORG_GRADLE_PROJECT_codeartifactToken-<unset>}" > "$STUB_ENV_FILE"
+mkdir -p build/test-results/test
+echo '<testsuite name="x.CaTest" tests="2" skipped="0" failures="0" errors="0"/>' > build/test-results/test/TEST-x.CaTest.xml
+exit 0
+EOF
+}
+CA_GRADLE_BODY="repositories { maven { url 'https://fake-domain-111111111111.d.codeartifact.us-west-2.amazonaws.com/maven/repo/'; credentials { password = codeartifactToken } } }"
+
+# run_ca NAME [args...] : run_gate with fake ca-token + per-case call/env files
+run_ca() {
+  local name=$1; shift
+  CA_CALLS="$WORK/ca-calls-$name.log" STUB_ENV_FILE="$WORK/ca-env-$name.txt" REPO_GATE_CA_TOKEN="${CA_BIN:-$FAKE_CA}" run_gate "$name" "$@"
+}
+
+ca_gradle_repo ca_g build.gradle "$CA_GRADLE_BODY"
+run_ca ca_g
+assert_eq "ca gradle - exit 0" 0 "$RC"
+assert_has "ca gradle - BUILD PASS" "gradle BUILD PASS"
+assert_eq "ca gradle - ca-token invoked once with --env gradle" "ca-token --env gradle" "$(cat "$WORK/ca-calls-ca_g.log" 2>/dev/null)"
+assert_eq "ca gradle - token reached gradlew's environment" "$CA_TOK" "$(cat "$WORK/ca-env-ca_g.txt" 2>/dev/null)"
+assert_lacks "ca gradle - token not in gate stdout" "$CA_TOK"
+assert_eq "ca gradle - token not in any gate log" "" "$(grep -rlF "$CA_TOK" "$WORK/tmp" 2>/dev/null)"
+assert_eq "ca gradle - token not left in the caller's environment" "" "${ORG_GRADLE_PROJECT_codeartifactToken:-}"
+
+# the settings file alone is enough to need a token
+ca_gradle_repo ca_gs settings.gradle.kts "dependencyResolutionManagement { repositories { maven(\"https://x.d.codeartifact.us-west-2.amazonaws.com/maven/r/\") } }"
+run_ca ca_gs
+assert_eq "ca gradle - settings.gradle.kts mention triggers ca-token" "ca-token --env gradle" "$(cat "$WORK/ca-calls-ca_gs.log" 2>/dev/null)"
+assert_eq "ca gradle - settings case token passed" "$CA_TOK" "$(cat "$WORK/ca-env-ca_gs.txt" 2>/dev/null)"
+
+# env var already set: ca-token is not called and the preset value is used
+ca_gradle_repo ca_gp build.gradle "$CA_GRADLE_BODY"
+ORG_GRADLE_PROJECT_codeartifactToken="PRESET-TOKEN-QQ1" run_ca ca_gp
+assert_eq "ca gradle preset - exit 0" 0 "$RC"
+assert_eq "ca gradle preset - ca-token not invoked" "no-calls" "$([ -f "$WORK/ca-calls-ca_gp.log" ] && echo called || echo no-calls)"
+assert_eq "ca gradle preset - gradlew got the preset value" "PRESET-TOKEN-QQ1" "$(cat "$WORK/ca-env-ca_gp.txt" 2>/dev/null)"
+assert_lacks "ca gradle preset - preset token not in stdout" "PRESET-TOKEN-QQ1"
+
+# no CodeArtifact reference: no behaviour change, no call
+ca_gradle_repo ca_gn build.gradle "plugins { id 'java' }"
+run_ca ca_gn
+assert_eq "ca gradle unrelated - exit 0" 0 "$RC"
+assert_eq "ca gradle unrelated - ca-token not invoked" "no-calls" "$([ -f "$WORK/ca-calls-ca_gn.log" ] && echo called || echo no-calls)"
+assert_eq "ca gradle unrelated - no token in gradlew env" "<unset>" "$(cat "$WORK/ca-env-ca_gn.txt" 2>/dev/null)"
+
+# ca-token fails: BUILD FAIL with the login hint, gradlew never runs
+ca_gradle_repo ca_gf build.gradle "$CA_GRADLE_BODY"
+FAKE_CA_MODE=fail run_ca ca_gf
+assert_eq "ca gradle failure - exit 1" 1 "$RC"
+assert_has "ca gradle failure - BUILD FAIL" "gradle BUILD FAIL"
+assert_has "ca gradle failure - login hint in the detail" "aws sso login --profile fake-profile/Test"
+assert_has "ca gradle failure - exit code of ca-token shown" "ca-token exit 4"
+assert_has "ca gradle failure - final line" "REPO-GATE: FAIL (1 gates)"
+assert_eq "ca gradle failure - gradlew not run" "no-run" "$([ -f "$WORK/bin-ca_gf/calls.log" ] && echo ran || echo no-run)"
+
+# codeartifactToken already set in a gradle.properties: Gradle reads it itself, so no fetch
+# (even with a ca-token that would fail), and the build still runs
+printf '# user level\ncodeartifactToken=USER-PROP-VALUE-AA1\n' > "$WORK/gradle-home/gradle.properties"
+ca_gradle_repo ca_gu build.gradle "$CA_GRADLE_BODY"
+FAKE_CA_MODE=fail run_ca ca_gu
+assert_eq "ca gradle user properties - exit 0" 0 "$RC"
+assert_has "ca gradle user properties - BUILD PASS" "gradle BUILD PASS"
+assert_eq "ca gradle user properties - ca-token not invoked" "no-calls" "$([ -f "$WORK/ca-calls-ca_gu.log" ] && echo called || echo no-calls)"
+assert_eq "ca gradle user properties - no token injected into gradlew's env" "<unset>" "$(cat "$WORK/ca-env-ca_gu.txt" 2>/dev/null)"
+assert_lacks "ca gradle user properties - property value not in stdout" "USER-PROP-VALUE-AA1"
+rm -f "$WORK/gradle-home/gradle.properties"
+ca_gradle_repo ca_gq build.gradle "$CA_GRADLE_BODY"
+printf 'org.gradle.jvmargs=-Xmx1g\ncodeartifactToken = PROJ-PROP-VALUE-BB2\n' > "$WORK/ca_gq/gradle.properties"
+FAKE_CA_MODE=fail run_ca ca_gq
+assert_eq "ca gradle project properties - exit 0" 0 "$RC"
+assert_eq "ca gradle project properties - ca-token not invoked" "no-calls" "$([ -f "$WORK/ca-calls-ca_gq.log" ] && echo called || echo no-calls)"
+# a commented-out or empty property is not a token: the fetch still happens, and its failure is still loud
+printf '#codeartifactToken=commented-out\ncodeartifactToken=\n' > "$WORK/gradle-home/gradle.properties"
+ca_gradle_repo ca_gc build.gradle "$CA_GRADLE_BODY"
+FAKE_CA_MODE=fail run_ca ca_gc
+assert_eq "ca gradle commented/empty property - ca-token is still asked" "ca-token --env gradle" "$(cat "$WORK/ca-calls-ca_gc.log" 2>/dev/null)"
+assert_eq "ca gradle commented/empty property - failure still exits 1" 1 "$RC"
+assert_has "ca gradle commented/empty property - BUILD FAIL" "gradle BUILD FAIL"
+rm -f "$WORK/gradle-home/gradle.properties"
+
+# ca-token missing, or printing something that is not the export line
+ca_gradle_repo ca_gm build.gradle "$CA_GRADLE_BODY"
+CA_BIN="$WORK/no-such-ca-token" run_ca ca_gm
+assert_eq "ca gradle missing helper - exit 1" 1 "$RC"
+assert_has "ca gradle missing helper - says where it looked" "ca-token not found at $WORK/no-such-ca-token"
+ca_gradle_repo ca_gj build.gradle "$CA_GRADLE_BODY"
+FAKE_CA_MODE=junk run_ca ca_gj
+assert_eq "ca gradle junk output - exit 1" 1 "$RC"
+assert_has "ca gradle junk output - BUILD FAIL" "gradle BUILD FAIL"
+assert_lacks "ca gradle junk output - junk not echoed" "hello from a broken ca-token"
+
+# node: .npmrc referencing the env var needs a token for install and later gates
+ca_node_repo() { # name npmrc-content
+  node_repo "$1" jest
+  printf '%s\n' "$2" > "$WORK/$1/.npmrc"
+  stub "$WORK/bin-$1/pnpm" <<'EOF'
+#!/bin/bash
+echo "pnpm $*" >> "${STUB_LOG:-/dev/null}"
+echo "${AWS_CODEARTIFACT_TOKEN-<unset>}" >> "$STUB_ENV_FILE"
+if [ "$1" = install ] && [ "${2:-}" = "--frozen-lockfile" ]; then mkdir -p node_modules; exit 0; fi
+if [ "$1" = run ] && [ "${2:-}" = test ]; then cat "$STUB_TEST_OUT"; exit 0; fi
+exit 0
+EOF
+}
+CA_NPMRC='//fake-domain-111111111111.d.codeartifact.us-west-2.amazonaws.com/npm/repo/:_authToken=${AWS_CODEARTIFACT_TOKEN}'
+ca_node_repo ca_n "$CA_NPMRC"
+STUB_TEST_OUT="$JEST_PASS" run_ca ca_n
+assert_eq "ca node - exit 0" 0 "$RC"
+assert_eq "ca node - ca-token invoked once with --env npm" "ca-token --env npm" "$(cat "$WORK/ca-calls-ca_n.log" 2>/dev/null)"
+assert_has "ca node - install ran" "node INSTALL PASS"
+assert_eq "ca node - install and test both saw the token" "$CA_TOK $CA_TOK" "$(tr '\n' ' ' < "$WORK/ca-env-ca_n.txt" | sed 's/ $//')"
+assert_lacks "ca node - token not in gate stdout" "$CA_TOK"
+assert_eq "ca node - token not in any gate log" "" "$(grep -rlF "$CA_TOK" "$WORK/tmp" 2>/dev/null)"
+
+ca_node_repo ca_np "$CA_NPMRC"
+AWS_CODEARTIFACT_TOKEN="PRESET-NPM-QQ2" STUB_TEST_OUT="$JEST_PASS" run_ca ca_np
+assert_eq "ca node preset - exit 0" 0 "$RC"
+assert_eq "ca node preset - ca-token not invoked" "no-calls" "$([ -f "$WORK/ca-calls-ca_np.log" ] && echo called || echo no-calls)"
+assert_file_has "ca node preset - pnpm saw the preset value" "$WORK/ca-env-ca_np.txt" "PRESET-NPM-QQ2"
+
+ca_node_repo ca_nn "registry=https://registry.example.invalid/"
+STUB_TEST_OUT="$JEST_PASS" run_ca ca_nn
+assert_eq "ca node unrelated .npmrc - exit 0" 0 "$RC"
+assert_eq "ca node unrelated .npmrc - ca-token not invoked" "no-calls" "$([ -f "$WORK/ca-calls-ca_nn.log" ] && echo called || echo no-calls)"
+
+ca_node_repo ca_nf "$CA_NPMRC"
+FAKE_CA_MODE=fail STUB_TEST_OUT="$JEST_PASS" run_ca ca_nf
+assert_eq "ca node failure - exit 1" 1 "$RC"
+assert_has "ca node failure - INSTALL FAIL" "node INSTALL FAIL"
+assert_has "ca node failure - login hint" "aws sso login --profile fake-profile/Test"
+assert_has "ca node failure - later gates skipped" "node TESTS SKIPPED (0s) install failed"
+assert_eq "ca node failure - pnpm never ran" "no-run" "$([ -f "$WORK/bin-ca_nf/calls.log" ] && echo ran || echo no-run)"
+
+# no install will run (node_modules current, or --no-install): no token is fetched,
+# so a dead SSO session does not take the offline gates down with it
+ca_node_repo ca_nc "$CA_NPMRC"
+fresh_nm "$WORK/ca_nc" .modules.yaml
+FAKE_CA_MODE=fail STUB_TEST_OUT="$JEST_PASS" run_ca ca_nc
+assert_eq "ca node current node_modules, ca-token failing - exit 0" 0 "$RC"
+assert_has "ca node current node_modules - INSTALL SKIPPED" "node INSTALL SKIPPED (0s) node_modules present"
+assert_has "ca node current node_modules - TESTS still run" "node TESTS PASS"
+assert_lacks "ca node current node_modules - no INSTALL FAIL" "INSTALL FAIL"
+assert_eq "ca node current node_modules - ca-token not invoked" "no-calls" "$([ -f "$WORK/ca-calls-ca_nc.log" ] && echo called || echo no-calls)"
+ca_node_repo ca_nx "$CA_NPMRC"
+fresh_nm "$WORK/ca_nx" .modules.yaml
+touch -t 203001010000 "$WORK/ca_nx/pnpm-lock.yaml"
+FAKE_CA_MODE=fail STUB_TEST_OUT="$JEST_PASS" run_ca ca_nx --no-install
+assert_eq "ca node --no-install with a stale lockfile - ca-token not invoked" "no-calls" "$([ -f "$WORK/ca-calls-ca_nx.log" ] && echo called || echo no-calls)"
+assert_has "ca node --no-install with a stale lockfile - visible INSTALL SKIPPED" "node INSTALL SKIPPED (0s) lockfile newer than node_modules (--no-install)"
+assert_has "ca node --no-install - TESTS still run" "node TESTS PASS"
+ca_node_repo ca_nm "$CA_NPMRC"
+FAKE_CA_MODE=fail STUB_TEST_OUT="$JEST_PASS" run_ca ca_nm --no-install
+assert_eq "ca node --no-install, node_modules missing - ca-token not invoked" "no-calls" "$([ -f "$WORK/ca-calls-ca_nm.log" ] && echo called || echo no-calls)"
+assert_has "ca node --no-install, node_modules missing - INSTALL SKIPPED" "node INSTALL SKIPPED (0s) --no-install"
+# a stale lockfile with installs allowed still needs the token, and still fails loudly without it
+ca_node_repo ca_ns "$CA_NPMRC"
+fresh_nm "$WORK/ca_ns" .modules.yaml
+touch -t 203001010000 "$WORK/ca_ns/pnpm-lock.yaml"
+FAKE_CA_MODE=fail STUB_TEST_OUT="$JEST_PASS" run_ca ca_ns
+assert_eq "ca node stale lockfile, ca-token failing - exit 1" 1 "$RC"
+assert_has "ca node stale lockfile - INSTALL FAIL with the login hint" "aws sso login --profile fake-profile/Test"
+assert_has "ca node stale lockfile - INSTALL FAIL line" "node INSTALL FAIL"
+assert_eq "ca node stale lockfile - ca-token invoked once" "ca-token --env npm" "$(cat "$WORK/ca-calls-ca_ns.log" 2>/dev/null)"
 
 # ---- 13. usage / non-project ----------------------------------------------------
 newrepo empty >/dev/null; echo hi > "$WORK/empty/README.md"

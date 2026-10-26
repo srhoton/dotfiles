@@ -1,0 +1,225 @@
+#!/bin/bash
+#
+# ca-token - fetch (and cache) an AWS CodeArtifact authorization token without
+# ever putting it in tool output.
+#
+# The token is a credential. By default this prints NOTHING secret: just a
+# one-line status. Use it as `eval "$(ca-token --env gradle)"` so the value goes
+# straight into the environment and never appears in a transcript.
+#
+# Usage:
+#   ca-token [--env gradle|npm] [--print] [--profile P] [--domain D]
+#            [--domain-owner O] [--region R] [--refresh] [--check]
+#
+#   (no flags)       fetch or reuse the cached token; print only
+#                    "ca-token: token cached, valid until <UTC timestamp>".
+#   --env gradle     print exactly: export ORG_GRADLE_PROJECT_codeartifactToken='<token>'
+#   --env npm        print exactly: export AWS_CODEARTIFACT_TOKEN='<token>'
+#   --print          print the bare token (explicit opt-in; avoid in transcripts).
+#   --check          no network: exit 0 if a valid cached token exists, 1 if not.
+#                    Prints nothing. Wins over --env/--print/--refresh.
+#   --refresh        ignore the cache and fetch a new token.
+#   --profile P      AWS profile (default fb-common-non-prod/Repository-ReadOnly).
+#   --domain D       CodeArtifact domain (default fullbay).
+#   --domain-owner O domain owner account id (default 851725176053).
+#   --region R       region (default us-west-2).
+#   -h, --help       show this help.
+#
+# Cache: ${XDG_CACHE_HOME:-$HOME/.cache}/claude-bin/ (dir 0700, files 0600), one
+# file per profile|domain|owner|region. A token is reused until the earlier of 30
+# minutes before its expiration and 11 hours after it was fetched. A failed
+# fetch never falls back to a stale or expired cached token.
+#
+# Exit codes: 0 ok (--check: valid cache), 1 --check found no valid cache,
+# 3 usage error or `aws` missing, 4 the fetch failed (expired SSO session, no
+# credentials, bad response). On 4 the exact `aws sso login --profile <P>`
+# command is printed to stderr. No message ever contains the token.
+#
+# Environment:
+#   CA_TOKEN_PROFILE / CA_TOKEN_DOMAIN / CA_TOKEN_OWNER / CA_TOKEN_REGION
+#                      defaults overriding the built-in ones (flags win)
+#   Tests only:
+#   CA_TOKEN_AWS       command to run instead of `aws`
+#   CA_TOKEN_CACHE_DIR cache directory instead of the XDG one
+#   CA_TOKEN_NOW       clock override, epoch seconds
+#
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$SELF"; }
+die_usage() {
+  echo "ca-token: $1" >&2
+  echo "usage: ca-token [--env gradle|npm] [--print] [--profile P] [--domain D] [--domain-owner O] [--region R] [--refresh] [--check]" >&2
+  exit 3
+}
+
+PROFILE="${CA_TOKEN_PROFILE:-fb-common-non-prod/Repository-ReadOnly}"
+DOMAIN="${CA_TOKEN_DOMAIN:-fullbay}"
+OWNER="${CA_TOKEN_OWNER:-851725176053}"
+# us-west-2 is deliberate: the fullbay domain (owner 851725176053) is fetched there,
+# not in the profile's own configured region.
+REGION="${CA_TOKEN_REGION:-us-west-2}"
+AWS="${CA_TOKEN_AWS:-aws}"
+ENVKIND=""; PRINT=0; REFRESH=0; CHECK=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --env)
+      [ $# -ge 2 ] || die_usage "--env needs gradle or npm"
+      case "$2" in gradle|npm) ENVKIND="$2" ;; *) die_usage "--env must be gradle or npm, got: $2" ;; esac
+      shift ;;
+    --print) PRINT=1 ;;
+    --refresh) REFRESH=1 ;;
+    --check) CHECK=1 ;;
+    --profile)      [ $# -ge 2 ] || die_usage "--profile needs a value";      PROFILE="$2"; shift ;;
+    --domain)       [ $# -ge 2 ] || die_usage "--domain needs a value";       DOMAIN="$2"; shift ;;
+    --domain-owner) [ $# -ge 2 ] || die_usage "--domain-owner needs a value"; OWNER="$2"; shift ;;
+    --region)       [ $# -ge 2 ] || die_usage "--region needs a value";       REGION="$2"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die_usage "unknown argument: $1" ;;
+  esac
+  shift
+done
+if [ "$PRINT" -eq 1 ] && [ -n "$ENVKIND" ]; then die_usage "--print and --env are mutually exclusive"; fi
+
+now() {
+  if [ -n "${CA_TOKEN_NOW:-}" ]; then printf '%s' "$CA_TOKEN_NOW"; else date +%s; fi
+}
+NOW="$(now)"
+case "$NOW" in ''|*[!0-9]*) die_usage "CA_TOKEN_NOW must be epoch seconds" ;; esac
+
+fmt_ts() { date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf '%s' "$1"; }
+
+# ---- cache -------------------------------------------------------------------
+CACHE_DIR="${CA_TOKEN_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-bin}"
+hash_key() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum
+  else cksum; fi | cut -c1-16
+}
+# Domains are regional, so the region is part of the key.
+CACHE_FILE="$CACHE_DIR/ca-token-$(printf '%s|%s|%s|%s' "$PROFILE" "$DOMAIN" "$OWNER" "$REGION" | hash_key)"
+
+TOKEN=""; VALID_UNTIL=""
+# cache_load: sets TOKEN and VALID_UNTIL when the cache file holds a token that is
+# still valid at $NOW. File format: line 1 = valid-until epoch, line 2 = token.
+cache_load() {
+  local vu tok
+  [ -f "$CACHE_FILE" ] || return 1
+  { IFS= read -r vu; IFS= read -r tok; } < "$CACHE_FILE" 2>/dev/null || true
+  case "$vu" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$tok" ] || return 1
+  [ "$NOW" -lt "$vu" ] || return 1
+  TOKEN="$tok"; VALID_UNTIL="$vu"
+  return 0
+}
+
+if [ "$CHECK" -eq 1 ]; then
+  if cache_load; then exit 0; fi
+  exit 1
+fi
+
+# ---- fetch -------------------------------------------------------------------
+fail_fetch() { # message... : print the message and the login command, exit 4
+  echo "ca-token: $*" >&2
+  echo "ca-token: if the SSO session expired, run: aws sso login --profile $PROFILE" >&2
+  exit 4
+}
+
+# Parses the get-authorization-token JSON on stdin. Prints line 1 = expiration as
+# epoch seconds ("none" if absent or unparseable), line 2 = the token. Never
+# prints the input on error.
+PARSE_PY='
+import json, re, sys, datetime
+try:
+    d = json.load(sys.stdin)
+    tok = d["authorizationToken"]
+    if not isinstance(tok, str) or not tok or "\n" in tok:
+        raise ValueError("bad token")
+except Exception:
+    sys.exit(2)
+exp = d.get("expiration")
+epoch = "none"
+try:
+    if isinstance(exp, (int, float)):
+        epoch = str(int(exp))
+    elif isinstance(exp, str):
+        s = exp.strip().replace("Z", "+00:00")
+        s = re.sub(r"(\.\d{6})\d+", r"\1", s)
+        dt = datetime.datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        epoch = str(int(dt.timestamp()))
+except Exception:
+    epoch = "none"
+print(epoch)
+print(tok)
+'
+
+fetch_token() {
+  if ! command -v "$AWS" >/dev/null 2>&1; then
+    echo "ca-token: aws CLI not found ($AWS)" >&2
+    exit 3
+  fi
+  local errf json rc parsed exp_epoch tok cap limit
+  errf="$(mktemp "${TMPDIR:-/tmp}/ca-token-err.XXXXXX")" || { echo "ca-token: cannot create temp file" >&2; exit 3; }
+  json="$("$AWS" codeartifact get-authorization-token --profile "$PROFILE" --domain "$DOMAIN" \
+          --domain-owner "$OWNER" --region "$REGION" --output json 2> "$errf" < /dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    local detail
+    detail="$(grep -v '^[[:space:]]*$' "$errf" | head -3)"
+    rm -f "$errf"
+    if [ -n "$detail" ]; then
+      echo "ca-token: aws codeartifact get-authorization-token failed (exit $rc):" >&2
+      printf '%s\n' "$detail" | sed 's/^/  /' >&2
+      fail_fetch "no token fetched"
+    fi
+    fail_fetch "aws codeartifact get-authorization-token failed (exit $rc)"
+  fi
+  rm -f "$errf"
+  parsed="$(printf '%s' "$json" | python3 -I -c "$PARSE_PY" 2>/dev/null)" || fail_fetch "unrecognised response from aws (no authorizationToken)"
+  exp_epoch="$(printf '%s\n' "$parsed" | sed -n 1p)"
+  tok="$(printf '%s\n' "$parsed" | sed -n 2p)"
+  [ -n "$tok" ] || fail_fetch "unrecognised response from aws (empty token)"
+
+  cap=$((NOW + 11 * 3600))
+  case "$exp_epoch" in
+    ''|*[!0-9]*) limit=$((NOW + 3600)) ;;   # expiration unparseable: be conservative
+    *) limit=$((exp_epoch - 1800)); [ "$limit" -le "$cap" ] || limit=$cap ;;
+  esac
+  TOKEN="$tok"; VALID_UNTIL="$limit"
+}
+
+cache_store() {
+  umask 077
+  mkdir -p "$CACHE_DIR" 2>/dev/null && chmod 700 "$CACHE_DIR" 2>/dev/null || { echo "ca-token: warning: cannot create cache dir $CACHE_DIR; token not cached" >&2; return 0; }
+  local tmp
+  tmp="$(mktemp "$CACHE_DIR/.ca-token.XXXXXX")" || { echo "ca-token: warning: cannot write cache; token not cached" >&2; return 0; }
+  chmod 600 "$tmp"
+  printf '%s\n%s\n' "$VALID_UNTIL" "$TOKEN" > "$tmp" && mv -f "$tmp" "$CACHE_FILE" || rm -f "$tmp"
+}
+
+if [ "$REFRESH" -eq 1 ] || ! cache_load; then
+  fetch_token
+  # A token already expired (or expiring within the margin) is not usable.
+  if [ "$VALID_UNTIL" -le "$NOW" ]; then
+    fail_fetch "aws returned a token that is already expired or expires within 30 minutes"
+  fi
+  cache_store
+fi
+
+# ---- output ------------------------------------------------------------------
+SQ="'"; SQ_ESC="'\\''"   # ' becomes '\'' inside a single-quoted string
+squote() { local v=$1; printf '%s' "${v//"$SQ"/$SQ_ESC}"; }
+case "$ENVKIND" in
+  gradle) printf "export ORG_GRADLE_PROJECT_codeartifactToken='%s'\n" "$(squote "$TOKEN")" ;;
+  npm)    printf "export AWS_CODEARTIFACT_TOKEN='%s'\n" "$(squote "$TOKEN")" ;;
+  *)
+    if [ "$PRINT" -eq 1 ]; then
+      printf '%s\n' "$TOKEN"
+    else
+      echo "ca-token: token cached, valid until $(fmt_ts "$VALID_UNTIL")"
+    fi ;;
+esac
+exit 0

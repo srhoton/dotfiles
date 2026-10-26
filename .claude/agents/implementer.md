@@ -32,6 +32,7 @@ The orchestrator's prompt gives you:
 ## Default gates (must all pass before you return)
 
 - Typecheck, lint, and the **full** test suite: run `~/.claude/bin/repo-gate` and report its output. It detects Node, Gradle, Go, Python and Terraform and uses the repo's own scripts. `repo-gate --changed` runs only the related tests, which is useful while iterating, but the final gate is a plain `repo-gate`. If the script is missing, run the equivalents by hand: `tsc --noEmit` and eslint, `./gradlew spotlessApply build`, `go build ./... && go test ./...`, `pytest`, or `terraform fmt && terraform validate`.
+- repo-gate fetches the CodeArtifact token itself (bin/ca-token); if you run Gradle or pnpm by hand, use `eval "$(~/.claude/bin/ca-token --env gradle)"` (or `--env npm`) first.
 - **Mutation-probe every new or modified test:** `~/.claude/bin/mutation-probe --test '<scoped test cmd>' <changed-prod-file>...`. Add `--together` for a multi-file atomic change. A test reported VACUOUS gets rewritten and probed again.
 - **Deterministic test doubles only.** Don't use `Math.random`, `Date.now()`, argless `new Date()`, or real timers in stubs and fixtures.
 
