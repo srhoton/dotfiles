@@ -29,6 +29,7 @@ description: |
   For compliance status questions, use the adr-compliance-reviewer agent.
   </commentary>
   </example>
+tools: Read, Glob, Grep, Bash
 model: opus
 color: purple
 ---

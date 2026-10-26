@@ -146,7 +146,7 @@ const verified = await parallel(toVerify.map(f => () =>
     'Reviewers over-report: a finding that is unreachable, already guarded elsewhere, based on a misread of the ' +
     'code, or real-but-minor should be refuted (real-but-minor: say so in the reason). ' +
     'Cite file:line evidence either way. If you cannot decide from the code, refuted=false.',
-    { label: `verify:${f.file}:${f.line}`, phase: 'Verify', model: REVIEW_MODEL, schema: VERDICT_SCHEMA }
+    { label: `verify:${f.file}:${f.line}`, phase: 'Verify', agentType: 'finding-verifier', model: REVIEW_MODEL, schema: VERDICT_SCHEMA }
   ).then(v => ({ finding: f, verdict: v }))
 ))
 
