@@ -25,7 +25,7 @@
 #   -d DIR  target directory (default ~/git)
 #   SPEC    [ORG/]NAME — a NAME ending in "-" is a prefix, otherwise an exact
 #           repo name; ORG defaults to $FB_ORG. Defaults:
-#             act- ath- usr- mig- wor- fin- prt- aps- unt- app-
+#             act- ath- usr- mig- wor- fin- prt- aps- unt- app- svo- flt-
 #             fb-architecture/architecture-  fb-peo-apex/apex
 #
 # Environment: FB_ORG overrides the default GitHub org (default fullbay).
@@ -33,7 +33,7 @@
 set -uo pipefail
 
 DEFAULT_ORG="${FB_ORG:-fullbay}"
-DEFAULT_SPECS="act- ath- usr- mig- wor- fin- prt- aps- unt- app- fb-architecture/architecture- fb-peo-apex/apex"
+DEFAULT_SPECS="act- ath- usr- mig- wor- fin- prt- aps- unt- app- svo- flt- fb-architecture/architecture- fb-peo-apex/apex"
 
 first_line() { printf '%s' "$1" | sed -n '1p'; }
 emit() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
