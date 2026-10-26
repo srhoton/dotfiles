@@ -9,9 +9,22 @@ and check results; the local clone's state is read with a few git calls.
 "Actionable" is decided by lib/pr_feedback.py, the same module pr-fix-queue uses to
 decide whether a PR is blocked, so what this shows is what the queue would act on.
 
-Usage: pr-context <PR#|URL> [-R owner/repo] [--json]
+Usage: pr-context <PR#|URL> [-R owner/repo] [--json] [--body] [--diff [--only PATH]...]
   -R owner/repo   repository (default: the PR URL's, else `gh repo view` here)
   --json          emit everything as one JSON object instead of the text report
+  --body          add the full PR description: a `## Body` section (text) or a `body`
+                  string field (--json). The default report truncates the body at 2000 chars.
+  --diff          add the numbered diff from `gh pr diff`: a `## Numbered diff` section
+                  (text) or a `diff` string field (--json). Lines read `<new-file line>| +added`
+                  / `<line>|  context`, the numbers pr-review-post accepts for inline comments.
+                  If `gh pr diff` fails (e.g. HTTP 406, diff too large) the report is still
+                  printed: the section reads `unavailable: <reason>` (--json: `diff` is null and
+                  `diff_error` holds the reason), a WARNING goes to stderr, and the exit is 0.
+                  The diff is fetched after the GraphQL context; the PR head is re-read after
+                  it, and if it moved (a push in between) the diff is withheld the same way
+                  ("head moved during fetch (<old7> -> <new7>); re-run").
+  --only PATH     with --diff: render only PATH (repeatable; a rename matches by either path),
+                  e.g. to skip a lockfile. Without --diff it is a usage error.
 
 Exit 0 normally (actionable feedback is not an error), 1 if the PR is not found,
 2 on any other failure. Read-only. Standard library only.
@@ -31,6 +44,7 @@ import time
 from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+import numbered_diff  # noqa: E402
 import pr_feedback  # noqa: E402
 
 QUERY = """
@@ -105,8 +119,11 @@ def gh_cmd() -> list[str]:
 
 
 def run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess[str]:
+    # Every gh and git call goes through here; output that is not valid UTF-8 (a Latin-1
+    # byte in a diff line, a PR body, a branch name) becomes U+FFFD instead of a crash.
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=cwd)
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                              check=False, cwd=cwd)
     except FileNotFoundError:
         raise Failure(f"'{cmd[0]}' is not installed or not on PATH") from None
 
@@ -158,6 +175,31 @@ def fetch_once(slug: str, num: int) -> dict[str, Any]:
             raise NotFound(f"PR {slug}#{num} not found")
         raise Failure(f"GraphQL: {errors[0].get('message', '?')}")
     return {"viewer": ((doc.get("data") or {}).get("viewer") or {}).get("login") or "", "pr": pr}
+
+
+def fetch_numbered_diff(slug: str, num: int, only: list[str] | None = None) -> str:
+    """`gh pr diff` (the diff GitHub shows, the one inline comments anchor to), numbered.
+
+    only: restrict the rendering to these paths (a rename matches by either path).
+    """
+    proc = run([*gh_cmd(), "pr", "diff", str(num), "-R", slug, "--color=never"])
+    if proc.returncode != 0:
+        raise Failure(f"gh pr diff failed: {first_line(proc.stderr or proc.stdout) or f'exit {proc.returncode}'}")
+    return numbered_diff.render_diff(proc.stdout, only or None)
+
+
+def check_head_unmoved(slug: str, num: int, head_oid: str) -> None:
+    """The diff is fetched after the GraphQL context; raise Failure if the PR head is not
+    still the context's, or cannot be re-read (a diff that cannot be tied to the head is
+    not handed out)."""
+    proc = run([*gh_cmd(), "pr", "view", str(num), "-R", slug, "--json", "headRefOid",
+                "--jq", ".headRefOid"])
+    now = proc.stdout.strip()
+    if proc.returncode != 0 or not now:
+        raise Failure("could not re-check the PR head after the diff fetch "
+                      f"({first_line(proc.stderr or proc.stdout) or f'exit {proc.returncode}'}); re-run")
+    if now != head_oid:
+        raise Failure(f"head moved during fetch ({head_oid[:7]} -> {now[:7]}); re-run")
 
 
 def fetch(slug: str, num: int) -> dict[str, Any]:
@@ -415,6 +457,12 @@ def render_text(ctx: dict[str, Any]) -> str:
     out += ["", "SKIPPED (not actionable)",
             f"  threads: {counts(ctx['skipped']['threads'])}",
             f"  comments: {counts(ctx['skipped']['comments'])}"]
+    # Present only when --body / --diff asked for them; the default report is unchanged.
+    if "body" in ctx:
+        out += ["", "## Body", ctx["body"].strip() or "(no description)"]
+    if "diff" in ctx:
+        shown = ctx["diff"] if ctx["diff"] is not None else f"unavailable: {ctx['diff_error']}"
+        out += ["", "## Numbered diff", shown]
     return "\n".join(out)
 
 
@@ -425,7 +473,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("pr", metavar="PR", help="PR number or URL")
     p.add_argument("-R", "--repo", metavar="OWNER/REPO", help="repository (default: from the URL or the current clone)")
     p.add_argument("--json", action="store_true", help="emit one JSON object instead of the text report")
-    return p.parse_args(argv)
+    p.add_argument("--body", action="store_true", help="add the full PR description (## Body / `body` field)")
+    p.add_argument("--diff", action="store_true",
+                   help="add the numbered diff from `gh pr diff` (## Numbered diff / `diff` field)")
+    p.add_argument("--only", action="append", default=[], metavar="PATH",
+                   help="with --diff: render only this path (repeatable; a rename matches by either path)")
+    args = p.parse_args(argv)
+    if args.only and not args.diff:
+        p.error("--only needs --diff")
+    return args
 
 
 def main(argv: list[str]) -> int:
@@ -435,6 +491,19 @@ def main(argv: list[str]) -> int:
         slug = resolve_repo(repo)
         got = fetch(slug, num)
         ctx = build_context(slug, got, local_state(slug, str(got["pr"].get("headRefOid") or "")))
+        if args.body:
+            ctx["body"] = got["pr"].get("body") or ""
+        if args.diff:
+            # A diff GitHub refuses to serve (HTTP 406 over 20,000 lines / 300 files), or one
+            # that a push made stale while it was fetched, must not discard the rest of the
+            # report: say so in the output and on stderr.
+            try:
+                diff = fetch_numbered_diff(slug, num, args.only)
+                check_head_unmoved(slug, num, str(got["pr"].get("headRefOid") or ""))
+                ctx["diff"] = diff
+            except Failure as e:
+                ctx["diff"], ctx["diff_error"] = None, str(e)
+                print(f"pr-context: WARNING: numbered diff unavailable ({e})", file=sys.stderr)
     except NotFound as e:
         print(f"pr-context: {e}", file=sys.stderr)
         return 1

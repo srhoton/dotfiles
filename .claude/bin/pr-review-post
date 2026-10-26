@@ -56,7 +56,11 @@ DEFAULT_REVIEWERS = (
     "functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + "
     "performance-reviewer + data-side-effects-reviewer"
 )
-HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+# The patch splitter lives in lib/numbered_diff.py so `review-context --diff` and
+# `pr-context --diff` print exactly the line numbers this script accepts.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+from numbered_diff import commentable_lines  # noqa: E402
 
 
 class PostError(Exception):
@@ -132,29 +136,6 @@ def fallback_body(findings: list[dict[str, Any]], reviewers: str, note: str) -> 
 
 
 # ---- diff ----------------------------------------------------------------------
-
-def commentable_lines(patch: str) -> set[int]:
-    """RIGHT-side line numbers a review comment can anchor to: added and context lines."""
-    lines: set[int] = set()
-    right = None
-    # Split on "\n" only: str.splitlines() also breaks on \x0c, \x1c-\x1e, \x85 and U+2028/9,
-    # which can occur inside a source line and would shift every later line number.
-    rows = patch.split("\n")
-    if rows and rows[-1] == "":
-        rows.pop()
-    for raw in rows:
-        m = HUNK.match(raw)
-        if m:
-            right = int(m.group(1))
-            continue
-        if right is None or raw.startswith("\\"):
-            continue
-        if raw.startswith("-"):
-            continue
-        lines.add(right)
-        right += 1
-    return lines
-
 
 def parse_json_stream(text: str) -> list[Any]:
     """gh api --paginate prints one JSON document per page, concatenated."""

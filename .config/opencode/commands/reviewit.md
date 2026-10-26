@@ -11,14 +11,15 @@ Follow these steps exactly:
 
 ## Step 1: Fetch PR Context
 
-Gather the PR info in one call, then the diff:
+Gather everything in ONE call (pr-context fetches the diff right after the GraphQL context, so everything describes the same head unless someone pushes in between; it re-reads the head after the diff and withholds the diff if it moved):
 
 ```bash
-~/.claude/bin/pr-context $ARGUMENTS --json   # repo, title, body, head SHA, files, checks, local HEAD match
-gh pr diff $ARGUMENTS
+~/.claude/bin/pr-context $ARGUMENTS --json --body --diff
+# JSON: pr.title, body (full description), pr.headRefOid (head SHA), files.nodes[].path, checks, local, and
+# diff (the numbered diff, with the line numbers pr-review-post accepts)
 ```
 
-Save the PR title, body, head SHA, and list of changed files for use in later steps. Also save your current branch:
+Save the PR title, `body`, head SHA (`pr.headRefOid`), and list of changed files for use in later steps. If `diff` is null, `diff_error` says why (e.g. GitHub refuses a very large diff, or "head moved during fetch ... re-run", in which case re-run the command above before continuing, because the context is then stale too); for the other reasons the rest of the context is still valid, so continue and have the reviewers read the diff themselves (`~/.claude/bin/review-context --diff FILE...` in the checkout). Also save your current branch:
 
 ```bash
 ORIGINAL_BRANCH=$(git branch --show-current)

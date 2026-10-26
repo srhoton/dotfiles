@@ -53,10 +53,14 @@ const severityNote =
   'Rate a finding CRITICAL or HIGH only if it breaks correctness, data safety, security, or a stated requirement. ' +
   'Style, extra abstraction, and defensive hardening are MEDIUM or LOW at most.'
 
+const diffNote =
+  'To see the change with line numbers, run `~/.claude/bin/review-context --diff [FILE...]` instead of `git diff` plus `grep -n`.'
+
 const header =
   `Repo root: ${repoRoot}\n` +
   `Changed files (your ENTIRE review scope):\n${files.map(f => `- ${f}`).join('\n')}\n\n` +
   `${scopeNote}\n\n` +
+  `${diffNote}\n\n` +
   `${severityNote}\n\n`
 
 const checklistNote =

@@ -7,12 +7,20 @@
 #
 # Usage:
 #   review-context [--base BRANCH] [--files-only] [--no-defects] [-C DIR]
+#   review-context --diff [-U N] [FILE...] [--base BRANCH] [-C DIR]
 #
 #   --base BRANCH   compare against BRANCH (a local ref, else origin/BRANCH).
 #                   Default: the branch origin/HEAD points at, else master, else main;
 #                   the default prefers origin/<branch> over a possibly stale local one.
 #   --files-only    print ONLY the deduped changed-file list, one path per line,
 #                   relative to the repo root (for feeding the review workflow).
+#   --diff          print ONLY the numbered diff: the merge base against the working tree
+#                   (committed + staged + unstaged), plus untracked files as all-added.
+#                   Each line is `<new-file line>| +added` / `<line>|  context`; deleted
+#                   lines are `    -| -text`. Per file `=== path (+A -D) ===`; binary files
+#                   `path: binary file changed`. Not truncated. FILE... (paths relative to
+#                   the repo root) restricts it; a path that is not changed exits 3.
+#   -U N            context lines around each change in --diff (default 3)
 #   --no-defects    omit the defect-classes checklist (path: $DEFECT_CLASSES, default
 #                   ~/.claude/knowledge/defect-classes.md)
 #   -C DIR          run as if started in DIR
@@ -24,13 +32,17 @@
 # disk (those are listed separately as DELETED); then the defect classes.
 #
 # Exit 0 = ok (an unresolvable base only warns on stderr and skips the branch
-# diff). Exit 2 = not in a git repo, or bad usage. Read-only.
+# diff). Exit 2 = not in a git repo, or bad usage. Exit 3 = --diff FILE that is not
+# a changed path. Read-only.
 
 set -uo pipefail
 
 BASE_ARG=""
 FILES_ONLY=0
 NO_DEFECTS=0
+DIFF=0
+CONTEXT_LINES=""
+DIFF_FILES=()
 DIR=""
 
 usage() { awk 'NR >= 2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; }
@@ -41,12 +53,34 @@ while [ $# -gt 0 ]; do
                   BASE_ARG="$2"; shift 2 ;;
     --files-only) FILES_ONLY=1; shift ;;
     --no-defects) NO_DEFECTS=1; shift ;;
+    --diff)       DIFF=1; shift ;;
+    -U)           [ $# -ge 2 ] || { echo "review-context: -U needs a value" >&2; exit 2; }
+                  CONTEXT_LINES="$2"; shift 2 ;;
+    -U[0-9]*)     CONTEXT_LINES="${1#-U}"; shift ;;
     -C)           [ $# -ge 2 ] || { echo "review-context: -C needs a value" >&2; exit 2; }
                   DIR="$2"; shift 2 ;;
     -h|--help)    usage; exit 0 ;;
-    *)            echo "review-context: unknown argument: $1 (see --help)" >&2; exit 2 ;;
+    --)           shift; DIFF_FILES+=("$@"); break ;;
+    -*)           echo "review-context: unknown argument: $1 (see --help)" >&2; exit 2 ;;
+    *)            DIFF_FILES+=("$1"); shift ;;
   esac
 done
+
+if [ "$DIFF" -eq 0 ] && { [ -n "$CONTEXT_LINES" ] || [ "${#DIFF_FILES[@]}" -gt 0 ]; }; then
+  echo "review-context: -U and FILE arguments need --diff (see --help)" >&2; exit 2
+fi
+if [ "$DIFF" -eq 1 ] && [ "$FILES_ONLY" -eq 1 ]; then
+  echo "review-context: --diff and --files-only are mutually exclusive" >&2; exit 2
+fi
+case "${CONTEXT_LINES:-0}" in
+  *[!0-9]*) echo "review-context: -U needs a non-negative integer, got '$CONTEXT_LINES'" >&2; exit 2 ;;
+esac
+
+# Resolved before any cd, and through symlinks, so a PATH-invoked or symlinked script finds lib/.
+NUMBERED_DIFF=""
+if [ "$DIFF" -eq 1 ]; then
+  NUMBERED_DIFF="$(python3 -c 'import os, sys; print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "lib", "numbered_diff.py"))' "${BASH_SOURCE[0]}")" || exit 2
+fi
 
 if [ -n "$DIR" ]; then
   cd "$DIR" 2>/dev/null || { echo "review-context: cannot cd to $DIR" >&2; exit 2; }
@@ -116,6 +150,52 @@ fi
 if [ "$FILES_ONLY" -eq 1 ]; then
   [ "${#CHANGED[@]}" -eq 0 ] || printf '%s\n' "${CHANGED[@]}"
   exit 0
+fi
+
+# ---- --diff: the numbered diff, nothing else ------------------------------------
+if [ "$DIFF" -eq 1 ]; then
+  for want in ${DIFF_FILES[@]+"${DIFF_FILES[@]}"}; do
+    known=0
+    for have in ${CHANGED[@]+"${CHANGED[@]}"} ${DELETED[@]+"${DELETED[@]}"}; do
+      [ "$have" = "${want#./}" ] && { known=1; break; }
+    done
+    if [ "$known" -eq 0 ]; then
+      echo "review-context: not a changed path (relative to $ROOT): $want" >&2; exit 3
+    fi
+  done
+
+  # The merge base is what `base...HEAD` diffs from; the working tree is the other side,
+  # so committed, staged and unstaged changes (and tracked deletions) all appear once.
+  FROM=""
+  if [ -n "$BASE_REF" ]; then FROM="$(git merge-base "$BASE_REF" HEAD 2>/dev/null)"; fi
+  if [ -z "$FROM" ]; then
+    [ -z "$BASE_REF" ] || echo "review-context: WARN no merge base with $BASE_REF; diffing against HEAD" >&2
+    FROM="$(git rev-parse --verify -q 'HEAD^{commit}' 2>/dev/null || git hash-object -t tree /dev/null)"
+  fi
+
+  ONLY=()
+  for want in ${DIFF_FILES[@]+"${DIFF_FILES[@]}"}; do ONLY+=(--only "${want#./}"); done
+
+  # Explicit prefixes and no external/textconv drivers, so a user's diff.noprefix,
+  # diff.mnemonicPrefix or color config cannot change what the parser sees.
+  GIT_DIFF=(git -c core.quotepath=off diff --no-color --no-ext-diff --src-prefix=a/ --dst-prefix=b/ "-U${CONTEXT_LINES:-3}")
+  RAW="$(mktemp)" || exit 1
+  trap 'rm -f "$RAW"' EXIT
+  "${GIT_DIFF[@]}" -M "$FROM" > "$RAW" || { echo "review-context: git diff failed" >&2; exit 1; }
+  # Untracked files are not in `git diff`; diff each against /dev/null so it renders as all-added.
+  # --no-index exits 1 when the files differ, which is the expected case.
+  while IFS= read -r -d '' path; do
+    [ -d "$path" ] && [ ! -L "$path" ] && continue
+    if [ "${#DIFF_FILES[@]}" -gt 0 ]; then
+      keep=0
+      for want in "${DIFF_FILES[@]}"; do [ "${want#./}" = "$path" ] && keep=1; done
+      [ "$keep" -eq 1 ] || continue
+    fi
+    "${GIT_DIFF[@]}" --no-index -- /dev/null "$path" >> "$RAW"
+    [ $? -le 1 ] || { echo "review-context: git diff failed for untracked file $path" >&2; exit 1; }
+  done < <(git ls-files --others --exclude-standard -z)
+  python3 "$NUMBERED_DIFF" ${ONLY[@]+"${ONLY[@]}"} < "$RAW"
+  exit $?
 fi
 
 # ---- report -------------------------------------------------------------------
