@@ -12,7 +12,7 @@
 
 1. List candidate Fullbay repos (pattern match `*-svc`, `*-fun`, `*-uix`).
 2. For each, fetch yesterday's merged PRs (last 24h).
-3. Fetch ADRs + ImplGuides from `fullbay/architecture-decisions` master.
+3. Fetch ADRs + ImplGuides from `fb-architecture/architecture-decisions` master.
 4. For each PR's diff, scan against ImplGuide Prohibited Patterns.
 5. Post Slack DM digest of violations. Weekly heartbeat on clean days.
 
@@ -33,8 +33,8 @@ Steps:
    Filter where merged_at >= 24h ago AND merged_at < now.
 
 4. Fetch ADR + ImplGuide content once (cache for this run):
-   GET https://api.github.com/repos/fullbay/architecture-decisions/contents/adrs
-   GET https://api.github.com/repos/fullbay/architecture-decisions/contents/implGuides
+   GET https://api.github.com/repos/fb-architecture/architecture-decisions/contents/adrs
+   GET https://api.github.com/repos/fb-architecture/architecture-decisions/contents/implGuides
    For each *-ImplGuide.md, extract the "Prohibited Patterns" table.
 
 5. For each merged PR (cap total at 50 across all repos):
