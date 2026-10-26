@@ -41,6 +41,7 @@ Language and tool rules live in `~/.claude/rules/` and load when matching files 
 - For multiline PR bodies, prefer `gh pr create --body-file <tmpfile>` over inline heredocs. Heredocs containing backticks corrupt PR content.
 - Same rule applies to multiline commit messages: write to a tempfile and use `git commit -F <tmpfile>` rather than `-m "$(cat <<EOF ...`.
 - PR comment and review-reply bodies go through `--body-file <tmpfile>` or `gh api ... --input <payload.json>`. `gh` does not expand `@path` in a body argument, so it posts the literal path.
+- Commit, notes and push with `~/.claude/bin/commit-notes` (stages only the paths you name, shows the staged stat, never skips hooks, warns on a stacked or closed PR).
 
 ### Git State Verification
 - Before claiming a file or commit doesn't exist, run `git fetch origin && git log origin/<branch> --oneline -20` to confirm the local clone is current. Local clones drift.

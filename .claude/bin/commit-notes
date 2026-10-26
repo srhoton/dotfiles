@@ -1,0 +1,340 @@
+#!/bin/bash
+#
+# commit-notes - stage named paths, commit from a message file, attach a git
+# note, optionally push and report the PR, in one guarded call.
+#
+# Replaces the hand-written add / commit -F / notes add / push sequence in
+# /trueup, with the CLAUDE.md checks built in: it never stages everything, it
+# shows what is staged and refuses when nothing is, and it refuses on the
+# default branch.
+#
+# Usage:
+#   commit-notes -m MSGFILE [-n NOTESFILE] [--add PATH...] [--push] [-N]
+#
+#   -m MSGFILE    commit message file (required); committed with `git commit -F`
+#   -n NOTESFILE  note text; attached to the new commit with `git notes add -F`
+#   --add PATH... stage exactly these paths (repeatable; takes every following
+#                 argument up to the next option, or, after a `--`, every
+#                 remaining argument, so a path may start with '-'; put the
+#                 other options before --add in that case). Paths are literal:
+#                 no glob or pathspec magic, so `[id].tsx` names that file only
+#                 (a directory still covers everything under it). Each must
+#                 exist, or be a tracked deletion, and have a change to stage;
+#                 otherwise exit 3. Without --add, commits what is already
+#                 staged. Any path whose index entry the pre-commit hook changes
+#                 (it runs `git add -u`) outside the --add set, whether newly
+#                 staged or just gaining more hunks, is put back to its pre-hook
+#                 entry with a WARNING; the stat is printed again after the hook
+#                 so it is what gets committed. With no --add, that includes a
+#                 formatter rewrite of a file you had staged by hand: re-stage it
+#                 if you want the formatted version. An index with unmerged paths
+#                 exits 3 before the hook runs.
+#   --push        `git push` when the upstream is <remote>/<this branch>, else
+#                 `git push -u origin HEAD`, then print `PR #N STATE base=BASE`
+#                 for the branch and WARN if that PR is MERGED/CLOSED or its
+#                 base is not the default branch. With -n, the notes ref is
+#                 pushed too, only if the remote already has refs/notes/commits;
+#                 otherwise a NOTICE says the note stays local and prints the
+#                 `git push <remote> refs/notes/commits` command to run.
+#   -N            dry run: print every command it would run and the staged stat;
+#                 changes nothing visible (staging is done in a throwaway index).
+#                 The hook is not run, so the stat can differ from a real run.
+#
+# Exit codes: 0 ok, 3 usage or guard refusal, otherwise the failing command's
+# exit code (git, or a Claude Code hook that blocked).
+#
+# Hooks: Claude Code's pre-commit-checks.sh and guard-pr-state.sh match the
+# command text `git commit` / `git push`, so they cannot see a call to this
+# script. commit-notes therefore runs them itself, with the same stdin the
+# harness would give them, and stops when they block. Git's own hooks run as
+# usual. Nothing here skips any hook.
+#
+# Environment:
+#   GH                       gh binary (default `gh`), as in pr-context
+#   COMMIT_NOTES_HOOKS_DIR   directory holding the two Claude Code hooks
+#                            (default: ../hooks next to this script, else
+#                            ~/.claude/hooks); a missing hook file is skipped.
+#                            For tests.
+
+set -uo pipefail
+
+SELF=$(basename "$0")
+HERE=$(cd "$(dirname "$0")" && pwd)
+
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' | sed '1d'; }
+die_usage() { echo "$SELF: $*" >&2; echo "try: $SELF --help" >&2; exit 3; }
+refuse() { echo "$SELF: $*" >&2; exit 3; }
+
+MSG=""; NOTES=""; PUSH=0; DRY=0
+ADD=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m) [ $# -ge 2 ] || die_usage "-m needs a file"; MSG=$2; shift 2 ;;
+    -n) [ $# -ge 2 ] || die_usage "-n needs a file"; NOTES=$2; shift 2 ;;
+    --add)
+      shift; got=0
+      while [ $# -gt 0 ] && [[ $1 != -* ]]; do ADD+=("$1"); got=1; shift; done
+      if [ $# -gt 0 ] && [ "$1" = "--" ]; then
+        shift
+        while [ $# -gt 0 ]; do ADD+=("$1"); got=1; shift; done
+      fi
+      [ "$got" = 1 ] || die_usage "--add needs at least one path" ;;
+    --push) PUSH=1; shift ;;
+    -N) DRY=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die_usage "unknown argument '$1'" ;;
+  esac
+done
+
+[ -n "$MSG" ] || die_usage "-m MSGFILE is required (the message is committed with -F, never inline)"
+[ -f "$MSG" ] || refuse "message file not found: $MSG"
+[ -s "$MSG" ] || refuse "message file is empty: $MSG"
+if [ -n "$NOTES" ]; then
+  [ -f "$NOTES" ] || refuse "notes file not found: $NOTES"
+  [ -s "$NOTES" ] || refuse "notes file is empty: $NOTES"
+fi
+
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || refuse "not inside a git work tree"
+
+if [ -n "${COMMIT_NOTES_HOOKS_DIR:-}" ]; then
+  HOOKS_DIR=$COMMIT_NOTES_HOOKS_DIR
+elif [ -d "$HERE/../hooks" ]; then
+  HOOKS_DIR="$HERE/../hooks"
+else
+  HOOKS_DIR="$HOME/.claude/hooks"
+fi
+
+PFX="+"
+[ "$DRY" = 1 ] && PFX="would run:"
+
+# Print a command the way it would be typed; run it unless this is a dry run.
+step() {
+  printf '%s' "$PFX"; printf ' %q' "$@"; printf '\n'
+  [ "$DRY" = 1 ] && return 0
+  "$@"
+}
+
+# Run a Claude Code hook with the stdin the harness would send for COMMAND.
+# Returns the hook's exit code. A hook file that is not installed is skipped.
+claude_hook() { # HOOK-FILENAME COMMAND-TEXT
+  local hook="$HOOKS_DIR/$1"
+  printf '%s hook %s (as for: %s)\n' "$PFX" "$1" "$2"
+  [ "$DRY" = 1 ] && return 0
+  [ -f "$hook" ] || return 0
+  printf '{"tool_input":{"command":"%s"}}' "$2" | (cd "$TOP" && bash "$hook")
+}
+
+# Paths staged in the index (relative to the repo root; one entry per path, no
+# rename detection), into the global array CACHED. Extra arguments are passed to
+# `git diff --cached`: a tree-ish to compare the index against, and/or
+# `-- PATH...`, taken literally (no glob or magic) and resolved from the current
+# directory like `git add`.
+load_cached() {
+  CACHED=()
+  local p
+  while IFS= read -r -d '' p; do CACHED+=("$p"); done \
+    < <(git --literal-pathspecs diff --cached --name-only -z --no-renames "$@")
+}
+
+in_list() { # NEEDLE [ITEM...]
+  local needle=$1 item
+  shift
+  for item in "$@"; do [ "$item" = "$needle" ] && return 0; done
+  return 1
+}
+
+default_branch() {
+  local ref b
+  if ref=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) && [ -n "$ref" ]; then
+    echo "${ref#origin/}"; return
+  fi
+  for b in master main; do
+    if git show-ref --verify --quiet "refs/remotes/origin/$b"; then echo "$b"; return; fi
+  done
+  for b in master main; do
+    if git show-ref --verify --quiet "refs/heads/$b"; then echo "$b"; return; fi
+  done
+}
+
+BRANCH=$(git branch --show-current 2>/dev/null)
+[ -n "$BRANCH" ] || refuse "detached HEAD; create a branch first (git switch -c <branch>)"
+DEFAULT=$(default_branch)
+if [ -n "$DEFAULT" ]; then
+  [ "$BRANCH" != "$DEFAULT" ] || refuse "on the default branch '$DEFAULT'; create a feature branch first (git switch -c <branch>)"
+else
+  case "$BRANCH" in
+    master|main) refuse "on '$BRANCH' and the default branch is unknown; create a feature branch first (git switch -c <branch>)" ;;
+  esac
+fi
+
+# A dry run stages into a throwaway copy of the index, so the staged stat it
+# prints is the real one and the real index and work tree are untouched.
+if [ "$DRY" = 1 ]; then
+  TMPIDX=$(mktemp "${TMPDIR:-/tmp}/commit-notes-index.XXXXXX") || exit 1
+  trap 'rm -f "$TMPIDX" "$TMPIDX.lock"' EXIT
+  IDX=$(git rev-parse --git-path index)
+  if [ -f "$IDX" ]; then cp "$IDX" "$TMPIDX"; else rm -f "$TMPIDX"; fi
+  export GIT_INDEX_FILE=$TMPIDX
+  echo "$SELF: dry run; nothing will be changed"
+fi
+
+# ---- stage ----------------------------------------------------------------------
+if [ "${#ADD[@]}" -gt 0 ]; then
+  # Check every path first so a bad one leaves the index as it was.
+  for p in "${ADD[@]}"; do
+    if [ -z "$(git --literal-pathspecs status --porcelain -- "$p" 2>/dev/null)" ]; then
+      if [ -e "$p" ] || [ -L "$p" ]; then
+        refuse "--add '$p' has no change to stage (unchanged, or ignored); nothing was staged"
+      fi
+      refuse "--add '$p' matches nothing: it does not exist and is not a tracked deletion; nothing was staged"
+    fi
+  done
+  printf '%s' "$PFX"; printf ' %q' git --literal-pathspecs add -- "${ADD[@]}"; printf '\n'
+  git --literal-pathspecs add -- "${ADD[@]}" || exit $?
+fi
+
+echo "$SELF: staged changes:"
+git diff --cached --stat
+if git diff --cached --quiet; then
+  refuse "nothing is staged; a path that matches nothing stages nothing. Pass --add PATH or stage the files first."
+fi
+
+# With --add, anything else already in the index rides along; say so by name.
+if [ "${#ADD[@]}" -gt 0 ]; then
+  load_cached
+  ALL_STAGED=(${CACHED[@]+"${CACHED[@]}"})
+  load_cached -- "${ADD[@]}"
+  for p in ${ALL_STAGED[@]+"${ALL_STAGED[@]}"}; do
+    in_list "$p" ${CACHED[@]+"${CACHED[@]}"} \
+      || echo "$SELF: WARNING: '$p' was already staged and is not in --add; it will be committed too"
+  done
+fi
+
+UNTRACKED=$(git -C "$TOP" ls-files --others --exclude-standard)
+if [ -n "$UNTRACKED" ]; then
+  echo "$SELF: WARNING: untracked files are NOT part of this commit:"
+  printf '%s\n' "$UNTRACKED" | head -10 | sed 's/^/  /'
+  n=$(printf '%s\n' "$UNTRACKED" | wc -l | tr -d ' ')
+  [ "$n" -le 10 ] || echo "  ... and $((n - 10)) more"
+fi
+
+# ---- commit ---------------------------------------------------------------------
+commit_failed() { # EXIT-CODE
+  echo "$SELF: commit failed; nothing pushed" >&2
+  exit "$1"
+}
+
+# pre-commit-checks.sh runs `git add -u` after formatting, which stages every
+# modified tracked file, not just the ones named, and adds the remaining
+# unstaged hunks of a path that was only partly staged. Snapshot the index as a
+# tree first; afterwards, every path whose index entry differs from that tree
+# and is not in --add is put back to its pre-hook entry. Paths in --add that the
+# formatter rewrote stay as the hook left them. Conservative by design: with no
+# --add, a formatter rewrite of a file the user had staged by hand cannot be told
+# from a sweep, so it is restored too (the warning says so; re-stage it if the
+# format is wanted). Index only; the work tree is never touched.
+if [ "$DRY" = 1 ]; then
+  claude_hook pre-commit-checks.sh "git commit"; hook_rc=$?
+  echo "$SELF: note: the real hook may stage more files (git add -u); a real run restores any index entry it changes outside --add and prints the final stat"
+else
+  PRE_TREE=$(git write-tree 2>/dev/null) \
+    || refuse "cannot snapshot the index before the pre-commit hook (unmerged paths?); nothing committed. Resolve and stage them first."
+  claude_hook pre-commit-checks.sh "git commit"; hook_rc=$?
+  load_cached "$PRE_TREE"
+  CHANGED=(${CACHED[@]+"${CACHED[@]}"})
+  IN_ADD=()
+  if [ "${#ADD[@]}" -gt 0 ]; then
+    load_cached "$PRE_TREE" -- "${ADD[@]}"
+    IN_ADD=(${CACHED[@]+"${CACHED[@]}"})
+  fi
+  for p in ${CHANGED[@]+"${CHANGED[@]}"}; do
+    in_list "$p" ${IN_ADD[@]+"${IN_ADD[@]}"} && continue
+    if git -C "$TOP" --literal-pathspecs reset -q "$PRE_TREE" -- "$p"; then
+      echo "$SELF: WARNING: pre-commit hook changed the staged content of $p, not in --add; restored it"
+    else
+      echo "$SELF: could not restore $p, which the pre-commit hook changed outside --add; nothing committed" >&2
+      exit 3
+    fi
+  done
+fi
+if [ "$hook_rc" -ne 0 ]; then
+  echo "$SELF: pre-commit-checks.sh blocked the commit (exit $hook_rc)" >&2
+  commit_failed "$hook_rc"
+fi
+if [ "$DRY" != 1 ]; then
+  echo "$SELF: staged changes (after the pre-commit hook):"
+  git diff --cached --stat
+fi
+step git commit -F "$MSG" || commit_failed $?
+
+# ---- notes ----------------------------------------------------------------------
+if [ -n "$NOTES" ]; then
+  if [ "$DRY" = 1 ]; then
+    step git notes add -F "$NOTES" HEAD
+  elif git notes list HEAD >/dev/null 2>&1; then
+    echo "$SELF: HEAD already has a note; replacing it (-f)"
+    step git notes add -f -F "$NOTES" HEAD || { rc=$?; echo "$SELF: committed, but the note failed; nothing pushed" >&2; exit "$rc"; }
+  else
+    step git notes add -F "$NOTES" HEAD || { rc=$?; echo "$SELF: committed, but the note failed; nothing pushed" >&2; exit "$rc"; }
+  fi
+fi
+
+if [ "$PUSH" != 1 ]; then
+  [ "$DRY" = 1 ] && exit 0
+  echo "$SELF: committed $(git rev-parse --short=7 HEAD) on $BRANCH (not pushed)"
+  exit 0
+fi
+
+# ---- push -----------------------------------------------------------------------
+claude_hook guard-pr-state.sh "git push" || { rc=$?; echo "$SELF: guard-pr-state.sh blocked the push (exit $rc); the commit exists locally, nothing pushed" >&2; exit "$rc"; }
+
+# A bare `git push` is only safe when the upstream is the same-named branch on
+# its remote: a branch cut from origin/master tracks origin/master, and under
+# push.default=simple the push fails, under =upstream it lands on master.
+UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || UPSTREAM=""
+UP_REMOTE=$(git config --get "branch.$BRANCH.remote" 2>/dev/null) || UP_REMOTE=""
+if [ -n "$UPSTREAM" ] && [ -n "$UP_REMOTE" ] && [ "$UPSTREAM" = "$UP_REMOTE/$BRANCH" ]; then
+  step git push || { rc=$?; echo "$SELF: push failed (exit $rc); the commit exists locally" >&2; exit "$rc"; }
+else
+  step git push -u origin HEAD || { rc=$?; echo "$SELF: push failed (exit $rc); the commit exists locally" >&2; exit "$rc"; }
+fi
+
+if [ "$DRY" = 1 ]; then
+  [ -z "$NOTES" ] || echo "would run: git push <remote> refs/notes/commits  (only if the remote already has that ref; otherwise a NOTICE says the note stays local)"
+  echo "would run: gh pr view $BRANCH  (report the PR state and base)"
+  exit 0
+fi
+
+REMOTE=$(git config --get "branch.$BRANCH.remote" 2>/dev/null) || REMOTE=origin
+echo "$SELF: pushed $(git rev-parse --short=7 HEAD) to $BRANCH"
+
+if [ -n "$NOTES" ]; then
+  git ls-remote --exit-code "$REMOTE" refs/notes/commits >/dev/null 2>&1
+  case $? in
+    0) step git push "$REMOTE" refs/notes/commits || { rc=$?; echo "$SELF: the commit was pushed but pushing refs/notes/commits failed (exit $rc)" >&2; exit "$rc"; } ;;
+    2) echo "$SELF: NOTICE: $REMOTE has no refs/notes/commits, so the note stays local (not pushed unasked). To publish it: git push $REMOTE refs/notes/commits" ;;
+    *) echo "$SELF: WARNING: could not check $REMOTE for refs/notes/commits; notes not pushed" ;;
+  esac
+fi
+
+# ---- PR state ---------------------------------------------------------------------
+read -r -a GHC <<<"${GH:-gh}"
+if ! command -v "${GHC[0]}" >/dev/null 2>&1; then
+  echo "$SELF: gh not available; PR state not checked"
+  exit 0
+fi
+if ! PRLINE=$("${GHC[@]}" pr view "$BRANCH" --json number,state,baseRefName --jq '[.number,.state,.baseRefName]|@tsv' 2>/dev/null) || [ -z "$PRLINE" ]; then
+  echo "$SELF: no PR found for $BRANCH (or gh could not tell); open one against ${DEFAULT:-the default branch}"
+  exit 0
+fi
+IFS=$'\t' read -r PR_NUM PR_STATE PR_BASE <<<"$PRLINE"
+echo "PR #$PR_NUM $PR_STATE base=$PR_BASE"
+case "$PR_STATE" in
+  MERGED|CLOSED)
+    echo "WARNING: PR #$PR_NUM is $PR_STATE; this push reaches no open review. Use a new branch and a new PR." ;;
+esac
+if [ -n "$DEFAULT" ] && [ "$PR_BASE" != "$DEFAULT" ]; then
+  echo "WARNING: base is $PR_BASE, not $DEFAULT; merging this PR will not land it on $DEFAULT"
+fi
+exit 0
