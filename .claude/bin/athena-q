@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+"""athena-q: run one Athena query from the shell, safely and with small output.
+
+Starts the query, polls with backoff until a terminal state has been seen on two
+consecutive polls (the cache-flicker rule pr-ci-wait uses), then pages
+get-query-results. Prints one status line, then up to --max-rows rows; the full
+result goes to --out so big result sets never have to enter a session's context.
+
+Usage: athena-q --profile P --workgroup W [--database D] [--catalog C]
+                [--region us-west-2] [--output-location s3://bucket/prefix/]
+                (-f FILE | -e SQL | SQL on stdin)
+                [--max-rows 50] [--tsv | --json] [--out FILE]
+                [--timeout 300] [--allow-write] [-n]
+  --profile, --workgroup  required, never defaulted (pick the account on purpose)
+  -f FILE | -e SQL        the query (-f - reads stdin); with neither, stdin is read
+  --max-rows N            rows shown on screen (default 50); the rest are counted
+  --tsv | --json          raw TSV, or a JSON list of objects (default: aligned
+                          table, cells cut at 60 characters). All values are
+                          strings as Athena returns them; NULL is empty (TSV/table)
+                          or null (JSON). Tabs/newlines in TSV cells become \\t \\n.
+  --out FILE              write the FULL result (TSV, or JSON with --json) to FILE
+                          and print only its path and row count. It pages through
+                          get-query-results, one aws CLI start per 1000 rows, so it
+                          is slow above ~100k rows: fetch the CSV from the status
+                          line's result=<s3 location> with `aws s3 cp` instead.
+  --timeout S             give up after S seconds (default 300): the query is
+                          stopped (best effort) and the exit code is 2
+  --allow-write           permit anything other than one read-only statement
+  -n                      dry run: print the start-query-execution argv and the
+                          guard verdict; no aws call is made
+
+Output: the first stdout line is
+  athena-q: <state> qid=<id> runtime=<ms>ms scanned=<bytes> [result=<s3 location>]
+(result= appears when Athena reports the query's output location.)
+FAILED/CANCELLED print the StateChangeReason on stderr.
+
+Read-only guard (default): comments and string/quoted-identifier literals are
+stripped, then exactly one statement must remain (a trailing ; is fine) and its
+first keyword must be SELECT, WITH, SHOW, DESCRIBE, EXPLAIN or VALUES. WITH and
+EXPLAIN bodies that contain INSERT/DELETE/UPDATE/MERGE/CREATE/DROP/ALTER/UNLOAD/
+OPTIMIZE/VACUUM/MSCK as a keyword are refused too (EXPLAIN ANALYZE executes its
+statement). Refusals exit 3. KNOWN LIMIT: this is a keyword guard, not a SQL
+parser. It stops accidents, not a determined bypass; the workgroup's IAM
+permissions are the real boundary. A column literally named like a forbidden
+keyword must be double-quoted to pass inside WITH/EXPLAIN. SHOW and DESCRIBE are
+parsed with Hive-style escapes (a backslash escapes the next character, even a
+quote), which the guard does not model: such a statement with a backslash inside a
+quoted string is refused (exit 3) because it cannot be verified.
+
+Exit codes: 0 ok, 1 query failed or cancelled, 2 timed out, 3 usage error or
+guard refusal, 4 AWS error (an expired SSO session prints the exact
+`aws sso login --profile P` command). If AWS access fails after the query started,
+its qid is printed on stderr and a best-effort stop-query-execution is sent first.
+
+Environment (tests):
+  ATHENA_Q_AWS          aws binary/command (default `aws`)
+  ATHENA_Q_SLEEP=N      sleep N seconds per wait instead of the backoff (0 = none)
+  ATHENA_Q_FAKE_CLOCK=S elapsed time is S seconds per poll instead of the real clock
+Standard library only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Iterator
+from typing import Any
+
+DEFAULT_REGION = "us-west-2"
+DEFAULT_TIMEOUT = 300
+DEFAULT_MAX_ROWS = 50
+POLL_START = 1.0
+POLL_MAX = 5.0
+POLL_ERROR_LIMIT = 3
+PAGE_MAX = 1000  # get-query-results MaxResults ceiling
+CELL_LIMIT = 60
+TERMINAL = {"SUCCEEDED", "FAILED", "CANCELLED"}
+
+READ_FIRST = {"SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN", "VALUES"}
+WRITE_WORDS = {
+    "INSERT",
+    "DELETE",
+    "UPDATE",
+    "MERGE",
+    "CREATE",
+    "DROP",
+    "ALTER",
+    "UNLOAD",
+    "OPTIMIZE",
+    "VACUUM",
+    "MSCK",
+}
+SCAN_FIRST = {
+    "WITH",
+    "EXPLAIN",
+}  # SHOW CREATE TABLE is legitimate, so SHOW is not scanned
+HIVE_PARSED = {
+    "SHOW",
+    "DESCRIBE",
+}  # Hive-style DDL parser: backslash escapes inside quotes
+_LINE_END = re.compile(r"[\r\n]")
+
+CRED_PATTERN = re.compile(
+    r"token has expired|sso session|sso token|error loading sso|expiredtoken|"
+    r"unable to locate credentials|credentials? (have |has )?(expired|not found)|"
+    r"security token included in the request is (expired|invalid)|"
+    r"invalidclienttokenid|unrecognizedclientexception|refresh failed|"
+    r"session has expired|login session|aws sso login",
+    re.IGNORECASE,
+)
+PROFILE_MISSING = re.compile(
+    r"profile \(?([^)\s]+)\)? (could|can) ?not be found", re.IGNORECASE
+)
+
+
+class UsageError(Exception):
+    """Bad invocation or a guard refusal (exit 3)."""
+
+
+class AwsError(Exception):
+    """An aws call failed (exit 4). kind: 'creds', 'profile' or 'other'."""
+
+    def __init__(self, message: str, kind: str = "other") -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+class QueryTimeout(Exception):
+    pass
+
+
+# ---- read-only guard -------------------------------------------------------------
+
+
+def strip_sql(sql: str, quoted: list[str] | None = None) -> str:
+    """Replace comments and quoted text with a space, so only SQL keywords remain.
+
+    Handles -- line comments (end at CR or LF), /* */ block comments, '...'
+    strings, "..." and `...` identifiers (a doubled quote is an escaped quote). An
+    unterminated comment or quote raises UsageError, because it could be hiding a
+    second statement. CR, LF, FF, VT and Unicode spaces inside a block comment or
+    quote are plain content, as in the engine's lexer. The raw text of each quoted
+    segment is appended to `quoted` when given.
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "-" and sql.startswith("--", i):
+            # Trino/Hive end a -- comment at the first CR or LF (SIMPLE_COMMENT:
+            # '--' ~[\r\n]*). Ending only at LF would hide what follows a bare CR.
+            eol = _LINE_END.search(sql, i)
+            i = n if eol is None else eol.start()
+            out.append(" ")
+        elif c == "/" and sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            if end < 0:
+                raise UsageError("unterminated /* comment")
+            i = end + 2
+            out.append(" ")
+        elif c in "'\"`":
+            j = i + 1
+            while True:
+                end = sql.find(c, j)
+                if end < 0:
+                    raise UsageError(f"unterminated {c} quote")
+                if sql.startswith(c, end + 1):  # doubled quote = escaped quote
+                    j = end + 2
+                    continue
+                break
+            if quoted is not None:
+                quoted.append(sql[i + 1 : end])
+            i = end + 1
+            out.append(" ")
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def guard_verdict(sql: str) -> tuple[bool, str]:
+    """(read-only?, detail). detail is the first keyword when allowed, else the reason."""
+    quoted: list[str] = []
+    try:
+        bare = strip_sql(sql, quoted)
+    except UsageError as e:
+        return False, str(e)
+    statements = [s for s in bare.split(";") if s.strip()]
+    if not statements:
+        return False, "no statement found"
+    if len(statements) > 1:
+        return False, f"{len(statements)} statements found; exactly one is allowed"
+    m = re.match(r"[\s(]*([A-Za-z_]+)", statements[0])
+    first = m.group(1).upper() if m else ""
+    if first not in READ_FIRST:
+        return (
+            False,
+            f"statement starts with '{first or statements[0].strip()[:20]}', not one of {'/'.join(sorted(READ_FIRST))}",
+        )
+    if first in HIVE_PARSED and any("\\" in q for q in quoted):
+        # SHOW/DESCRIBE are parsed by Athena's Hive-style DDL parser, where a backslash
+        # escapes the next character (including a quote). strip_sql follows the Trino
+        # rules (only a doubled quote escapes), so it could end a string where the
+        # engine does not and misjudge what is quoted: the statement cannot be verified.
+        return False, (
+            f"{first} statement has a backslash inside a quoted string; Hive-style escapes "
+            "make the guard unable to verify where the string ends"
+        )
+    if first in SCAN_FIRST:
+        words = {
+            w.upper() for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", statements[0])
+        }
+        bad = sorted(words & WRITE_WORDS)
+        if bad:
+            return False, f"{first} statement contains {'/'.join(bad)}"
+    return True, first
+
+
+# ---- aws -------------------------------------------------------------------------
+
+
+class Aws:
+    def __init__(self, profile: str, region: str) -> None:
+        self.base = shlex.split(os.environ.get("ATHENA_Q_AWS") or "aws")
+        self.profile = profile
+        self.region = region
+
+    def argv(self, args: list[str]) -> list[str]:
+        return [
+            *self.base,
+            "athena",
+            *args,
+            "--profile",
+            self.profile,
+            "--region",
+            self.region,
+            "--output",
+            "json",
+        ]
+
+    def call(self, args: list[str]) -> dict[str, Any]:
+        try:
+            proc = subprocess.run(
+                self.argv(args), capture_output=True, text=True, check=False
+            )
+        except FileNotFoundError:
+            raise AwsError(
+                f"the aws CLI ({self.base[0]}) is not installed or not on PATH"
+            ) from None
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            line = next(
+                (ln for ln in err.splitlines() if ln.strip()),
+                f"aws exit {proc.returncode}",
+            )
+            if PROFILE_MISSING.search(err):
+                raise AwsError(
+                    f"AWS profile '{self.profile}' is not configured on this machine "
+                    "(see: aws configure list-profiles)",
+                    "profile",
+                )
+            if CRED_PATTERN.search(err):
+                raise AwsError(line, "creds")
+            raise AwsError(line)
+        try:
+            doc = json.loads(proc.stdout or "{}")
+        except ValueError:
+            raise AwsError(f"aws {args[0]} returned non-JSON output") from None
+        if not isinstance(doc, dict):
+            raise AwsError(f"aws {args[0]} returned an unexpected JSON document")
+        return doc
+
+
+def start_args(args: argparse.Namespace, sql: str) -> list[str]:
+    # --query-string=SQL stays ONE argv element (never shell-interpolated) and
+    # cannot be mistaken for an option when the SQL starts with a "--" comment.
+    out = [
+        "start-query-execution",
+        f"--query-string={sql}",
+        "--work-group",
+        args.workgroup,
+    ]
+    ctx = {
+        k: v for k, v in (("Database", args.database), ("Catalog", args.catalog)) if v
+    }
+    if ctx:
+        out += ["--query-execution-context", json.dumps(ctx)]
+    if args.output_location:
+        out += [
+            "--result-configuration",
+            json.dumps({"OutputLocation": args.output_location}),
+        ]
+    return out
+
+
+# ---- clock / sleep ---------------------------------------------------------------
+
+
+def make_clock() -> tuple[Callable[[], float], Callable[[], None]]:
+    """(elapsed seconds, on_poll). Real monotonic time unless ATHENA_Q_FAKE_CLOCK is set."""
+    fake = os.environ.get("ATHENA_Q_FAKE_CLOCK")
+    if fake is not None:
+        step, polls = float(fake), [0]
+        return (lambda: step * polls[0]), (lambda: polls.__setitem__(0, polls[0] + 1))
+    start = time.monotonic()
+    return (lambda: time.monotonic() - start), (lambda: None)
+
+
+def sleep(seconds: float) -> None:
+    override = os.environ.get("ATHENA_Q_SLEEP")
+    seconds = float(override) if override is not None else seconds
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+# ---- query lifecycle -------------------------------------------------------------
+
+
+def wait_for_query(aws: Aws, qid: str, timeout: float) -> dict[str, Any]:
+    """Poll until a terminal state is seen on two consecutive polls; return QueryExecution."""
+    elapsed, on_poll = make_clock()
+    interval = POLL_START
+    last_terminal: str | None = None
+    late_confirm = False  # the one confirming poll already taken past the deadline
+    errors = 0
+    while True:
+        on_poll()
+        qe: dict[str, Any] | None = None
+        try:
+            qe = (
+                aws.call(["get-query-execution", "--query-execution-id", qid]).get(
+                    "QueryExecution"
+                )
+                or {}
+            )
+            errors = 0
+        except AwsError as e:
+            errors += 1
+            if e.kind != "other" or errors >= POLL_ERROR_LIMIT:
+                raise
+            print(f"athena-q: poll failed ({e}); retrying", file=sys.stderr)
+        state = ((qe or {}).get("Status") or {}).get("State")
+        if qe is not None and state in TERMINAL:
+            if state == last_terminal:
+                return qe
+            last_terminal = state
+        else:
+            last_terminal = None
+        now = elapsed()
+        confirming = last_terminal is not None
+        if now >= timeout:
+            # A terminal state seen once is not yet trusted: take one confirming
+            # poll even past the deadline instead of stopping a finished query.
+            if not confirming or late_confirm:
+                raise QueryTimeout()
+            late_confirm = True
+        # The confirming poll always waits POLL_START (even past the deadline, where
+        # clamping to the time left would be 0): back-to-back polls would not give a
+        # flickering state any time to change, which is what the second poll is for.
+        sleep(POLL_START if confirming else min(interval, max(timeout - now, 0)))
+        if not confirming:
+            interval = min(interval * 2, POLL_MAX)
+
+
+def stop_query(aws: Aws, qid: str) -> None:
+    try:
+        aws.call(["stop-query-execution", "--query-execution-id", qid])
+    except AwsError as e:
+        print(f"athena-q: could not stop query {qid}: {e}", file=sys.stderr)
+
+
+def human_bytes(n: Any) -> str:
+    if not isinstance(n, (int, float)):
+        return "?"
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return "?"
+
+
+def status_line(qe: dict[str, Any], qid: str) -> str:
+    stats = qe.get("Statistics") or {}
+    ms = stats.get("EngineExecutionTimeInMillis")
+    state = (qe.get("Status") or {}).get("State") or "UNKNOWN"
+    line = (
+        f"athena-q: {state} qid={qid} runtime={ms if ms is not None else '?'}ms "
+        f"scanned={human_bytes(stats.get('DataScannedInBytes'))}"
+    )
+    location = (qe.get("ResultConfiguration") or {}).get("OutputLocation")
+    return f"{line} result={location}" if location else line
+
+
+# ---- results ---------------------------------------------------------------------
+
+Row = list["str | None"]
+
+
+def result_pages(
+    aws: Aws, qid: str, page_size: int
+) -> Iterator[tuple[list[str], list[Row], bool]]:
+    """Yield (columns, data rows, more pages exist?) per page; drops the header row."""
+    token: str | None = None
+    columns: list[str] = []
+    first = True
+    while True:
+        call = [
+            "get-query-results",
+            "--query-execution-id",
+            qid,
+            "--max-results",
+            str(page_size),
+        ]
+        if token:
+            call += ["--next-token", token]
+        doc = aws.call(call)
+        rs = doc.get("ResultSet") or {}
+        rows: list[Row] = [
+            [c.get("VarCharValue") for c in (r.get("Data") or [])]
+            for r in rs.get("Rows") or []
+        ]
+        if first:
+            info = (rs.get("ResultSetMetadata") or {}).get("ColumnInfo") or []
+            columns = [str(ci.get("Label") or ci.get("Name") or "") for ci in info]
+            # The first row of the first page repeats the column names (SELECT/WITH);
+            # SHOW/DESCRIBE-style results have no such row, so only drop a real match.
+            if rows and (not columns or rows[0] == columns):
+                header = rows.pop(0)
+                if not columns:
+                    columns = [h or "" for h in header]
+            first = False
+        token = doc.get("NextToken") or None
+        yield (
+            columns,
+            [r + [None] * (len(columns) - len(r)) for r in rows],
+            token is not None,
+        )
+        if token is None:
+            return
+
+
+def unique_names(columns: list[str]) -> list[str]:
+    seen: dict[str, int] = {}
+    out = []
+    for c in columns:
+        seen[c] = seen.get(c, 0) + 1
+        out.append(c if seen[c] == 1 else f"{c}_{seen[c]}")
+    return out
+
+
+def tsv_cell(v: str | None) -> str:
+    return (
+        ""
+        if v is None
+        else v.replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+    )
+
+
+def table_cell(v: str | None) -> str:
+    s = " ".join((v or "").split())
+    return s if len(s) <= CELL_LIMIT else s[: CELL_LIMIT - 3] + "..."
+
+
+def render_table(columns: list[str], rows: list[Row]) -> str:
+    cells = [[table_cell(c) for c in columns]] + [
+        [table_cell(v) for v in r] for r in rows
+    ]
+    widths = [max(len(r[i]) for r in cells) for i in range(len(columns))]
+    return "\n".join(
+        "  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip() for r in cells
+    )
+
+
+def show_rows(aws: Aws, qid: str, args: argparse.Namespace) -> None:
+    columns: list[str] = []
+    rows: list[Row] = []
+    more_pages = False
+    page_size = min(
+        PAGE_MAX, args.max_rows + 2
+    )  # header + max_rows + 1 to detect "more"
+    for columns, page, more_pages in result_pages(aws, qid, page_size):
+        rows.extend(page)
+        if len(rows) > args.max_rows:
+            break
+    extra = max(0, len(rows) - args.max_rows)
+    shown = rows[: args.max_rows]
+    names = unique_names(columns)
+    if args.json:
+        print(json.dumps([dict(zip(names, r)) for r in shown], indent=2))
+    elif args.tsv:
+        print("\t".join(tsv_cell(c) for c in columns))
+        for r in shown:
+            print("\t".join(tsv_cell(v) for v in r))
+    else:
+        print(render_table(columns, shown))
+        if not shown:
+            print("(0 rows)")
+    if extra or more_pages:
+        plus = "+" if more_pages else ""
+        print(f"... {extra}{plus} more rows (use --out FILE)")
+
+
+def write_rows(aws: Aws, qid: str, args: argparse.Namespace) -> int:
+    tmp = f"{args.out}.athena-q.tmp"
+    count = 0
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            names: list[str] = []
+            started = False
+            for columns, page, _more in result_pages(aws, qid, PAGE_MAX):
+                if not started:
+                    started = True
+                    names = unique_names(columns)
+                    fh.write(
+                        "["
+                        if args.json
+                        else "\t".join(tsv_cell(c) for c in columns) + "\n"
+                    )
+                for r in page:
+                    if args.json:
+                        fh.write(
+                            ("," if count else "")
+                            + "\n  "
+                            + json.dumps(dict(zip(names, r)))
+                        )
+                    else:
+                        fh.write("\t".join(tsv_cell(v) for v in r) + "\n")
+                    count += 1
+            if args.json:
+                fh.write("\n]\n")
+        os.replace(tmp, args.out)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return count
+
+
+# ---- main ------------------------------------------------------------------------
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> Any:  # usage errors exit 3, not argparse's 2
+        self.print_usage(sys.stderr)
+        print(f"athena-q: {message}", file=sys.stderr)
+        sys.exit(3)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = Parser(
+        prog="athena-q",
+        description="Run one Athena query: poll, page, print small.",
+        epilog="Read the header of this script for the guard rules and exit codes.",
+    )
+    p.add_argument(
+        "--profile",
+        required=True,
+        metavar="P",
+        help="AWS SSO profile (required, never defaulted)",
+    )
+    p.add_argument(
+        "--workgroup",
+        required=True,
+        metavar="W",
+        help="Athena workgroup (required, never defaulted)",
+    )
+    p.add_argument("--database", metavar="D")
+    p.add_argument("--catalog", metavar="C")
+    p.add_argument(
+        "--region",
+        default=DEFAULT_REGION,
+        metavar="R",
+        help=f"default {DEFAULT_REGION}",
+    )
+    p.add_argument(
+        "--output-location",
+        metavar="s3://...",
+        help="result S3 location (when the workgroup has none)",
+    )
+    p.add_argument(
+        "-f", "--file", metavar="FILE", help="read the SQL from FILE ('-' = stdin)"
+    )
+    p.add_argument("-e", "--execute", metavar="SQL", help="the SQL text")
+    p.add_argument(
+        "--max-rows",
+        type=int,
+        default=DEFAULT_MAX_ROWS,
+        metavar="N",
+        help=f"rows shown (default {DEFAULT_MAX_ROWS})",
+    )
+    fmt = p.add_mutually_exclusive_group()
+    fmt.add_argument(
+        "--tsv", action="store_true", help="raw TSV instead of the aligned table"
+    )
+    fmt.add_argument("--json", action="store_true", help="JSON list of objects")
+    p.add_argument(
+        "--out",
+        metavar="FILE",
+        help="write the full result to FILE; print only path and row count",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        metavar="S",
+        help=f"seconds (default {DEFAULT_TIMEOUT})",
+    )
+    p.add_argument(
+        "--allow-write", action="store_true", help="permit non-read-only statements"
+    )
+    p.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="print the aws argv and guard verdict only",
+    )
+    args = p.parse_args(argv)
+    if not args.profile.strip() or not args.workgroup.strip():
+        p.error("--profile and --workgroup must not be empty")
+    if args.file is not None and args.execute is not None:
+        p.error("give the SQL with -f or -e, not both")
+    if args.max_rows < 1:
+        p.error("--max-rows must be at least 1")
+    if args.timeout <= 0:
+        p.error("--timeout must be positive")
+    if args.output_location and not args.output_location.startswith("s3://"):
+        p.error("--output-location must start with s3://")
+    return args
+
+
+def read_sql(args: argparse.Namespace) -> str:
+    if args.execute is not None:
+        return args.execute
+    if args.file is not None and args.file != "-":
+        try:
+            with open(args.file, encoding="utf-8") as fh:
+                return fh.read()
+        except OSError as e:
+            raise UsageError(f"cannot read {args.file}: {e.strerror or e}") from None
+    if args.file is None and sys.stdin.isatty():
+        raise UsageError("no SQL: pass -f FILE, -e SQL, or pipe the SQL on stdin")
+    return sys.stdin.read()
+
+
+def check_out_path(path: str) -> None:
+    if os.path.isdir(path):
+        raise UsageError(f"--out {path} is a directory")
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent) or not os.access(parent, os.W_OK):
+        raise UsageError(f"--out: {parent} is not a writable directory")
+
+
+def report_aws_error(e: AwsError, profile: str) -> int:
+    if e.kind == "creds":
+        print(
+            f"athena-q: AWS credentials for profile {profile} are missing or expired ({e}).",
+            file=sys.stderr,
+        )
+        print(
+            f"athena-q: re-authenticate with:  aws sso login --profile {shlex.quote(profile)}",
+            file=sys.stderr,
+        )
+    else:
+        print(f"athena-q: aws error: {e}", file=sys.stderr)
+    return 4
+
+
+def run(args: argparse.Namespace) -> int:
+    sql = read_sql(args)
+    if not sql.strip():
+        raise UsageError("the SQL is empty")
+    read_only, detail = guard_verdict(sql)
+    aws = Aws(args.profile, args.region)
+    start = start_args(args, sql)
+
+    if args.dry_run:
+        print(shlex.join(aws.argv(start)))
+        if read_only:
+            print(f"athena-q: guard: read-only {detail} statement, allowed")
+            return 0
+        if args.allow_write:
+            print(f"athena-q: guard: would refuse ({detail}); --allow-write overrides")
+            return 0
+        print(
+            f"athena-q: guard: REFUSED ({detail}); --allow-write would be needed",
+            file=sys.stderr,
+        )
+        return 3
+
+    if not read_only:
+        if not args.allow_write:
+            raise UsageError(
+                f"refused: {detail}. Only one read-only statement is allowed; "
+                "use --allow-write for anything that can modify data"
+            )
+        print(
+            "athena-q: --allow-write: running a statement that can modify data",
+            file=sys.stderr,
+        )
+    if args.out:
+        check_out_path(args.out)
+
+    try:
+        qid = str(aws.call(start).get("QueryExecutionId") or "")
+        if not qid:
+            raise AwsError("start-query-execution returned no QueryExecutionId")
+        try:
+            qe = wait_for_query(aws, qid, args.timeout)
+        except QueryTimeout:
+            print(
+                f"athena-q: timed out after {args.timeout:g}s qid={qid}; stopping the query",
+                file=sys.stderr,
+            )
+            stop_query(aws, qid)
+            return 2
+        except KeyboardInterrupt:
+            stop_query(aws, qid)
+            return 130
+        except AwsError as e:
+            # Credentials or the profile failed (or polling kept failing) after the query
+            # started: it is probably still running. Name it, and try to stop it.
+            print(
+                f"athena-q: lost contact with AWS while waiting; query qid={qid} may still be running "
+                f"({e}); trying to stop it",
+                file=sys.stderr,
+            )
+            stop_query(aws, qid)
+            raise
+        print(status_line(qe, qid), flush=True)
+        state = (qe.get("Status") or {}).get("State")
+        if state != "SUCCEEDED":
+            reason = (qe.get("Status") or {}).get(
+                "StateChangeReason"
+            ) or "(no reason given)"
+            print(f"athena-q: {state}: {reason}", file=sys.stderr)
+            return 1
+        if args.out:
+            count = write_rows(aws, qid, args)
+            print(f"athena-q: wrote {count} rows to {args.out}")
+        else:
+            show_rows(aws, qid, args)
+        return 0
+    except AwsError as e:
+        return report_aws_error(e, args.profile)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    try:
+        return run(args)
+    except UsageError as e:
+        print(f"athena-q: {e}", file=sys.stderr)
+        return 3
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

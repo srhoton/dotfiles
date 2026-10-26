@@ -11,6 +11,10 @@ Helper executables on `PATH` for Claude Code workflows.
   - `--show <slug>` prints one ADR and its guide in full.
   - `--no-fetch`, `--root`. Read-only apart from `git fetch`.
 - `agent-msg` — inter-Claude mailbox CLI (legacy filesystem mailbox).
+- `athena-q` — runs one Athena query: `--profile` and `--workgroup` are required and never defaulted; SQL comes from `-e`, `-f` or stdin.
+  - Polls with 1-5s backoff and trusts a terminal state only when seen twice. Prints `athena-q: <state> qid= runtime= scanned= result=`, then up to `--max-rows` rows (table, `--tsv`, `--json`); `--out FILE` writes the full result and prints only the path and row count (slow above ~100k rows; use the S3 `result=` location for those).
+  - Read-only by default: one SELECT/WITH/SHOW/DESCRIBE/EXPLAIN/VALUES statement; anything else needs `--allow-write`. It is a keyword guard, not a SQL parser.
+  - Exit codes: 0 ok, 1 failed, 2 timed out (query stopped), 3 usage or guard refusal, 4 AWS error (prints the `aws sso login --profile` command). Tests: `bin/tests/athena-q.sh`.
 - `fanout-report` — turns a `review-fanout` workflow output file (the wrapped, bare, or embedded result) into a markdown report under `~/.claude/scratch/<repo>/`.
   - The report holds numbered actionable findings with verified yes/NO, refuted findings with their refutations, informational findings, and skipped reviewers.
   - Prints only the path and the counts (`--out`, `--stdout`, `--repo`).
