@@ -38,6 +38,18 @@
 #   gradle     gradlew + build.gradle[.kts]. BUILD = ./gradlew [spotlessApply] build
 #              (spotlessApply REFORMATS source files in the working tree);
 #              counts and failing tests come from build/test-results XML.
+#              If ORG_GRADLE_PROJECT_codeartifactToken is unset, no
+#              `codeartifactToken=` is set in $GRADLE_USER_HOME/gradle.properties
+#              (default ~/.gradle) or the project's gradle.properties, and the
+#              build or settings files mention codeartifact, the token comes from
+#              `ca-token --env gradle`; if that fails BUILD is FAIL with the
+#              `aws sso login` hint. Node does the same (`ca-token --env npm`)
+#              when .npmrc references AWS_CODEARTIFACT_TOKEN and it is unset,
+#              but only when an install will actually run (node_modules missing
+#              or stale, and no --no-install); a current node_modules or
+#              --no-install never fetches a token (failure = INSTALL FAIL). A
+#              token already in the environment is used as is; the token is
+#              never printed or logged.
 #   go         go.mod. TYPECHECK go build, LINT golangci-lint (if configured),
 #              TESTS go test ./...
 #   python     pyproject.toml. TYPECHECK uv run --frozen mypy, LINT uv run --frozen
@@ -60,6 +72,7 @@
 # Environment (for tests):
 #   REPO_GATE_FAKE_BIN   directory prepended to PATH (stub pnpm/mise/jest/...)
 #   REPO_GATE_VET_DIFF   path to use instead of the sibling vet-diff
+#   REPO_GATE_CA_TOKEN   path to use instead of the sibling ca-token
 #
 set -uo pipefail
 
@@ -157,6 +170,37 @@ simple_gate() {
 }
 
 count_of() { printf '%s' "$1" | grep -Eo "[0-9]+ $2" | head -1 | grep -Eo '^[0-9]+'; }
+
+# ca_token_env KIND VAR : make sure the CodeArtifact token VAR is in the
+# environment. Already set -> nothing to do. Otherwise export it from
+# `ca-token --env KIND`. Returns 1 on failure, with CA_DETAIL (one line, carries
+# the `aws sso login` hint) and CA_EXCERPT (ca-token's stderr) set for emit.
+# The token only ever lives in this shell's variables: ca-token's stdout is
+# captured, never written to a log, and never echoed.
+CA_DETAIL=""; CA_EXCERPT=""; CA_SECS=0
+ca_token_env() {
+  local kind=$1 var=$2 ca="${REPO_GATE_CA_TOKEN:-$SELF_DIR/ca-token}" out rc hint t0=$SECONDS
+  local errf="$LOGDIR/ca-token-$kind.err"
+  if [ -n "${!var:-}" ]; then return 0; fi
+  if [ ! -x "$ca" ]; then
+    echo "ca-token not found at $ca" > "$errf"; rc=127; out=""
+  else
+    out="$("$ca" --env "$kind" 2> "$errf" < /dev/null)"; rc=$?
+  fi
+  CA_SECS=$((SECONDS - t0))
+  # The only acceptable stdout is the single export line for this variable.
+  if [ "$rc" -eq 0 ]; then
+    case "$out" in
+      "export $var='"*"'") eval "$out"; export "${var?}"; return 0 ;;
+    esac
+    echo "ca-token printed an unexpected line (not an export of $var)" >> "$errf"; rc=1
+  fi
+  hint="$(grep -m1 'aws sso login' "$errf" | sed 's/^ca-token: //')"
+  CA_DETAIL="CodeArtifact token unavailable (ca-token exit $rc)${hint:+: $hint}"
+  CA_EXCERPT="$errf"
+  return 1
+}
+GRADLE_CA_SET=0; NODE_CA_SET=0
 
 # ---- Node --------------------------------------------------------------------
 PKG_PY='
@@ -356,6 +400,18 @@ run_node() {
   elif [ "$NODE_LOCK" -eq 0 ]; then
     emit node INSTALL SKIPPED 0 "no lockfile; refusing an unfrozen install"
   else
+    # Only an install that will actually run needs the CodeArtifact token; with
+    # node_modules current or --no-install the gates stay offline.
+    if [ -z "${AWS_CODEARTIFACT_TOKEN:-}" ] && grep -Eqs 'AWS_CODEARTIFACT_TOKEN' "$ROOT/.npmrc"; then
+      if ! ca_token_env npm AWS_CODEARTIFACT_TOKEN; then
+        emit node INSTALL FAIL "$CA_SECS" "$CA_DETAIL" "$CA_EXCERPT"
+        emit node TYPECHECK SKIPPED 0 "install failed"
+        emit node LINT SKIPPED 0 "install failed"
+        emit node TESTS SKIPPED 0 "install failed"
+        return
+      fi
+      NODE_CA_SET=1
+    fi
     local -a cmd
     case "$NODE_PM_NAME" in
       pnpm) cmd=("${NODE_PM[@]}" install --frozen-lockfile) ;;
@@ -441,10 +497,28 @@ make_marker() { # backdated 2s so same-second writes still count as newer
   if [ -n "$ts" ]; then touch -t "$ts" "$m" 2>/dev/null; fi
 }
 
+# True when a non-empty `codeartifactToken` property is already set in the user's
+# gradle.properties ($GRADLE_USER_HOME, default ~/.gradle) or the project's: Gradle
+# reads it itself, so no token needs fetching (and an offline run still works).
+# Only the key is looked at; the value is never read into a variable or printed.
+gradle_token_configured() {
+  grep -Eqs '^[[:space:]]*codeartifactToken[[:space:]]*[=:][[:space:]]*[^[:space:]]' \
+    "${GRADLE_USER_HOME:-$HOME/.gradle}/gradle.properties" "$ROOT/gradle.properties"
+}
+
 run_gradle() {
   local -a cmd=(./gradlew build)
   if grep -Eqs 'spotless' "$ROOT/build.gradle" "$ROOT/build.gradle.kts"; then cmd=(./gradlew spotlessApply build); fi
   local marker="$LOGDIR/gradle.marker" list="$LOGDIR/gradle-xml.list"
+  if [ -z "${ORG_GRADLE_PROJECT_codeartifactToken:-}" ] \
+     && grep -Eqis 'codeartifact' "$ROOT/build.gradle" "$ROOT/build.gradle.kts" "$ROOT/settings.gradle" "$ROOT/settings.gradle.kts" \
+     && ! gradle_token_configured; then
+    if ! ca_token_env gradle ORG_GRADLE_PROJECT_codeartifactToken; then
+      emit gradle BUILD FAIL "$CA_SECS" "$CA_DETAIL" "$CA_EXCERPT"
+      return
+    fi
+    GRADLE_CA_SET=1
+  fi
   make_marker "$marker"
   run_cmd gradle BUILD "${cmd[@]}"
   local build_rc=$RC build_secs=$SECS build_log=$LOG
@@ -630,8 +704,14 @@ run_terraform_dir() {
 }
 
 # ---- main --------------------------------------------------------------------
-[ "$HAS_NODE" -eq 1 ] && run_node
-[ "$HAS_GRADLE" -eq 1 ] && run_gradle
+if [ "$HAS_NODE" -eq 1 ]; then
+  run_node
+  if [ "$NODE_CA_SET" -eq 1 ]; then unset AWS_CODEARTIFACT_TOKEN; fi
+fi
+if [ "$HAS_GRADLE" -eq 1 ]; then
+  run_gradle
+  if [ "$GRADLE_CA_SET" -eq 1 ]; then unset ORG_GRADLE_PROJECT_codeartifactToken; fi
+fi
 [ "$HAS_GO" -eq 1 ] && run_go
 [ "$HAS_PY" -eq 1 ] && run_python
 if [ "${#TF_DIRS[@]}" -gt 0 ]; then
