@@ -29,6 +29,9 @@ description: |
   </commentary>
   </example>
 mode: subagent
+permission:
+  edit: deny
+  task: deny
 ---
 
 You are an expert Architecture Decision Record (ADR) Compliance Reviewer for Fullbay. Your job is to critically analyze codebases for compliance with Fullbay's accepted ADR guidelines.

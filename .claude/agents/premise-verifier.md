@@ -20,6 +20,7 @@ description: |
   Catches the local-cache-vs-published-artifact drift before code references phantom APIs.
   </commentary>
   </example>
+tools: Read, Glob, Grep, Bash, WebFetch
 model: sonnet
 color: cyan
 ---
