@@ -14,6 +14,10 @@ Helper executables on `PATH` for Claude Code workflows.
   - Prints nothing secret by default. `eval "$(ca-token --env gradle|npm)"` puts the token in the environment (`ORG_GRADLE_PROJECT_codeartifactToken` / `AWS_CODEARTIFACT_TOKEN`); `--print` is the explicit opt-in; `--check` tests the cache without calling aws.
   - A failed fetch never falls back to a stale token: it prints `aws sso login --profile <P>` and exits 4 (3 = usage or no `aws`). `repo-gate` calls it for Gradle and Node repos that need it. Tests: `bin/tests/ca-token.sh`.
 - `agent-msg` — inter-Claude mailbox CLI (legacy filesystem mailbox).
+- `athena-q` — runs one Athena query: `--profile` and `--workgroup` are required and never defaulted; SQL comes from `-e`, `-f` or stdin.
+  - Polls with 1-5s backoff and trusts a terminal state only when seen twice. Prints `athena-q: <state> qid= runtime= scanned= result=`, then up to `--max-rows` rows (table, `--tsv`, `--json`); `--out FILE` writes the full result and prints only the path and row count (slow above ~100k rows; use the S3 `result=` location for those).
+  - Read-only by default: one SELECT/WITH/SHOW/DESCRIBE/EXPLAIN/VALUES statement; anything else needs `--allow-write`. It is a keyword guard, not a SQL parser.
+  - Exit codes: 0 ok, 1 failed, 2 timed out (query stopped), 3 usage or guard refusal, 4 AWS error (prints the `aws sso login --profile` command). Tests: `bin/tests/athena-q.sh`.
 - `fanout-report` — turns a `review-fanout` workflow output file (the wrapped, bare, or embedded result) into a markdown report under `~/.claude/scratch/<repo>/`.
   - The report holds numbered actionable findings with verified yes/NO, refuted findings with their refutations, informational findings, and skipped reviewers.
   - Prints only the path and the counts (`--out`, `--stdout`, `--repo`).
