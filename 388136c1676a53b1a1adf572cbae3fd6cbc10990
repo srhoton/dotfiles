@@ -1,0 +1,3 @@
+Evidence: ~/.claude/scratch/claude-usage/week-2026-10-31.md (costs counted once per message.id).
+Simulation over last week's 137 implementer runs: cap 200K saves ~$223/wk (+99 compactions), 300K ~$162 (+46), 400K ~$109 (+23).
+Suites: generator 17 OK, plugin 12/0, implementer-gate 18/0, claude-to-opencode --check clean; fresh-session implementer dispatch loads and returns.
