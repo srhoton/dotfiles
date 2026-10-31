@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""cc-usage: what Claude Code sessions cost, from the transcripts, counted once per API response.
+
+One API response is written to the session JSONL as several lines (thinking, text, tool_use,
+...), each repeating `message.usage`, and streaming can rewrite that usage with a growing
+`output_tokens`. Summing every line overcounts (by 2.4x in the analysis this tool replaces).
+So responses are deduplicated per transcript file by `message.id` (falling back to the line's
+`uuid`), keeping the line with the largest `output_tokens`, i.e. the final one.
+
+Usage: cc-usage [--since 7d|YYYY-MM-DD] [--until ...] [--by kind|agent|repo|session|day|model]
+                [--agent TYPE] [--repo SUBSTR] [--top N] [--json] [--root DIR]
+  --since WHEN    start of the window, inclusive: `Nd` or `Nh` ago, or a date / ISO datetime
+                  (UTC). Default 7d.
+  --until WHEN    end of the window (default: now). A plain date includes that whole day;
+                  `Nd`/`Nh` mean that long ago; an ISO datetime is exclusive.
+  --by GROUP      kind (main|subagent|workflow, the default), agent, repo, session, day (UTC)
+                  or model.
+  --agent TYPE    keep only this agent: `main`, a subagent's agentType, or `workflow:<prefix>`;
+                  `workflow` matches every workflow agent. Applied before grouping.
+  --repo SUBSTR   keep only projects whose repo name contains SUBSTR. Applied before grouping.
+  --top N         show the N most expensive groups (default 15; 0 = all). TOTAL always covers
+                  every group.
+  --json          one JSON object: {by, since, until, groups: [...], omitted, total}.
+  --root DIR      the projects directory (default ~/.claude/projects).
+
+Transcripts read under the root:
+  <project>/<session>.jsonl                                  main session
+  <project>/<session>/subagents/agent-*.jsonl                subagent; type from the sibling
+                                                             agent-*.meta.json `agentType`
+  <project>/<session>/subagents/workflows/<wf>/agent-*.jsonl workflow agent; type is
+                                                             `workflow:<label prefix>` from the
+                                                             workflow's journal.jsonl `started`
+                                                             events (`review:functional` ->
+                                                             `workflow:review`), else `workflow`
+repo is the project directory name without its `-Users-<user>-git-` / `-Users-<user>-` prefix;
+session is the session id.
+
+Per group: cost, share, runs (distinct transcript files), responses, median and max responses
+per run, median and max peak context per run (context = input + cache_read + cache_creation
+tokens of one response), cache-read $, cache-write $ (1h / 5m), output $. Cost uses the list
+prices in PRICES below. `<synthetic>` responses (not API calls) are left out entirely.
+A file whose mtime is before the window start is not opened (it cannot hold a later response).
+Lines that are not JSON, or carry no usage, are skipped; their count goes to stderr.
+
+Exit 0 normally, 2 on a usage error or an unreadable root. Read-only. Standard library only.
+Testing: bin/tests/cc-usage.sh builds a synthetic tree and passes it with --root.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import re
+import statistics
+import sys
+from typing import Any
+
+# List prices in USD per million tokens (input, output, cache read). They are NOT fetched from
+# anywhere: update them by hand whenever Anthropic changes its pricing or a new model tier
+# appears. Cache writes are derived from the input price: 5-minute writes cost 1.25x, 1-hour
+# writes 2x. A model whose name matches no tier is priced as opus, the most expensive one.
+PRICES = {
+    "opus": {"input": 4.0, "output": 20.0, "cache_read": 0.20},
+    "fable": {"input": 4.0, "output": 20.0, "cache_read": 0.20},
+    "sonnet": {"input": 2.0, "output": 10.0, "cache_read": 0.20},
+    "haiku": {"input": 1.0, "output": 5.0, "cache_read": 0.10},
+}
+DEFAULT_TIER = "opus"
+CACHE_WRITE_5M_X = 1.25
+CACHE_WRITE_1H_X = 2.0
+
+GROUPINGS = ("kind", "agent", "repo", "session", "day", "model")
+SYNTHETIC = "<synthetic>"
+TS_RE = re.compile(r"^\d{4}-\d\d-\d\dT")
+REL_RE = re.compile(r"^(\d+)([dh])$")
+
+
+class UsageError(Exception):
+    pass
+
+
+# ---- pricing -------------------------------------------------------------------
+
+def tier(model: str) -> str:
+    return next((t for t in PRICES if t in model), DEFAULT_TIER)
+
+
+def _int(v: Any) -> int:
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
+def tokens(u: dict) -> dict:
+    """The token counts of one usage object, with cache writes split into 1h and 5m."""
+    cc = u.get("cache_creation")
+    cc = cc if isinstance(cc, dict) else {}
+    w1 = _int(cc.get("ephemeral_1h_input_tokens"))
+    total = _int(u.get("cache_creation_input_tokens")) or w1 + _int(cc.get("ephemeral_5m_input_tokens"))
+    return {
+        "input": _int(u.get("input_tokens")),
+        "output": _int(u.get("output_tokens")),
+        "cache_read": _int(u.get("cache_read_input_tokens")),
+        "write_1h": w1,
+        "write_5m": max(total - w1, 0),
+    }
+
+
+def cost_parts(model: str, t: dict) -> dict:
+    p = PRICES[tier(model)]
+    return {
+        "input": t["input"] * p["input"] / 1e6,
+        "output": t["output"] * p["output"] / 1e6,
+        "cache_read": t["cache_read"] * p["cache_read"] / 1e6,
+        "write_1h": t["write_1h"] * p["input"] * CACHE_WRITE_1H_X / 1e6,
+        "write_5m": t["write_5m"] * p["input"] * CACHE_WRITE_5M_X / 1e6,
+    }
+
+
+def context_size(t: dict) -> int:
+    return t["input"] + t["cache_read"] + t["write_1h"] + t["write_5m"]
+
+
+# ---- reading transcripts -------------------------------------------------------
+
+def responses(path: str, skipped: list) -> list:
+    """One (timestamp, model, usage) per API response in a transcript, in first-seen order.
+
+    Lines of one response share message.id (else the line uuid, else they are all distinct);
+    the line with the largest output_tokens wins, the later one on a tie.
+    """
+    best: dict = {}
+    order: list = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for n, line in enumerate(fh):
+                if '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    skipped[0] += 1
+                    continue
+                if not isinstance(d, dict) or d.get("type") != "assistant":
+                    continue
+                m = d.get("message")
+                if not isinstance(m, dict) or not isinstance(m.get("usage"), dict):
+                    continue
+                key = m.get("id") or d.get("uuid") or f"line{n}"
+                u = m["usage"]
+                if key not in best:
+                    order.append(key)
+                elif _int(u.get("output_tokens")) < _int(best[key][2].get("output_tokens")):
+                    continue
+                ts = d.get("timestamp")
+                best[key] = (ts if isinstance(ts, str) else "", str(m.get("model") or ""), u)
+    except OSError as e:
+        print(f"cc-usage: WARNING: cannot read {path}: {e}", file=sys.stderr)
+        return []
+    return [best[k] for k in order]
+
+
+def journal_labels(wf_dir: str) -> dict:
+    """agentId -> label from a workflow's journal.jsonl `started` events (best effort)."""
+    labels: dict = {}
+    try:
+        with open(os.path.join(wf_dir, "journal.jsonl"), encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and d.get("type") == "started" and d.get("agentId") and isinstance(d.get("label"), str):
+                    labels[d["agentId"]] = d["label"]
+    except OSError:
+        pass
+    return labels
+
+
+def agent_type_from_meta(path: str) -> str:
+    try:
+        with open(path[: -len(".jsonl")] + ".meta.json", encoding="utf-8", errors="replace") as fh:
+            at = json.load(fh).get("agentType")
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+    return at if isinstance(at, str) and at else "unknown"
+
+
+def repo_name(project: str) -> str:
+    stripped = re.sub(r"^-Users-[^-]+-git-", "", project, count=1)
+    if stripped == project:
+        stripped = re.sub(r"^-Users-[^-]+-", "", project, count=1)
+    return stripped or project
+
+
+def transcripts(root: str) -> list:
+    """(path, kind, agent, project, session) for every transcript under root."""
+    found = []
+    for p in sorted(glob.glob(os.path.join(glob.escape(root), "*", "*.jsonl"))):
+        found.append((p, "main", "main", os.path.basename(os.path.dirname(p)), os.path.basename(p)[: -len(".jsonl")]))
+    for p in sorted(glob.glob(os.path.join(glob.escape(root), "*", "*", "subagents", "agent-*.jsonl"))):
+        sess_dir = os.path.dirname(os.path.dirname(p))
+        found.append((p, "subagent", agent_type_from_meta(p),
+                      os.path.basename(os.path.dirname(sess_dir)), os.path.basename(sess_dir)))
+    wf_labels: dict = {}
+    for p in sorted(glob.glob(os.path.join(glob.escape(root), "*", "*", "subagents", "workflows", "*", "agent-*.jsonl"))):
+        wf_dir = os.path.dirname(p)
+        sess_dir = os.path.dirname(os.path.dirname(os.path.dirname(wf_dir)))
+        if wf_dir not in wf_labels:
+            wf_labels[wf_dir] = journal_labels(wf_dir)
+        agent_id = os.path.basename(p)[len("agent-"): -len(".jsonl")]
+        prefix = wf_labels[wf_dir].get(agent_id, "").split(":", 1)[0].strip()
+        found.append((p, "workflow", f"workflow:{prefix}" if prefix else "workflow",
+                      os.path.basename(os.path.dirname(sess_dir)), os.path.basename(sess_dir)))
+    return found
+
+
+# ---- window --------------------------------------------------------------------
+
+def _stamp(d: dt.datetime) -> str:
+    return d.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def parse_when(text: str, now: dt.datetime, is_until: bool) -> str:
+    """A bound as an ISO-8601 UTC string, comparable with the transcripts' timestamps."""
+    m = REL_RE.match(text)
+    if m:
+        n = int(m.group(1))
+        return _stamp(now - (dt.timedelta(days=n) if m.group(2) == "d" else dt.timedelta(hours=n)))
+    try:
+        if re.fullmatch(r"\d{4}-\d\d-\d\d", text):
+            day = dt.datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=dt.timezone.utc)
+            return _stamp(day + dt.timedelta(days=1) if is_until else day)
+        when = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise UsageError(f"cannot read {text!r} as a time: use Nd, Nh, YYYY-MM-DD or an ISO datetime")
+    return _stamp(when if when.tzinfo else when.replace(tzinfo=dt.timezone.utc))
+
+
+# ---- aggregation ---------------------------------------------------------------
+
+class Group:
+    def __init__(self) -> None:
+        self.cost = {"input": 0.0, "output": 0.0, "cache_read": 0.0, "write_1h": 0.0, "write_5m": 0.0}
+        self.responses = 0
+        self.runs: dict = {}  # path -> [responses, peak context]
+
+    def add(self, path: str, cost: dict, ctx: int) -> None:
+        for k, v in cost.items():
+            self.cost[k] += v
+        self.responses += 1
+        run = self.runs.setdefault(path, [0, 0])
+        run[0] += 1
+        run[1] = max(run[1], ctx)
+
+    def row(self, name: str, grand: float) -> dict:
+        total = sum(self.cost.values())
+        per_run = [r[0] for r in self.runs.values()]
+        peaks = [r[1] for r in self.runs.values()]
+        return {
+            "name": name,
+            "cost_usd": round(total, 6),
+            "share_pct": round(100 * total / grand, 2) if grand else 0.0,
+            "runs": len(self.runs),
+            "responses": self.responses,
+            "responses_per_run_median": statistics.median(per_run) if per_run else 0,
+            "responses_per_run_max": max(per_run, default=0),
+            "peak_context_median": statistics.median(peaks) if peaks else 0,
+            "peak_context_max": max(peaks, default=0),
+            "input_usd": round(self.cost["input"], 6),
+            "cache_read_usd": round(self.cost["cache_read"], 6),
+            "cache_write_1h_usd": round(self.cost["write_1h"], 6),
+            "cache_write_5m_usd": round(self.cost["write_5m"], 6),
+            "output_usd": round(self.cost["output"], 6),
+        }
+
+
+def group_name(by: str, kind: str, agent: str, project: str, session: str, ts: str, model: str) -> str:
+    if by == "kind":
+        return kind
+    if by == "agent":
+        return agent
+    if by == "repo":
+        return repo_name(project)
+    if by == "session":
+        return session
+    if by == "day":
+        return ts[:10]
+    return model or "unknown"
+
+
+def aggregate(args: argparse.Namespace, since: str, until: str, skipped: list) -> tuple:
+    groups: dict = {}
+    total = Group()
+    since_epoch = dt.datetime.strptime(since[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
+    for path, kind, agent, project, session in transcripts(args.root):
+        if args.agent and agent != args.agent and not agent.startswith(args.agent + ":"):
+            continue
+        if args.repo and args.repo not in repo_name(project):
+            continue
+        try:
+            if os.path.getmtime(path) < since_epoch:
+                continue  # last written before the window opened: nothing in it
+        except OSError:
+            continue
+        for ts, model, usage in responses(path, skipped):
+            if model == SYNTHETIC or not TS_RE.match(ts) or ts < since or ts >= until:
+                continue
+            t = tokens(usage)
+            parts, ctx = cost_parts(model, t), context_size(t)
+            name = group_name(args.by, kind, agent, project, session, ts, model)
+            groups.setdefault(name, Group()).add(path, parts, ctx)
+            total.add(path, parts, ctx)
+    return groups, total
+
+
+# ---- output --------------------------------------------------------------------
+
+def money(v: float) -> str:
+    return f"${v:,.2f}"
+
+
+def tok(v: float) -> str:
+    if v >= 1_000_000:
+        return f"{v / 1e6:.2f}M"
+    if v >= 1000:
+        return f"{v / 1000:.0f}k"
+    return f"{v:g}"
+
+
+def render_text(rows: list, total: dict, omitted: dict, by: str, since: str, until: str) -> str:
+    head = [by.upper(), "COST", "SHARE", "RUNS", "RESP", "RESP/RUN med/max", "PEAK-CTX med/max",
+            "CACHE-RD", "WRITE-1H", "WRITE-5M", "OUTPUT"]
+
+    def cells(r: dict) -> list:
+        return [r["name"], money(r["cost_usd"]), f"{r['share_pct']:.1f}%", str(r["runs"]), str(r["responses"]),
+                f"{r['responses_per_run_median']:g}/{r['responses_per_run_max']}",
+                f"{tok(r['peak_context_median'])}/{tok(r['peak_context_max'])}",
+                money(r["cache_read_usd"]), money(r["cache_write_1h_usd"]), money(r["cache_write_5m_usd"]),
+                money(r["output_usd"])]
+
+    body = [cells(r) for r in rows]
+    foot = cells(dict(total, name="TOTAL"))
+    widths = [max(len(row[i]) for row in [head] + body + [foot]) for i in range(len(head))]
+
+    def fmt(row: list) -> str:
+        first = row[0].ljust(widths[0])
+        return "  ".join([first] + [c.rjust(w) for c, w in zip(row[1:], widths[1:])]).rstrip()
+
+    out = [f"cc-usage: {since} .. {until} (UTC), by {by}", fmt(head)] + [fmt(r) for r in body]
+    if omitted["groups"]:
+        out.append(f"... {omitted['groups']} more group(s), {money(omitted['cost_usd'])} (--top 0 shows all)")
+    out.append(fmt(foot))
+    return "\n".join(out)
+
+
+def parse_args(argv: list) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="cc-usage", usage=argparse.SUPPRESS, add_help=False)
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("--since", default="7d")
+    p.add_argument("--until")
+    p.add_argument("--by", default="kind", choices=GROUPINGS)
+    p.add_argument("--agent")
+    p.add_argument("--repo")
+    p.add_argument("--top", type=int, default=15)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--root", default=os.path.join(os.path.expanduser("~"), ".claude", "projects"))
+    args = p.parse_args(argv)
+    if args.help:
+        print(__doc__.rstrip())
+        sys.exit(0)
+    if args.top < 0:
+        p.error("--top must be 0 or more")
+    return args
+
+
+def main(argv: list) -> int:
+    args = parse_args(argv)
+    now = dt.datetime.now(dt.timezone.utc)
+    try:
+        since = parse_when(args.since, now, False)
+        until = parse_when(args.until, now, True) if args.until else _stamp(now + dt.timedelta(seconds=1))
+        if not os.path.isdir(args.root):
+            raise UsageError(f"root {args.root} is not a directory")
+    except UsageError as e:
+        print(f"cc-usage: {e}", file=sys.stderr)
+        return 2
+    skipped = [0]
+    groups, total = aggregate(args, since, until, skipped)
+    grand = sum(total.cost.values())
+    ranked = sorted(((sum(g.cost.values()), n, g) for n, g in groups.items()), key=lambda x: (-x[0], x[1]))
+    shown = ranked if args.top == 0 else ranked[: args.top]
+    rows = [g.row(n, grand) for _, n, g in shown]
+    rest = ranked[len(shown):]
+    omitted = {"groups": len(rest), "cost_usd": round(sum(c for c, _, _ in rest), 6)}
+    total_row = total.row("TOTAL", grand)
+    if args.json:
+        print(json.dumps({"by": args.by, "since": since, "until": until, "groups": rows,
+                          "omitted": omitted, "total": total_row}, indent=2))
+    else:
+        print(render_text(rows, total_row, omitted, args.by, since, until))
+    if skipped[0]:
+        print(f"cc-usage: skipped {skipped[0]} line(s) that were not valid JSON", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
