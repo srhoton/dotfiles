@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""pr-stack: where does each of my PRs sit in a stack, and is its parent still alive?
+
+A stacked PR is a child whose base branch is another PR's head branch. When the parent
+merges, a child still based on the parent's branch strands its content, so the child must
+be retargeted onto the parent's own base. This replaces the hand-written `gh pr view N --json
+state,...` / `git fetch && git log origin/...` polling that checks for that.
+
+Usage: pr-stack [PR#...] [-R owner/repo] [--retarget] [--json]
+  PR#...          PR numbers (`#7` works too). With none: the open PRs authored by @me in the
+                  repo (`gh pr list --author @me --state open`).
+  -R owner/repo   repository (default: `gh repo view` in the current directory)
+  --retarget      for each NEEDS-RETARGET PR run `gh pr edit N --base <new>` and print
+                  `retargeted #N: <old> -> <new>`. <new> is the merged parent's own base
+                  branch (so A <- B <- C, with B merged into A while A is open, moves C onto A,
+                  not the default branch); if that branch is itself the spent head of a merged
+                  PR it walks up, and it stops at the default branch. Just before each edit the
+                  PR is re-read and skipped (with a message, still exit 3) if its base or state
+                  changed. A failed edit is reported on stderr and recorded as `retargetError`;
+                  the remaining PRs are still processed and the report is still printed. Without
+                  --retarget nothing is ever mutated. It does not rebase: a retargeted PR may
+                  now need a rebase onto <new>.
+  --json          one JSON array, one object per PR: number, url, state, isDraft, baseRefName,
+                  headRefName, headRefOid, mergedAt, parent ({number, state} or null), verdict,
+                  note, ahead, behind (null when not in a clone), retargeted, retargetError.
+
+One text line per PR:
+  #N STATE base=<base> head=<sha7> parent=#P(<state>)|none -> VERDICT  [ahead A / behind B]
+VERDICT:
+  OK              base is the default branch, the parent PR is still open, or the base is a
+                  live or protected branch (note: `base is a live branch (parent #P merged
+                  earlier)` / `base is a protected branch (parent #P merged earlier)`)
+  NEEDS-RETARGET  the parent PR merged, its branch is spent, and this PR's base is still it
+  PARENT-CLOSED   the parent PR was closed without merging
+  NO-PARENT-PR    base is not the default branch and no PR has that head branch
+  MERGED/CLOSED   the PR itself is already merged / closed
+The parent is the same-repo PR (fork PRs with that head name are ignored) whose head branch is
+this PR's base branch: an open one wins outright, else the most recently merged/closed one. A
+merged parent only counts as spent when the base branch no longer exists on the remote or its
+tip is still the parent's merged head; a base branch that moved on, or that is protected (e.g.
+`develop` right after a `develop -> main` release PR, when its tip still equals that PR's head),
+is live and is never retargeted. When the cwd is a clone whose
+`origin` is the repo, the PR head's ahead/behind vs origin/<default> is added after
+`git fetch -q origin` (a failed fetch, or no git, warns and skips it). Outside a clone it is
+simply left out. A `gh pr list` that returns exactly its limit warns on stderr (results may be
+cut off).
+
+Exit 0 every PR fetched and nothing needs attention (or every NEEDS-RETARGET was retargeted),
+1 a PR was not found, 2 usage error or a gh failure (including a failed retarget or an
+unexpected gh response), 3 a PR is NEEDS-RETARGET without --retarget (or skipped because it
+changed), or is PARENT-CLOSED / NO-PARENT-PR (a retarget cannot fix those, so they stay 3 even
+with --retarget). Precedence when several apply: 2, then 1, then 3.
+Standard library only. Testing: GH=<command> replaces the gh binary (bin/tests/pr-stack.sh).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from typing import Any
+from urllib.parse import quote
+
+PR_FIELDS = "number,state,isDraft,baseRefName,headRefName,headRefOid,mergedAt,url"
+PARENT_FIELDS = "number,state,mergedAt,closedAt,headRefName,headRefOid,baseRefName,isCrossRepository"
+NEEDS_ATTENTION = {"NEEDS-RETARGET", "PARENT-CLOSED", "NO-PARENT-PR"}
+PR_STATES = {"OPEN", "MERGED", "CLOSED"}
+AUTHOR_LIST_LIMIT = 100  # `gh pr list --author @me`
+PARENT_LIST_LIMIT = 100  # `gh pr list --head <base>`
+
+
+class NotFound(Exception):
+    pass
+
+
+class Failure(Exception):
+    pass
+
+
+def gh_cmd() -> list[str]:
+    return shlex.split(os.environ.get("GH") or "gh")
+
+
+def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
+    except FileNotFoundError:
+        raise Failure(f"'{cmd[0]}' is not installed or not on PATH") from None
+
+
+def first_line(proc: subprocess.CompletedProcess[str]) -> str:
+    lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+    return lines[0] if lines else f"exit {proc.returncode}"
+
+
+def gh_json(args: list[str], what: str) -> Any:
+    proc = run([*gh_cmd(), *args])
+    if proc.returncode != 0:
+        if "Could not resolve to a pull request" in (proc.stderr + proc.stdout):
+            raise NotFound(what)
+        raise Failure(f"{what}: gh failed: {first_line(proc)}")
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        raise Failure(f"{what}: gh did not return JSON") from None
+
+
+def resolve_repo(repo: str | None) -> tuple[str, str]:
+    """(owner/repo, default branch) from one `gh repo view`."""
+    if repo and not re.match(r"^[^/\s]+/[^/\s]+$", repo):
+        raise Failure(f"-R needs OWNER/REPO, got '{repo}'")
+    doc = gh_json(["repo", "view", *([repo] if repo else []), "--json", "nameWithOwner,defaultBranchRef"],
+                  "gh repo view")
+    slug = (doc or {}).get("nameWithOwner") or ""
+    default = ((doc or {}).get("defaultBranchRef") or {}).get("name") or ""
+    if "/" not in slug or not default:
+        raise Failure("cannot determine the repo and its default branch: pass -R owner/repo "
+                      "or run inside a clone")
+    return slug, default
+
+
+def warn_if_cut_off(count: int, limit: int, what: str) -> None:
+    if count >= limit:
+        print(f"pr-stack: WARN: {what} returned {count} results, its limit; some may be missing",
+              file=sys.stderr)
+
+
+def list_my_open(slug: str) -> list[int]:
+    docs = gh_json(["pr", "list", "-R", slug, "--author", "@me", "--state", "open",
+                    "--json", "number", "--limit", str(AUTHOR_LIST_LIMIT)], "gh pr list --author @me")
+    docs = docs or []
+    warn_if_cut_off(len(docs), AUTHOR_LIST_LIMIT, "gh pr list --author @me")
+    try:
+        return sorted(int(d["number"]) for d in docs)
+    except (KeyError, TypeError, ValueError):
+        raise Failure("gh pr list --author @me: unexpected gh response") from None
+
+
+def fetch_pr(slug: str, num: int) -> dict[str, Any]:
+    pr = gh_json(["pr", "view", str(num), "-R", slug, "--json", PR_FIELDS], f"PR {slug}#{num}")
+    if not isinstance(pr, dict):
+        raise Failure(f"PR {slug}#{num}: unexpected gh response")
+    for key in ("number", "state", "baseRefName", "headRefName", "headRefOid"):
+        if key not in pr or pr[key] in (None, ""):
+            raise Failure(f"PR {slug}#{num}: gh response is missing '{key}'")
+    if pr["state"] not in PR_STATES:
+        raise Failure(f"PR {slug}#{num}: unexpected state '{pr['state']}'")
+    try:
+        pr["number"] = int(pr["number"])
+    except (TypeError, ValueError):
+        raise Failure(f"PR {slug}#{num}: gh response has a non-numeric number") from None
+    return pr
+
+
+def find_parent(slug: str, base: str) -> dict[str, Any] | None:
+    """The same-repo PR whose head branch is `base`: an open one wins, else the newest
+    merged/closed one (by mergedAt/closedAt, then PR number). Fork PRs are ignored."""
+    docs = gh_json(["pr", "list", "-R", slug, "--head", base, "--state", "all",
+                    "--json", PARENT_FIELDS, "--limit", str(PARENT_LIST_LIMIT)],
+                   f"gh pr list --head {base}")
+    docs = docs or []
+    warn_if_cut_off(len(docs), PARENT_LIST_LIMIT, f"gh pr list --head {base}")
+    try:
+        cands = [d for d in docs if d.get("headRefName") == base and d.get("isCrossRepository") is not True]
+        for d in cands:
+            d["number"] = int(d["number"])
+            if d.get("state") not in PR_STATES:
+                raise ValueError(d.get("state"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise Failure(f"gh pr list --head {base}: unexpected gh response") from None
+    if not cands:
+        return None
+
+    def rank(d: dict[str, Any]) -> tuple[int, str, int]:
+        if d["state"] == "OPEN":
+            return (1, "", d["number"])
+        return (0, str(d.get("mergedAt") or d.get("closedAt") or ""), d["number"])
+
+    return max(cands, key=rank)
+
+
+def branch_status(slug: str, branch: str, merged_head: str) -> str:
+    """"spent" when the branch is gone from the remote, or unprotected and still at the merged
+    head; "protected" when it is a protected branch (always live, even at the merged head, as
+    `develop` is right after a `develop -> main` release PR); else "live"."""
+    proc = run([*gh_cmd(), "api", f"repos/{slug}/branches/{quote(branch, safe='/')}"])
+    if proc.returncode != 0:
+        if "HTTP 404" in (proc.stderr + proc.stdout):
+            return "spent"
+        raise Failure(f"gh api branches/{branch}: gh failed: {first_line(proc)}")
+    try:
+        doc = json.loads(proc.stdout)
+        tip = str(doc["commit"]["sha"])
+        protected = bool(doc.get("protected"))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise Failure(f"gh api branches/{branch}: unexpected gh response") from None
+    if protected:
+        return "protected"
+    return "spent" if tip.lower() == str(merged_head).lower() else "live"
+
+
+def verdict_for(pr: dict[str, Any], default: str, parent: dict[str, Any] | None, spent: bool) -> str:
+    if pr["state"] == "MERGED":
+        return "MERGED"
+    if pr["state"] == "CLOSED":
+        return "CLOSED"
+    if pr["baseRefName"] == default:
+        return "OK"
+    if parent is None:
+        return "NO-PARENT-PR"
+    if parent["state"] == "MERGED":
+        return "NEEDS-RETARGET" if spent else "OK"
+    if parent["state"] == "CLOSED":
+        return "PARENT-CLOSED"
+    return "OK"
+
+
+def retarget_base(slug: str, default: str, parent: dict[str, Any]) -> str:
+    """The branch a child of the merged `parent` moves to: the parent's own base, walking up
+    past merged parents whose branch is spent, and stopping at the default branch."""
+    seen: set[str] = set()
+    cur = parent
+    while True:
+        base = str(cur["baseRefName"])
+        if base == default or base in seen:
+            return base
+        seen.add(base)
+        up = find_parent(slug, base)
+        if (up is not None and up["state"] == "MERGED"
+                and branch_status(slug, base, str(up["headRefOid"])) == "spent"):
+            cur = up
+            continue
+        return base
+
+
+# ---- local clone ---------------------------------------------------------------
+
+def git(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return run(["git", *args])
+
+
+def origin_is(slug: str) -> bool:
+    if git(["rev-parse", "--is-inside-work-tree"]).returncode != 0:
+        return False
+    url = git(["remote", "get-url", "origin"])
+    if url.returncode != 0:
+        return False
+    # owner/repo path of the URL whatever the host form: https, scp-style SSH alias, ssh://
+    m = re.search(r"[:/]([^/:\s]+)/([^/\s]+?)(?:\.git)?/?$", url.stdout.strip())
+    return bool(m) and f"{m.group(1)}/{m.group(2)}".lower() == slug.lower()
+
+
+def prepare_local(slug: str) -> bool:
+    """True when ahead/behind can be computed: in a clone of slug and the fetch worked.
+    ahead/behind is optional, so a problem here warns and skips it."""
+    try:
+        if not origin_is(slug):
+            return False
+        fetched = git(["fetch", "-q", "origin"])
+        if fetched.returncode != 0:
+            raise Failure(f"git fetch origin failed ({first_line(fetched)})")
+    except Failure as e:
+        print(f"pr-stack: WARN: {e}; skipping ahead/behind", file=sys.stderr)
+        return False
+    return True
+
+
+def ahead_behind(default: str, sha: str) -> tuple[int | None, int | None]:
+    proc = git(["rev-list", "--left-right", "--count", f"origin/{default}...{sha}"])
+    parts = proc.stdout.split()
+    if proc.returncode != 0 or len(parts) != 2 or not all(p.isdigit() for p in parts):
+        return None, None  # head not available locally (e.g. a fork's branch)
+    return int(parts[1]), int(parts[0])
+
+
+# ---- output --------------------------------------------------------------------
+
+def render_line(r: dict[str, Any], width: int) -> str:
+    parent = r["parent"]
+    state = r["state"] + ("/draft" if r["isDraft"] and r["state"] == "OPEN" else "")
+    pstr = f"#{parent['number']}({parent['state']})" if parent else "none"
+    line = (f"#{r['number']:<{width}} {state:<10} base={r['baseRefName']} head={r['headRefOid'][:7]} "
+            f"parent={pstr} -> {r['verdict']}")
+    if r["ahead"] is not None:
+        line += f"  [ahead {r['ahead']} / behind {r['behind']} origin/{r['_default']}]"
+    if r["note"]:
+        line += f"  ({r['note']})"
+    return line
+
+
+def retarget(slug: str, r: dict[str, Any], default: str, info: Any) -> None:
+    """Move a NEEDS-RETARGET PR to its parent's base. Raises Failure; records nothing on r
+    except `retargeted`. Skips (message, no edit) when the PR changed since it was read."""
+    num, old = r["number"], r["baseRefName"]
+    try:
+        now = fetch_pr(slug, num)
+    except NotFound:
+        raise Failure(f"#{num} disappeared before it could be retargeted") from None
+    if now["state"] != "OPEN" or now["baseRefName"] != old:
+        print(f"skipped #{num}: it changed since it was read (now {now['state']}, base "
+              f"{now['baseRefName']}); not retargeting", file=info)
+        return
+    new = retarget_base(slug, default, r["_parent"])
+    proc = run([*gh_cmd(), "pr", "edit", str(num), "-R", slug, "--base", new])
+    if proc.returncode != 0:
+        raise Failure(f"gh pr edit #{num} --base {new} failed: {first_line(proc)}")
+    r["retargeted"] = True
+    print(f"retargeted #{num}: {old} -> {new}", file=info)
+    print(f"  #{num} may now need a rebase onto {new} (pr-stack does not rebase)", file=info)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="pr-stack", description="Stack status of PRs and their parents.")
+    p.add_argument("prs", nargs="*", metavar="PR#", help="PR numbers (default: my open PRs)")
+    p.add_argument("-R", "--repo", metavar="OWNER/REPO", help="repository (default: current clone's)")
+    p.add_argument("--retarget", action="store_true", help="retarget NEEDS-RETARGET PRs onto the merged parent's base")
+    p.add_argument("--json", action="store_true", help="emit a JSON array")
+    args = p.parse_args(argv)
+    nums = []
+    for a in args.prs:
+        m = re.match(r"^#?(\d+)$", a)
+        if not m:
+            p.error(f"'{a}' is not a PR number")
+        nums.append(int(m.group(1)))
+    args.nums = list(dict.fromkeys(nums))
+    return args
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    notfound = False
+    results: list[dict[str, Any]] = []
+    try:
+        slug, default = resolve_repo(args.repo)
+        nums = args.nums or list_my_open(slug)
+        local = prepare_local(slug) if nums else False
+        for num in nums:
+            try:
+                pr = fetch_pr(slug, num)
+            except NotFound as e:
+                print(f"pr-stack: {e} not found", file=sys.stderr)
+                notfound = True
+                continue
+            cand = find_parent(slug, pr["baseRefName"]) if pr["baseRefName"] != default else None
+            status = "live"
+            if cand and cand["state"] == "MERGED" and pr["state"] == "OPEN":
+                status = branch_status(slug, pr["baseRefName"], str(cand.get("headRefOid") or ""))
+            parent = {"number": cand["number"], "state": cand["state"]} if cand else None
+            verdict = verdict_for(pr, default, parent, status == "spent")
+            kind = "a protected branch" if status == "protected" else "a live branch"
+            note = (f"base is {kind} (parent #{cand['number']} merged earlier)"
+                    if verdict == "OK" and cand and cand["state"] == "MERGED" else None)
+            ahead, behind = ahead_behind(default, str(pr["headRefOid"])) if local else (None, None)
+            results.append({
+                "number": pr["number"], "url": pr.get("url"), "state": pr["state"],
+                "isDraft": bool(pr.get("isDraft")), "baseRefName": pr["baseRefName"],
+                "headRefName": pr["headRefName"], "headRefOid": str(pr["headRefOid"]),
+                "mergedAt": pr.get("mergedAt"), "parent": parent, "verdict": verdict, "note": note,
+                "ahead": ahead, "behind": behind, "retargeted": False, "retargetError": None,
+                "_default": default, "_parent": cand,
+            })
+    except Failure as e:
+        print(f"pr-stack: {e}", file=sys.stderr)
+        return 2
+    # Mutations come after every read, and are announced on stderr under --json so stdout
+    # stays one JSON document. The report is always printed, whatever the retargets did.
+    info = sys.stderr if args.json else sys.stdout
+    if not args.json:
+        width = max((len(str(r["number"])) for r in results), default=1)
+        for r in results:
+            print(render_line(r, width))
+        if not results and not notfound:
+            print("pr-stack: no open PRs authored by @me")
+    if args.retarget:
+        for r in results:
+            if r["verdict"] == "NEEDS-RETARGET":
+                try:
+                    retarget(slug, r, default, info)
+                except Failure as e:
+                    r["retargetError"] = str(e)
+                    print(f"pr-stack: {e}", file=sys.stderr)
+    if args.json:
+        print(json.dumps([{k: v for k, v in r.items() if not k.startswith("_")} for r in results], indent=2))
+    if any(r["retargetError"] for r in results):
+        return 2
+    if notfound:
+        return 1
+    pending = [r for r in results
+               if r["verdict"] in NEEDS_ATTENTION and not (r["verdict"] == "NEEDS-RETARGET" and r["retargeted"])]
+    return 3 if pending else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""pr-approve: approve a PR only if its head is still the commit that was reviewed.
+
+After a clean /reviewit the user says "approve it". The review covered one head SHA; a push
+since then means the approval would cover code nobody reviewed. This checks the PR is open, not
+a draft, not authored by the viewer (GitHub rejects self-approval) and that its head still
+starts with the reviewed SHA, then POSTs the approval to `repos/{o}/{r}/pulls/N/reviews` with
+`commit_id` pinned to the head that was just checked (`gh pr review --approve` cannot pin a
+commit, so a push between the check and the call would be approved unreviewed).
+
+Usage: pr-approve <PR#> --sha <reviewed-sha> [-R owner/repo] [--body-file FILE] [-n]
+  --sha SHA       required: the commit the review covered, 7-40 hex chars, matched as a
+                  prefix of the PR's current head
+  -R owner/repo   repository (default: `gh repo view` in the current directory)
+  --body-file F   approval body (default: "Approved after review at <sha7>: no critical or
+                  high findings."). Sent in a JSON payload file (`gh api --input`), never as
+                  an argument.
+  -n              dry run: run every check (read-only), print what would be done, approve nothing
+
+If GitHub rejects the pinned commit outright (HTTP 422, e.g. a commit that is not in the PR)
+nothing is approved: refused, exit 3, with the API message. GitHub does NOT reject a pinned
+commit that is merely stale (the head was pushed past it), it records the approval on that
+older commit. So after the POST the PR's head is read again: if it is no longer the approved
+head, it warns that the approval is recorded on <approved7> but the head moved to <now7> (on
+repos without "dismiss stale approvals" it may still count toward merging) and exits 3.
+On success it prints the id, state and commit of the viewer's latest review, re-read from
+`gh api repos/{o}/{r}/pulls/N/reviews`. If that review sits on a commit other than the
+approved one an approval EXISTS on the wrong commit: it says so and exits 3, dismiss it by
+hand and re-review. If the approval went through but a re-read fails, exit 2 with an
+"approved, but" message: the approval exists, verify it by hand.
+
+Exit 0 approved (or the dry run's checks passed), 1 PR not found, 2 usage error or gh failure
+(including a failed re-read after an approval was recorded), 3 refused (not open, draft, head
+moved since review, viewer is the author, GitHub rejected the pinned commit), an approval
+recorded on a different commit, or a head that moved during the approval. Standard library only.
+Testing: GH=<command> replaces the gh binary (bin/tests/pr-approve.sh).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+class NotFound(Exception):
+    pass
+
+
+class Failure(Exception):
+    pass
+
+
+class Refused(Exception):
+    pass
+
+
+def gh_cmd() -> list[str]:
+    return shlex.split(os.environ.get("GH") or "gh")
+
+
+def gh(args: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run([*gh_cmd(), *args], capture_output=True, text=True,
+                              errors="replace", check=False)
+    except FileNotFoundError:
+        raise Failure(f"the gh CLI ({gh_cmd()[0]}) is not installed or not on PATH") from None
+
+
+def first_line(proc: subprocess.CompletedProcess[str]) -> str:
+    lines = (proc.stderr or proc.stdout or "").strip().splitlines()
+    return lines[0] if lines else f"exit {proc.returncode}"
+
+
+def resolve_repo(repo: str | None) -> str:
+    if repo:
+        if not re.match(r"^[^/\s]+/[^/\s]+$", repo):
+            raise Failure(f"-R needs OWNER/REPO, got '{repo}'")
+        return repo
+    proc = gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+    slug = proc.stdout.strip()
+    if proc.returncode != 0 or "/" not in slug:
+        raise Failure("cannot determine the repo: pass -R owner/repo or run inside a clone "
+                      f"({first_line(proc)})")
+    return slug
+
+
+def fetch_viewer() -> str:
+    proc = gh(["api", "user", "--jq", ".login"])
+    login = proc.stdout.strip()
+    if proc.returncode != 0 or not re.match(r"^[A-Za-z0-9][A-Za-z0-9\[\]-]*$", login):
+        raise Failure(f"cannot determine the viewer login: {first_line(proc)}")
+    return login
+
+
+def fetch_pr(slug: str, num: int) -> dict[str, Any]:
+    proc = gh(["pr", "view", str(num), "-R", slug, "--json", "state,isDraft,headRefOid,author,reviewDecision"])
+    if proc.returncode != 0:
+        if "Could not resolve to a pull request" in (proc.stderr + proc.stdout):
+            raise NotFound(f"PR {slug}#{num} not found")
+        raise Failure(f"gh pr view failed: {first_line(proc)}")
+    try:
+        pr = json.loads(proc.stdout)
+    except ValueError:
+        raise Failure("gh pr view returned an unexpected response") from None
+    if not isinstance(pr, dict):
+        raise Failure("gh pr view returned an unexpected response")
+    for key in ("state", "headRefOid"):
+        if key not in pr:
+            raise Failure(f"gh pr view response is missing '{key}'")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", str(pr["headRefOid"])):
+        raise Failure(f"gh pr view returned a malformed headRefOid '{pr['headRefOid']}'")
+    return pr
+
+
+def check(pr: dict[str, Any], sha: str, viewer: str) -> None:
+    """Raise Refused with the reason, in the order the user can act on it."""
+    head = str(pr["headRefOid"]).lower()
+    if pr["state"] != "OPEN":
+        raise Refused(f"PR is {pr['state']}, not OPEN")
+    if pr.get("isDraft"):
+        raise Refused("PR is a draft; mark it ready for review first")
+    if not head.startswith(sha.lower()):
+        raise Refused(f"head moved since review: {sha[:7].lower()} -> {head[:7]}; re-review")
+    author = (pr.get("author") or {}).get("login") or ""
+    if author and author.lower() == viewer.lower():
+        raise Refused(f"you ({viewer}) authored this PR and GitHub rejects self-approval")
+
+
+def api_message(proc: subprocess.CompletedProcess[str]) -> str:
+    """The API's own error text when the body is JSON, else gh's first line."""
+    try:
+        doc = json.loads(proc.stdout)
+        msgs = [str(doc["message"])] + [str(e.get("message") if isinstance(e, dict) else e)
+                                        for e in doc.get("errors") or []]
+        return f"{first_line(proc)}: " + "; ".join(m for m in msgs if m)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return first_line(proc)
+
+
+def post_approval(slug: str, num: int, commit: str, body: str, tmp: Path) -> None:
+    """POST an APPROVE review pinned to commit. A 422 means GitHub refused the commit."""
+    path = tmp / "approve.json"
+    path.write_text(json.dumps({"event": "APPROVE", "body": body, "commit_id": commit}), encoding="utf-8")
+    proc = gh(["api", f"repos/{slug}/pulls/{num}/reviews", "--method", "POST", "--input", str(path)])
+    if proc.returncode != 0:
+        if "HTTP 422" in (proc.stderr + proc.stdout):
+            raise Refused(f"GitHub rejected the review on {commit[:7]}, nothing approved: {api_message(proc)}")
+        raise Failure(f"approving failed: {api_message(proc)}")
+
+
+def latest_review(slug: str, num: int, viewer: str) -> tuple[str, str, str]:
+    """(id, state, commit) of the viewer's newest review. gh prints every review as
+    login<TAB>id<TAB>state<TAB>commit_id; the viewer filter is applied here."""
+    proc = gh(["api", f"repos/{slug}/pulls/{num}/reviews", "--paginate", "--jq",
+               ".[] | [.user.login, .id, .state, .commit_id] | @tsv"])
+    if proc.returncode != 0:
+        raise Failure(f"approved, but re-reading the reviews failed: {first_line(proc)}")
+    rows = [ln.split("\t") for ln in proc.stdout.splitlines() if ln.strip()]
+    mine = [r for r in rows if len(r) == 4 and r[0].lower() == viewer.lower()]
+    if not mine:
+        raise Failure("approved, but found no review by the viewer when re-reading the reviews")
+    _, rid, state, commit = mine[-1]
+    return rid, state, commit
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="pr-approve", description="Approve a PR if its head is the reviewed SHA.")
+    p.add_argument("pr", metavar="PR#", help="pull request number")
+    p.add_argument("--sha", required=True, metavar="SHA", help="the reviewed head commit (7-40 hex chars)")
+    p.add_argument("-R", "--repo", metavar="OWNER/REPO", help="repository (default: current clone's)")
+    p.add_argument("--body-file", metavar="FILE", help="approval body file")
+    p.add_argument("-n", "--dry-run", action="store_true", help="check everything, approve nothing")
+    args = p.parse_args(argv)
+    m = re.match(r"^#?(\d+)$", args.pr)
+    if not m:
+        p.error("PR# must be a number")
+    args.num = int(m.group(1))
+    if not re.match(r"^[0-9a-fA-F]{7,40}$", args.sha):
+        p.error("--sha must be 7-40 hex characters")
+    return args
+
+
+def approve(args: argparse.Namespace, tmp: Path) -> int:
+    if args.body_file:
+        try:
+            body = Path(args.body_file).read_text(encoding="utf-8")
+        except OSError as e:
+            print(f"pr-approve: cannot read --body-file: {e.strerror or e}", file=sys.stderr)
+            return 2
+    else:
+        body = f"Approved after review at {args.sha[:7].lower()}: no critical or high findings.\n"
+
+    slug = resolve_repo(args.repo)
+    viewer = fetch_viewer()
+    pr = fetch_pr(slug, args.num)
+    check(pr, args.sha, viewer)
+    head = str(pr["headRefOid"]).lower()
+    if args.dry_run:
+        print(f"DRY RUN (nothing approved). Would approve {slug}#{args.num} at {head[:7]} as {viewer} "
+              f"(reviewDecision now {pr.get('reviewDecision') or 'none'}): "
+              f"POST repos/{slug}/pulls/{args.num}/reviews event=APPROVE commit_id={head}")
+        return 0
+
+    post_approval(slug, args.num, head, body, tmp)
+    rid, state, commit = latest_review(slug, args.num, viewer)
+    print(f"approved {slug}#{args.num}: review {rid} state {state} commit {commit[:7]}")
+    if commit.lower() != head:
+        print(f"pr-approve: an approval EXISTS on {commit[:7]}, not the reviewed {args.sha[:7].lower()} "
+              f"({head[:7]}): dismiss review {rid} by hand and re-review.", file=sys.stderr)
+        return 3
+    # GitHub accepts a stale commit_id without a 422, so the only way to learn the head moved
+    # while the review was being posted is to read it again now.
+    try:
+        now = str(fetch_pr(slug, args.num)["headRefOid"]).lower()
+    except (NotFound, Failure) as e:
+        raise Failure(f"approved, but re-reading the PR head failed: {e}") from None
+    if now != head:
+        print(f"pr-approve: WARN: the approval is recorded on {head[:7]} but the PR head moved to "
+              f"{now[:7]} (on repos without \"dismiss stale approvals\" it may still count toward "
+              f"merging): review {now[:7]} before merging.", file=sys.stderr)
+        return 3
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    with tempfile.TemporaryDirectory(prefix="pr-approve-") as d:
+        try:
+            return approve(args, Path(d))
+        except NotFound as e:
+            print(f"pr-approve: {e}", file=sys.stderr)
+            return 1
+        except Refused as e:
+            print(f"pr-approve: refused: {e}", file=sys.stderr)
+            return 3
+        except Failure as e:
+            print(f"pr-approve: {e}", file=sys.stderr)
+            return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

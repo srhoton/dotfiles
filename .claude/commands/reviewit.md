@@ -71,7 +71,7 @@ From the workflow's returned structure (or your own aggregation in the fallback 
 
 Display the MEDIUM/LOW findings in the terminal as an informational summary (not proposed as PR comments).
 
-If there are **zero** CRITICAL/HIGH findings, report: "Clean review — no critical or high issues found." Then display the informational summary if any, checkout the original branch (only if `ORIGINAL_BRANCH` was non-empty), and stop.
+If there are **zero** CRITICAL/HIGH findings, report: "Clean review — no critical or high issues found." Then display the informational summary if any, checkout the original branch (only if `ORIGINAL_BRANCH` was non-empty), and stop. Offer `~/.claude/bin/pr-approve <N> --sha <reviewed head SHA>` and run it only when the user says to approve; it refuses (exit 3) if the PR is closed, a draft, your own, or its head moved since that SHA, and it pins the approval to the commit it checked (exit 3 with a warning if the head moves while the approval is posted: the approval then sits on the old head).
 
 ---
 

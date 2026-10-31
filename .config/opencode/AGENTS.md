@@ -48,6 +48,7 @@ Language and tool rules live in `~/.config/opencode/rules/`; each file opens wit
 ### Git State Verification
 - Before claiming a file or commit doesn't exist, run `git fetch origin && git log origin/<branch> --oneline -20` to confirm the local clone is current. Local clones drift.
 - When asked about a specific commit SHA, check if it's a squash-merge of a PR (`git log --format='%s' -1 <sha>` — look for a `(#NN)` suffix) before treating it as standalone work.
+- For stacked PRs (a child PR based on a parent PR's branch), use `~/.claude/bin/pr-stack [PR#...]` to check whether each parent is open, merged or closed, instead of hand-written `gh pr view` / `git log origin/...` checks. `--retarget` (only on the user's go-ahead) moves a child off a merged parent's spent branch onto the parent's base (not always the default branch); a child left on it strands its content.
 - If a user pastes a GitHub URL that disagrees with your local view, trust the URL and `git fetch` to reconcile — do not assume the user is mistaken.
 
 ### Environment Configuration
