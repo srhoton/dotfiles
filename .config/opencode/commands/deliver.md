@@ -20,7 +20,7 @@ This command composes existing assets. Where it says "follow `<file>`", read tha
 You orchestrate this phase; the `implementer` agent writes the code. Do not write the implementation yourself, and do not pass `model` on the dispatch.
 
 1. Branch off the latest default branch (never commit to it directly).
-2. Dispatch the `implementer` agent. The prompt carries:
+2. Dispatch the `implementer` agent **once per plan section** (for example A1, then A2, then A3), not once for a whole layer. Each dispatch starts from a fresh context, which is a cleaner boundary than a mid-run compaction. Re-run `repo-gate` between sections. Each prompt carries:
    - the approved plan file path, plus the premise-verification table;
    - the repo root and the files/directories it may change (the Phase 1 scope);
    - the **Gates** below, verbatim.
@@ -47,4 +47,4 @@ Follow `~/.config/opencode/commands/review.md` exactly — mechanical gate, five
 
 ## Wrap-up
 
-Close with a short summary (what changed with `file:line` refs, evidence, PR + Jira links) and a bulleted **suggested next steps** list (e.g. `/shipit <stack>` once approved). Do not end on a question.
+Close with a short summary (what changed with `file:line` refs, evidence, PR + Jira links) and a bulleted **suggested next steps** list (e.g. `/shipit <stack>` once approved). Do not end on a question. Include "Start a fresh session (`/clear`) for the next ticket" in the next steps: one session per ticket keeps the main loop's context small.

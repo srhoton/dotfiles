@@ -3,6 +3,8 @@ name: implementer
 description: Writes the code for an already-approved plan, or applies an already-chosen set of review fixes, in an existing repo. The orchestrator owns design and review; this agent only implements and proves its gates pass. Used by /deliver Phase 2 and the /review fix loop.
 tools: Read, Write, Edit, Bash, Glob, Grep
 model: sonnet
+# Compact at 300K instead of the 1M window's ~967K: long runs spent most of their cost re-reading context.
+autoCompactWindow: 300000
 color: green
 hooks:
   Stop:
@@ -27,7 +29,8 @@ The orchestrator's prompt gives you:
 1. Read the plan or the findings, then read the code they touch. Find 2-3 existing examples of the pattern you need, and follow them instead of inventing a new one.
 2. Follow the language rules files for the repo's languages (`~/.claude/rules/*.md`). Make targeted edits with the Edit tool. Never edit code with bulk `sed`/regex, or with inline Python `str.replace` + write in a Bash call.
 3. Write or update tests alongside the change.
-4. Self-check the diff for scope creep before returning. Remove anything that wasn't asked for: extra layers, cleanup handlers, defensive frameworks.
+4. After a context compaction, re-read the plan file (or the findings list) and your own progress notes before the next edit. The compaction summary is not a substitute for the plan.
+5. Self-check the diff for scope creep before returning. Remove anything that wasn't asked for: extra layers, cleanup handlers, defensive frameworks.
 
 ## Default gates (must all pass before you return)
 
