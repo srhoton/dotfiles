@@ -18,6 +18,11 @@ Helper executables on `PATH` for Claude Code workflows.
   - Polls with 1-5s backoff and trusts a terminal state only when seen twice. Prints `athena-q: <state> qid= runtime= scanned= result=`, then up to `--max-rows` rows (table, `--tsv`, `--json`); `--out FILE` writes the full result and prints only the path and row count (slow above ~100k rows; use the S3 `result=` location for those).
   - Read-only by default: one SELECT/WITH/SHOW/DESCRIBE/EXPLAIN/VALUES statement; anything else needs `--allow-write`. It is a keyword guard, not a SQL parser.
   - Exit codes: 0 ok, 1 failed, 2 timed out (query stopped), 3 usage or guard refusal, 4 AWS error (prints the `aws sso login --profile` command). Tests: `bin/tests/athena-q.sh`.
+- `cc-usage` — what Claude Code sessions cost, from the transcripts under `~/.claude/projects` (`--root`): main sessions, subagents (type from the sibling `agent-*.meta.json`) and workflow agents (`workflow:<label prefix>` from the workflow's `journal.jsonl`).
+  - Each API response is counted once: a response is written as several JSONL lines that all repeat `usage`, so lines are deduplicated per transcript by `message.id` (else the line `uuid`), keeping the one with the largest `output_tokens`. Summing every line overcounts about 2.4×.
+  - `--since 7d|Nh|YYYY-MM-DD` (default 7d), `--until`, `--by kind|agent|repo|session|day|model` (default kind; dates and days are UTC), `--agent TYPE`, `--repo SUBSTR`, `--top N` (default 15), `--json`.
+  - Per group: cost, share, runs, responses, median and max responses per run, median and max peak context per run, cache-read $, cache-write $ (1h and 5m) and output $, then a TOTAL line. `<synthetic>` responses are ignored.
+  - Prices are the list prices in the `PRICES` table at the top of the script (cache writes 2× input at 1h, 1.25× at 5m); update them when pricing changes. Read-only, standard library only. Tests: `bin/tests/cc-usage.sh`.
 - `fanout-report` — turns a `review-fanout` workflow output file (the wrapped, bare, or embedded result) into a markdown report under `~/.claude/scratch/<repo>/`.
   - The report holds numbered actionable findings with verified yes/NO, refuted findings with their refutations, informational findings, and skipped reviewers.
   - Prints only the path and the counts (`--out`, `--stdout`, `--repo`).
