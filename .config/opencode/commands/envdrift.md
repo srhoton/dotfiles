@@ -9,8 +9,7 @@ Report environment SHA drift for a Port.io stack: compare the commit deployed in
 
 Procedure:
 
-1. Using the Port MCP `list_entities` on the `stack_environment_status` blueprint, read these entities and their `short_sha` property:
-   `<stack>-dev`, `<stack>-qa`, `<stack>-stage`, `<stack>-prod`, `<stack>-demo`.
+1. Read all five entities in **one** Port MCP `list_entities` call on the `stack_environment_status` blueprint: `identifiers: [<stack>-dev, <stack>-qa, <stack>-stage, <stack>-prod, <stack>-demo]`, `include: ["short_sha"]`. Don't read them one call each.
    - If the Port MCP is unavailable, say so and stop (suggest the user reconnect it).
    - If `<stack>-dev` does not exist, report that `<stack>` doesn't appear to be a Port stack and stop.
    - For any other env entity that doesn't exist, note it as "absent" and skip it.
