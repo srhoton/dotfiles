@@ -24,26 +24,14 @@
   },
   "model": "opus",
   "skillOverrides": {
-    "bughunt": "off",
-    "build": "off",
-    "build-resume": "off",
-    "checkdeploy": "off",
-    "docs": "off",
-    "envconfig": "off",
-    "fleet": "off",
-    "java_service": "off",
-    "moveittofb": "off",
-    "post-msg": "off",
-    "refresh-other": "off",
-    "reviewitrob": "off",
-    "reviewitsec": "off",
-    "reviewitzach": "off",
-    "ship-when-clean": "off",
-    "shipit-batch": "off",
-    "terraformitup": "off",
-    "validatewithjwt": "off",
-    "vlt": "off",
-    "vlttf": "off"
+    "anthropic-skills:docx": "name-only",
+    "anthropic-skills:pptx": "name-only",
+    "anthropic-skills:xlsx": "name-only",
+    "anthropic-skills:pdf": "name-only",
+    "anthropic-skills:google-workspace": "name-only",
+    "anthropic-skills:morning": "name-only",
+    "anthropic-skills:import-memory": "name-only",
+    "anthropic-skills:skill-creator": "name-only"
   },
   "hooks": {
     "Notification": [
@@ -273,12 +261,12 @@
     "command": "bash $HOME/.claude/statusline-command.sh"
   },
   "enabledPlugins": {
-    "aws-agents@agent-toolkit-for-aws": true,
+    "aws-agents@agent-toolkit-for-aws": false,
     "aws-core@agent-toolkit-for-aws": false,
     "aws-data-analytics@agent-toolkit-for-aws": true,
     "discord@claude-plugins-official": false,
     "gopls-lsp@claude-plugins-official": true,
-    "jdtls-lsp@claude-plugins-official": true,
+    "jdtls-lsp@claude-plugins-official": false,
     "pyright-lsp@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true
   },
@@ -287,12 +275,6 @@
       "source": {
         "source": "github",
         "repo": "aws/agent-toolkit-for-aws"
-      }
-    },
-    "thedotmack": {
-      "source": {
-        "source": "github",
-        "repo": "thedotmack/claude-mem"
       }
     }
   },
@@ -308,5 +290,139 @@
   "skipAutoPermissionPrompt": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754086649066
-  }
+  },
+  "deniedMcpServers": [
+    {
+      "serverName": "claude.ai Adobe"
+    },
+    {
+      "serverName": "claude.ai Atlassian"
+    },
+    {
+      "serverName": "claude.ai Atlassian (2)"
+    },
+    {
+      "serverName": "claude.ai Chili Piper"
+    },
+    {
+      "serverName": "claude.ai Churnzero beta"
+    },
+    {
+      "serverName": "claude.ai Consensus"
+    },
+    {
+      "serverName": "claude.ai Decodo"
+    },
+    {
+      "serverName": "claude.ai Dovetail"
+    },
+    {
+      "serverName": "claude.ai Figma"
+    },
+    {
+      "serverName": "claude.ai Gmail"
+    },
+    {
+      "serverName": "claude.ai Google Calendar"
+    },
+    {
+      "serverName": "claude.ai Google Docs"
+    },
+    {
+      "serverName": "claude.ai Google Drive"
+    },
+    {
+      "serverName": "claude.ai Google Sheets"
+    },
+    {
+      "serverName": "claude.ai Google Slides"
+    },
+    {
+      "serverName": "claude.ai Granola"
+    },
+    {
+      "serverName": "claude.ai Intercom"
+    },
+    {
+      "serverName": "claude.ai Intuit QuickBooks"
+    },
+    {
+      "serverName": "claude.ai Krisp"
+    },
+    {
+      "serverName": "claude.ai Lattice"
+    },
+    {
+      "serverName": "claude.ai LogRocket"
+    },
+    {
+      "serverName": "claude.ai Lucid"
+    },
+    {
+      "serverName": "claude.ai Microsoft 365"
+    },
+    {
+      "serverName": "claude.ai Miro"
+    },
+    {
+      "serverName": "claude.ai Nooks"
+    },
+    {
+      "serverName": "claude.ai Peec AI"
+    },
+    {
+      "serverName": "claude.ai Pendo"
+    },
+    {
+      "serverName": "claude.ai Percuity MCP"
+    },
+    {
+      "serverName": "claude.ai Planful"
+    },
+    {
+      "serverName": "claude.ai Retell"
+    },
+    {
+      "serverName": "claude.ai Salesforce"
+    },
+    {
+      "serverName": "claude.ai Salesforce Read Only"
+    },
+    {
+      "serverName": "claude.ai Salesloft"
+    },
+    {
+      "serverName": "claude.ai SemRush"
+    },
+    {
+      "serverName": "claude.ai Sparktoro"
+    },
+    {
+      "serverName": "claude.ai Stripe"
+    },
+    {
+      "serverName": "claude.ai Supabase TOFU"
+    },
+    {
+      "serverName": "claude.ai Unbounce Landing Page Builder"
+    },
+    {
+      "serverName": "claude.ai Wispr Flow"
+    },
+    {
+      "serverName": "claude.ai Wistia"
+    },
+    {
+      "serverName": "claude.ai Zoom Revenue Accelerator Connector"
+    },
+    {
+      "serverName": "claude.ai Zoom for Claude"
+    },
+    {
+      "serverName": "claude.ai monday.com"
+    },
+    {
+      "serverName": "claude.ai vidIQ"
+    }
+  ]
 }

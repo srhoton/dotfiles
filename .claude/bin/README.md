@@ -13,7 +13,6 @@ Helper executables on `PATH` for Claude Code workflows.
 - `ca-token` — fetches the CodeArtifact authorization token and caches it under `${XDG_CACHE_HOME:-~/.cache}/claude-bin/` (files 0600, dir 0700) until the earlier of 30 minutes before expiry and 11 hours.
   - Prints nothing secret by default. `eval "$(ca-token --env gradle|npm)"` puts the token in the environment (`ORG_GRADLE_PROJECT_codeartifactToken` / `AWS_CODEARTIFACT_TOKEN`); `--print` is the explicit opt-in; `--check` tests the cache without calling aws.
   - A failed fetch never falls back to a stale token: it prints `aws sso login --profile <P>` and exits 4 (3 = usage or no `aws`). `repo-gate` calls it for Gradle and Node repos that need it. Tests: `bin/tests/ca-token.sh`.
-- `agent-msg` — inter-Claude mailbox CLI (legacy filesystem mailbox).
 - `athena-q` — runs one Athena query: `--profile` and `--workgroup` are required and never defaulted; SQL comes from `-e`, `-f` or stdin.
   - Polls with 1-5s backoff and trusts a terminal state only when seen twice. Prints `athena-q: <state> qid= runtime= scanned= result=`, then up to `--max-rows` rows (table, `--tsv`, `--json`); `--out FILE` writes the full result and prints only the path and row count (slow above ~100k rows; use the S3 `result=` location for those).
   - Read-only by default: one SELECT/WITH/SHOW/DESCRIBE/EXPLAIN/VALUES statement; anything else needs `--allow-write`. It is a keyword guard, not a SQL parser.
@@ -73,15 +72,4 @@ Helper executables on `PATH` for Claude Code workflows.
 
 ## Not tracked (compiled binary)
 
-- `micro-status-mcp` — the inter-agent mailbox MCP server. It is a large,
-  architecture-specific Go binary, so it is **git-ignored** rather than
-  committed. Build and install it from source:
-
-  ```bash
-  cd ~/git/micro-status-mcp
-  make build
-  cp -p bin/micro-status-mcp ~/.claude/bin/micro-status-mcp
-  # restart the server pane: micro-status-mcp serve
-  ```
-
-  Source repo: `github.com/srhoton/micro-status-mcp`.
+- `micro-status-mcp`: the inter-agent mailbox MCP server, **archived on 2026-11-02** (unused since July). It is a git-ignored Go binary, and any local copy can be deleted. `.claude/archive/README.md` says how to bring the mailbox back. The source is `github.com/srhoton/micro-status-mcp`.
