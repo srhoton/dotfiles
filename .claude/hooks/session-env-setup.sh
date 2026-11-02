@@ -17,26 +17,6 @@ if [ -n "$TMUX" ]; then
   tmux set -g pane-border-format "#{pane_index}: #{pane_title}" 2>/dev/null
 fi
 
-# Register this pane with the micro-status-mcp server so other Claude
-# sessions can tmux-send-keys notifications here. No-op outside tmux or
-# if the server isn't running. We resolve the binary explicitly because
-# the PATH-augmenting block below doesn't take effect until the next
-# session.
-if [ -n "$TMUX" ]; then
-  MSM_BIN=""
-  if command -v micro-status-mcp >/dev/null 2>&1; then
-    MSM_BIN="$(command -v micro-status-mcp)"
-  elif [ -x "$HOME/go/bin/micro-status-mcp" ]; then
-    MSM_BIN="$HOME/go/bin/micro-status-mcp"
-  fi
-  if [ -n "$MSM_BIN" ]; then
-    "$MSM_BIN" register \
-      --repo "$(basename "$PWD")" \
-      --pane "$(tmux display-message -p '#S:#I.#P')" \
-      >/dev/null 2>&1 || true
-  fi
-fi
-
 # Refresh origin so `git log origin/<branch>` is current. Backgrounded so
 # session start isn't blocked on slow network. Silent on failure (no
 # remote, no network, not a repo).

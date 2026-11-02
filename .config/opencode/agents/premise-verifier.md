@@ -69,11 +69,11 @@ If the claim depends on origin state, run `git fetch` first to ensure the local 
 
 When verifying a symbol-level claim (function, class, method, variable, type) in a language with an active LSP, **prefer LSP capabilities over grep** for higher accuracy:
 
-- **Java** (jdtls): find-references and workspace-symbols handle overloads, inheritance, and interface implementations that grep can't disambiguate.
 - **TypeScript** (typescript-lsp): find-references distinguishes `foo()` vs `obj.foo()` vs imported `foo` — critical for refactor verification.
 - **Python** (pyright): workspace-symbols + go-to-definition.
+- **Go** (gopls): find-references and workspace-symbols.
 
-If no LSP is active for the file type (e.g., Terraform, shell), or the LSP returns zero results that contradict grep, **fall back to grep** and note the discrepancy in your AMBIGUOUS bucket. Never silently prefer one over the other when they disagree — surface the conflict so the caller can investigate.
+If no LSP is active for the file type (e.g., Java, Terraform, shell), or the LSP returns zero results that contradict grep, **fall back to grep** and note the discrepancy in your AMBIGUOUS bucket. Never silently prefer one over the other when they disagree — surface the conflict so the caller can investigate.
 
 ### Step 3: Report structured findings
 

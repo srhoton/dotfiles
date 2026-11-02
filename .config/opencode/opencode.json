@@ -35,10 +35,6 @@
         "AWS_PROFILE": "fb-dev-non-prod/Admin"
       }
     },
-    "awsknowledge": {
-      "type": "remote",
-      "url": "https://knowledge-mcp.global.api.aws"
-    },
     "harness-mcp-server": {
       "type": "local",
       "command": [

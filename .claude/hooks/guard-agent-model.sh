@@ -21,13 +21,11 @@ printf '%s' "$INPUT" | python3 -c "
 import json, sys
 
 SONNET = {
-    'implementer', 'typescript-agent', 'java-quarkus-agent', 'python-agent',
-    'golang-agent', 'react-agent', 'terraform-agent',
+    'implementer',
 }
 OPUS = {
     'functional-reviewer', 'code-quality-reviewer', 'adr-compliance-reviewer',
-    'performance-reviewer', 'data-side-effects-reviewer', 'security-reviewer',
-    'lambda-performance-reviewer', 'zach-style-code-reviewer', 'finding-verifier',
+    'performance-reviewer', 'data-side-effects-reviewer', 'finding-verifier',
 }
 
 try:
