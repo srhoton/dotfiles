@@ -7,14 +7,21 @@ You are a deployment pipeline orchestrator. Your job is to deploy stack `$ARGUME
 
 **Exception (Step 0.5 only):** the environment-drift pre-flight may additionally call local git via `~/.claude/bin/sha-relation` for read-only commit-ancestry classification. All deploy, promote, terraform, and approval operations remain MCP-only.
 
+## Port MCP tools to use
+
+- **Fire an action** with `trigger_run`: `type: "ACTION"`, `identifier` = the step's action (e.g. `deploy_to_qa`), `entityIdentifier` = the step's entity, `inputs` = the step's properties. Keep the returned run ID.
+- **Poll a run** with `get_run` (`runId`). It returns `status`, `statusLabel`, `summary`, `response` and approval info.
+- `run_action` and `track_action_run` are Port's legacy forms of these two tools. Use them only if `trigger_run`/`get_run` are missing from the session, and say so in the output.
+- **Read environment SHAs in one call:** `list_entities` on `stack_environment_status` with `identifiers` set to every env you need (e.g. `[{stack}-dev, {stack}-qa, {stack}-stage, {stack}-prod, {stack}-demo]`) and `include: ["short_sha"]`. Don't read the environments one call each.
+
 Follow these steps exactly:
 
 ---
 
 ## Step 0: Validate and Display Plan
 
-1. Look up the `{stack}-dev` entity in the `stack_environment_status` blueprint using `list_entities`
-2. Verify it exists and has a `short_sha` property
+1. Read all five environment entities in **one** `list_entities` call on `stack_environment_status`: `identifiers: [{stack}-dev, {stack}-qa, {stack}-stage, {stack}-prod, {stack}-demo]`, `include: ["short_sha"]`. Keep the result; Step 0.5 uses it.
+2. Verify `{stack}-dev` exists and has a `short_sha` property
 3. Save this SHA as `TARGET_SHA` — this is the SHA that must flow through every environment
 4. If not found or no SHA, report the error and stop
 
@@ -31,7 +38,7 @@ Pipeline:  QA → Promote → TF QA → Stage → TF Stage → Prod (canary gate
 
 Before deploying, check where every environment currently sits relative to dev, and flag anything that isn't simply behind.
 
-1. Using `list_entities` on `stack_environment_status`, read the `short_sha` of `{stack}-qa`, `{stack}-stage`, `{stack}-prod`, `{stack}-demo` (Step 0 already captured `{stack}-dev` as `TARGET_SHA`). Skip any env entity that doesn't exist.
+1. Take the `short_sha` of `{stack}-qa`, `{stack}-stage`, `{stack}-prod` and `{stack}-demo` from the Step 0 read (no second call; `{stack}-dev` is `TARGET_SHA`). Skip any env entity that doesn't exist.
 2. Classify each against dev with the local git helper (this is the one allowed non-MCP call — see the exception above):
    ```bash
    ~/.claude/bin/sha-relation {TARGET_SHA} qa:<qa_sha> stage:<stage_sha> prod:<prod_sha> demo:<demo_sha>
@@ -93,7 +100,7 @@ This ensures the Harness pipeline has actually finished and the entity state is 
 
 Display: "Step 1/8: Deploying to QA..."
 
-After firing, poll with `track_action_run` every 30 seconds until status is no longer IN_PROGRESS.
+After firing with `trigger_run`, poll with `get_run` every 30 seconds until status is no longer IN_PROGRESS.
 - On FAILURE: display error and STOP
 
 After action SUCCESS, verify the SHA landed:
@@ -170,9 +177,9 @@ Display: "Step 6/8: Deploying to Prod (blue-green; canary gates auto-approve)...
 
 This step requires special handling because the Harness pipeline has approval gates:
 
-1. Fire the action and get the run ID
+1. Fire the action with `trigger_run` and get the run ID
 2. Enter a poll loop (every 30 seconds):
-   a. Check `track_action_run` for the run status
+   a. Check `get_run` for the run status
    b. If still IN_PROGRESS, handle any approval gates per the **Approval Gate Handling** section (env = prod). A `deploy_to_prod` run raises only the blue-green canary gates (`bluegreen_10pct` / `bluegreen_100pct`), which auto-approve. (The destructive-plan pause applies to the `terraform_approval` gate in Step 7, not here.)
 3. When the run reaches SUCCESS or FAILURE, exit the loop
 
@@ -254,6 +261,9 @@ Whenever a step says to handle approval gates, use the dedicated `pipeline_appro
      - If `env = prod` AND the plan shows deletions (the `-N` count is > 0), STOP and require an explicit "yes" from the user before approving — a destructive prod plan must never be auto-approved.
      - Otherwise run `approve_pipeline` with `{"reason": "Auto-approved via shipit CLI"}`.
 4. A single step may raise multiple gates (e.g. canary 10% then 100%) — re-query and handle each as it appears until the run reaches a terminal state.
+5. **Cross-check with `list_runs`** (`types: ["ACTION"]`, `waitingForApproval: true`) on each gate poll.
+   - **This step's run is listed** (status `WAITING_FOR_APPROVAL`): that's a **Port-level** action approval, not a Harness `pipeline_approval` gate. shipit does not approve those. Print the run ID and its approval info from `get_run`, then ask the user.
+   - **A gate is waiting in step 1 but this run isn't listed:** that's normal. Harness gates surface only as `pipeline_approval` entities.
 
 ### Gate failure classification and attempt budget
 
@@ -277,7 +287,7 @@ Stopping here is required behavior, not premature stopping — see the escalatio
 
 This section is **authoritative** for the pipeline's polling behavior (AGENTS.md defers to it).
 
-- Poll `track_action_run` every 30 seconds for action completion
+- Poll `get_run` every 30 seconds for action completion
 - Poll entity `short_sha` every 30 seconds for SHA verification after deploy steps
 - **Cache flicker:** a run's status can oscillate between IN_PROGRESS and SUCCESS. Read the same terminal state on 2-3 consecutive polls before treating it as final.
 - **Stale entity:** before firing a deploy or terraform action, confirm the target entity's `short_sha` matches the expected commit on origin. If it doesn't, wait 30s and re-fetch; never fire against a stale entity.
@@ -290,6 +300,10 @@ This section is **authoritative** for the pipeline's polling behavior (AGENTS.md
 ## Failure Behavior
 
 If ANY step fails or times out:
-1. Display which step failed and any error information
-2. Display a partial summary showing completed steps and the failed step
-3. STOP -- do not continue to subsequent steps
+1. **Diagnose before reporting** (read-only; never re-fire or approve anything here):
+   - `get_run` on the step's run ID. Report its `status`, `statusLabel`, `summary`, and any pipeline/Harness URL or error text in `response`.
+   - `search_audit_logs` with `filterQuery` `{combinator: "and", rules: [{field: "status", operator: "=", value: "FAILURE"}, {field: "entity", operator: "=", value: "<the step's target entity, e.g. {stack}-qa>"}, {field: "date", operator: "between", value: {from: "<step start time>", to: "<now>"}}]}`, `include: ["message", "context", "trigger"]`, `limit: 20`, `offset: 0`, `historicalData: true`. Quote the failure messages.
+   - If either call fails or returns nothing, say so rather than guessing a cause.
+2. Display which step failed, with the diagnosis above
+3. Display a partial summary showing completed steps and the failed step
+4. STOP -- do not continue to subsequent steps
