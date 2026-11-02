@@ -107,7 +107,7 @@ Language and tool rules live in `~/.claude/rules/` and load when matching files 
 
 ## Deployment Workflow
 
-- Standard end-to-end flow: implement → tests pass → self-review (`/review`) → commit with git notes → push → open PR → address review → ship through dev/stage/prod/demo via Port.io (`/shipit`).
+- Standard end-to-end flow: implement → tests pass → self-review (`/review`) → commit with git notes → push → open PR → address review → ship through dev/stage/prod/demo via Port.io (`/shipit`; `/shipit <stack> qa|stage` stops early, and `--dry-run` shows the plan without firing anything).
 - `commands/shipit.md` is authoritative for Port.io polling, SHA checks, and approval gates — follow it rather than improvising here.
 
 ### New Lambda Repos

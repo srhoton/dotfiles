@@ -1,8 +1,36 @@
 ---
-description: "Deploy a stack through all environments sequentially using Port.io self-service actions."
+description: "Deploy a stack through qa, stage, or (default) all environments using Port.io self-service actions."
+argument-hint: "<stack> [qa|stage|prod] [--dry-run]"
 disable-model-invocation: true
 ---
-You are a deployment pipeline orchestrator. Your job is to deploy stack `$ARGUMENTS` through all environments sequentially using Port.io self-service actions.
+You are a deployment pipeline orchestrator. Your job is to deploy a stack sequentially through the environments up to a target environment (qa, stage, or prod by default) using Port.io self-service actions. The arguments are `$ARGUMENTS`.
+
+## Step −1: Parse Arguments
+
+Parse `$ARGUMENTS` before calling anything:
+
+- **`STACK`**: the first word. Every `{stack}` below means `STACK`.
+- **`TARGET_ENV`**: `qa`, `stage` or `prod`, given as the second word or as `--to <env>`. It defaults to **`prod`**, so `/shipit <stack>` behaves exactly as before.
+- **`DRY_RUN`**: true when `--dry-run` is present.
+- **On bad input, stop** without making any Port call and print `Usage: /shipit <stack> [qa|stage|prod] [--dry-run]`. Bad input means:
+  - no stack;
+  - a target other than qa, stage or prod (`dev` and `demo` can't be targets; demo ships only as part of a prod run);
+  - more than one target;
+  - an unknown flag.
+
+**Steps per target.** This table decides which steps run. Every step section below starts with a guard that refers to it.
+
+| `TARGET_ENV` | Steps in this run | N |
+|---|---|---|
+| `qa` | 1 Deploy to QA, 3 Terraform Apply QA | 2 |
+| `stage` | 1 Deploy to QA, 2 Promote Artifacts, 3 Terraform Apply QA, 4 Deploy to Stage, 5 Terraform Apply Stage | 5 |
+| `prod` | 1–8 | 8 |
+
+- **Envs in scope:** `qa` for qa; `qa, stage` for stage; `qa, stage, prod, demo` for prod.
+- **Why promote is skipped for qa:** Promote Artifacts only makes the SHA available to stage and prod.
+- **Step numbering:** the `Display:` lines below are written for a full prod run as `Step k/8`. In a shorter run, show the step's position in this run's plan instead, e.g. `Step 2/2: Terraform Apply QA...` for a qa run.
+
+**Dry run.** With `DRY_RUN`, run Step 0, Step 0.5 and Step 0.6 (all read-only), then print the plan and stop: the target, each step that would run (action, entity, inputs), and "Dry run: nothing was triggered". Never call `trigger_run`, `run_action` or `approve_pipeline` in a dry run.
 
 **IMPORTANT: Use Port.io MCP tools for ALL operations. Do NOT use Bash or other tools.**
 
@@ -30,8 +58,16 @@ Display:
 ```
 Deploying: {stack}
 SHA:       {TARGET_SHA}
-Pipeline:  QA → Promote → TF QA → Stage → TF Stage → Prod (canary gates auto-approve; destructive TF pauses) → TF Prod → TF Demo
+Target:    {TARGET_ENV}
+Pipeline:  <only this run's steps>
 ```
+The `Pipeline:` line for each target:
+
+| Target | Pipeline |
+|---|---|
+| qa | `QA → TF QA` |
+| stage | `QA → Promote → TF QA → Stage → TF Stage` |
+| prod | `QA → Promote → TF QA → Stage → TF Stage → Prod (canary gates auto-approve; destructive TF pauses) → TF Prod → TF Demo` |
 
 ---
 
@@ -58,16 +94,16 @@ Before deploying, check where every environment currently sits relative to dev, 
    ```
    (Same format as `/envdrift`, including the `(base)` dev row.)
 4. **Flag rule:** any env whose SHA != dev is drifted. `BEHIND` is the normal pre-ship state (that's why you're shipping) — note it and continue.
-5. **Pause rule:** if ANY env is `AHEAD` or `DIVERGED`, STOP before Step 1 and ask the user to confirm. An env ahead of dev means dev is missing a commit that's already live there — you may be about to ship the wrong baseline. Require an explicit "yes" to proceed. `UNKNOWN` (git couldn't resolve a SHA) → warn but do not hard-block; mention the clone may be behind.
+5. **Pause rule:** if ANY env **in scope for this target** (see Step −1) is `AHEAD` or `DIVERGED`, STOP before Step 1 and ask the user to confirm. If an env outside the scope is AHEAD or DIVERGED (e.g. prod on a qa run), print a warning and continue, because this run doesn't touch it. An env ahead of dev means dev is missing a commit that's already live there — you may be about to ship the wrong baseline. Require an explicit "yes" to proceed. `UNKNOWN` (git couldn't resolve a SHA) → warn but do not hard-block; mention the clone may be behind.
 
 ---
 
 ## Step 0.6: Deployment-Freeze / Block Pre-flight
 
-Before deploying, confirm no code freeze or deployment block applies to the target environments (qa, stage, prod, demo). Read-only.
+Before deploying, confirm no code freeze or deployment block applies to the environments **in scope for this target** (Step −1: `qa`; `qa, stage`; or `qa, stage, prod, demo`). Below, "target envs" means those environments. Read-only.
 
 1. Read the stack's scope once: `list_entities` on `stack` for `{stack}`, include `$team` and the `domain` relation — needed to evaluate team/domain-scoped blocks.
-2. `list_entities` on `environment` for identifiers `qa, stage, prod, demo`, include `deployment_freeze`, `is_production`. Flag any target env with `deployment_freeze = true`.
+2. `list_entities` on `environment` for the target envs' identifiers, include `deployment_freeze`, `is_production`. Flag any target env with `deployment_freeze = true`.
 3. `list_entities` on `deployment_block` where `status` in `[active, scheduled]`. A block **applies** to a target env when ALL of its set scopes match:
    - `environment` relation is empty OR equals the target env,
    - `stack` relation is empty OR equals `{stack}`,
@@ -95,6 +131,8 @@ This ensures the Harness pipeline has actually finished and the entity state is 
 
 ## Step 1: Deploy to QA
 
+*Runs for every target.*
+
 - Action: `deploy_to_qa`
 - Entity: `{stack}-dev`
 - Properties: `{"confirm": true}`
@@ -113,6 +151,8 @@ After action SUCCESS, verify the SHA landed:
 
 ## Step 2: Promote Artifacts
 
+*Runs only when `TARGET_ENV` is `stage` or `prod`. Skip it for `qa`.*
+
 - Action: `promote_artifacts`
 - Entity: `{stack}-qa`
 - Properties: `{"confirm": true}`
@@ -129,6 +169,8 @@ After action SUCCESS, display: "Step 2/8: Promote Artifacts -- SUCCESS"
 
 ## Step 3: Terraform Apply QA
 
+*Runs for every target.*
+
 - Action: `terraform_apply`
 - Entity: `{stack}-qa`
 - Properties: `{"confirm": true, "branch_or_sha": "master"}`
@@ -140,6 +182,8 @@ Poll until complete. During polling, handle any approval gates per the **Approva
 ---
 
 ## Step 4: Deploy to Stage
+
+*Runs only when `TARGET_ENV` is `stage` or `prod`. A qa run ends after Step 3; go to the Post-Deploy Health Check.*
 
 - Action: `deploy_to_stage`
 - Entity: `{stack}-qa`
@@ -158,6 +202,8 @@ After action SUCCESS, verify the SHA landed:
 
 ## Step 5: Terraform Apply Stage
 
+*Runs only when `TARGET_ENV` is `stage` or `prod`.*
+
 - Action: `terraform_apply`
 - Entity: `{stack}-stage`
 - Properties: `{"confirm": true, "branch_or_sha": "master"}`
@@ -169,6 +215,8 @@ Poll until complete. During polling, handle any approval gates per the **Approva
 ---
 
 ## Step 6: Deploy to Prod (blue-green; canary gates auto-approve)
+
+*Runs only when `TARGET_ENV` is `prod`. A stage run ends after Step 5; go to the Post-Deploy Health Check.*
 
 - Action: `deploy_to_prod`
 - Entity: `{stack}-stage`
@@ -195,6 +243,8 @@ On failure, stop.
 
 ## Step 7: Terraform Apply Prod
 
+*Runs only when `TARGET_ENV` is `prod`.*
+
 - Action: `terraform_apply`
 - Entity: `{stack}-prod`
 - Properties: `{"confirm": true, "branch_or_sha": "master"}`
@@ -206,6 +256,8 @@ Poll until complete. Handle any approval gates per the **Approval Gate Handling*
 ---
 
 ## Step 8: Terraform Apply Demo
+
+*Runs only when `TARGET_ENV` is `prod`.*
 
 - Action: `terraform_apply`
 - Entity: `{stack}-demo`
@@ -219,11 +271,13 @@ Poll until complete. Handle any approval gates per the **Approval Gate Handling*
 
 ## Post-Deploy Health Check (read-only)
 
-After the prod SHA is confirmed, verify prod runtime health before declaring success. Best-effort — never blocks or auto-remediates.
+After the last deploy step's SHA is confirmed, verify the runtime health of **`TARGET_ENV`** (the run's final environment) before declaring success. Best-effort — never blocks or auto-remediates.
 
-1. `list_entities` on `canary` where `relation stack = {stack}`, `environment = prod`, include `health`, `success_percentage`, `last_run_at`.
-2. `list_entities` on `slo` where `relation stack = {stack}`, `environment = prod`, include `slo_status`, `slo_attainment`, `slo_goal`.
-3. If `canary.health = DEGRADED` or `slo.slo_status` in `[BREACHED, BREACHING]`, flag loudly and recommend the `rollback_environment` action (`{"target_sha": <previous known-good SHA>, "reason": ...}`) — present it, do NOT fire it.
+1. `list_entities` on `canary` where `relation stack = {stack}`, `environment = {TARGET_ENV}`, include `health`, `success_percentage`, `last_run_at`.
+2. `list_entities` on `slo` where `relation stack = {stack}`, `environment = {TARGET_ENV}`, include `slo_status`, `slo_attainment`, `slo_goal`.
+3. If `canary.health = DEGRADED` or `slo.slo_status` in `[BREACHED, BREACHING]`, flag loudly.
+   - On a **prod** run, also recommend the `rollback_environment` action (`{"target_sha": <previous known-good SHA>, "reason": ...}`). Present it; do NOT fire it.
+   - On a **qa or stage** run, recommend investigating before promoting further. Don't suggest a rollback.
 4. If `canary.health = UNKNOWN`, or `slo.slo_status` in `[WARNING, INSUFFICIENT_DATA]`, report it as **inconclusive — verify manually** (do not treat as healthy, do not recommend rollback). `HEALTHY`/`OK` → report healthy.
 5. If no `canary`/`slo` entities exist for the stack, print "no canary/SLO configured for {stack} — skipping health check" and continue.
 
@@ -231,10 +285,15 @@ After the prod SHA is confirmed, verify prod runtime health before declaring suc
 
 ## Final Summary
 
-Display a summary:
+Display a summary that lists **only the steps this run executed**. The example below is a full prod run. For a shorter run, end with a line naming the environments it left alone, so a partial run is never mistaken for a full one:
+
+| Target | Last line |
+|---|---|
+| qa | `Not shipped this run: stage, prod, demo` |
+| stage | `Not shipped this run: prod, demo` |
 
 ```
-shipit complete: {stack} @ {TARGET_SHA}
+shipit complete: {stack} @ {TARGET_SHA} → {TARGET_ENV}
 
 | Step | Action                | Status  |
 |------|-----------------------|---------|
