@@ -56,6 +56,9 @@ Helper executables on `PATH` for Claude Code workflows.
   - If the review POST fails, it retries with every finding in the fallback comment.
   - `-n` is a dry run; `--event`, `--body-file`. Bodies are always sent through files, never `@path`.
 - `pr-review-queue` — finds open PRs awaiting my review and starts a Claude session running `/reviewit <PR#>` for each, in a throwaway detached worktree under `~/git/.pr-review/` and its own tmux window (`-n` dry run, `-m N` cap, `-o ORG` filter, `--clean`).
+  - Also sweeps Slack (#peo-hub-team, #peo-data-platform, #peo-principals by default, or `$PR_REVIEW_SLACK_CHANNELS`) for PR links posted in the last 24h, via one headless `claude -p --model haiku` call limited to `slack_read_channel`; the model only copies URLs and the script does every check itself.
+  - A Slack PR is kept only if it is open, not mine, not already reviewed by me and not already a review request; it is tagged `[slack]`. A channel that can't be read prints `slack sweep incomplete` on stderr and adds `slack=partial` to the summary.
+  - `--no-slack` skips the sweep, `--slack-hours N` changes the window, `-c CHANNEL` (repeatable) replaces the default channels. Thread replies are not read.
 - `repo-gate` — detects the project type (Node, Gradle, Go, Python, Terraform) and runs its gates.
   - Gates: install (frozen only), typecheck, lint (`vet-diff` for Node), and the full test suite.
   - Prints one `PASS`/`FAIL`/`SKIPPED` line per gate with a short excerpt on failure, and ends `REPO-GATE: PASS|FAIL`; a PASS lists any skipped core gates as `PASS (skipped: …)`. Exit 0 or 1, and 2 when there's no project.
