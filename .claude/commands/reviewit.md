@@ -71,7 +71,7 @@ From the workflow's returned structure (or your own aggregation in the fallback 
 
 Display the MEDIUM/LOW findings in the terminal as an informational summary (not proposed as PR comments).
 
-If there are **zero** CRITICAL/HIGH findings, report: "Clean review — no critical or high issues found." Then display the informational summary if any, checkout the original branch (only if `ORIGINAL_BRANCH` was non-empty), and stop. Offer `~/.claude/bin/pr-approve <N> --sha <reviewed head SHA>` and run it only when the user says to approve; it refuses (exit 3) if the PR is closed, a draft, your own, or its head moved since that SHA, and it pins the approval to the commit it checked (exit 3 with a warning if the head moves while the approval is posted: the approval then sits on the old head).
+If there are **zero** CRITICAL/HIGH findings, report: "Clean review — no critical or high issues found." and `Reviewed SHA: <headRefOid>` (the head SHA saved in Step 1). Then display the informational summary if any, checkout the original branch (only if `ORIGINAL_BRANCH` was non-empty), and stop. If the user then says "approve", follow "Approving" below.
 
 ---
 
@@ -144,4 +144,29 @@ Checkout the original branch (skip this if `ORIGINAL_BRANCH` was empty — there
 git checkout <ORIGINAL_BRANCH>
 ```
 
-Print a summary: "Posted N comments to PR #$ARGUMENTS. Skipped M findings. Reported K informational (MEDIUM/LOW) findings locally."
+Print a summary: "Posted N comments to PR #$ARGUMENTS. Skipped M findings. Reported K informational (MEDIUM/LOW) findings locally." Follow it with `Reviewed SHA: <headRefOid>`, the head SHA saved in Step 1. This is the commit the review covered, and "Approving" below needs it.
+
+---
+
+## Approving
+
+Approve only through `~/.claude/bin/pr-approve`. A hook blocks `gh pr review --approve` (and `-a`) and `gh api` approval posts, because they can't pin the commit and have approved a head nobody reviewed.
+
+When the user says "approve" (or "approve it") after a review:
+
+1. Use the `Reviewed SHA` printed above, which is the head the review covered. Never substitute the PR's current head or re-read it. If this session did not review the PR, there is no reviewed SHA: run the review first.
+2. Write the approval body to a temp file. List the MEDIUM/LOW findings as non-blocking follow-ups, and state the reviewed SHA. Don't pass the body as an argument.
+3. Run it, with the repo slug from `gh repo view --json nameWithOwner -q .nameWithOwner`:
+
+```bash
+~/.claude/bin/pr-approve $ARGUMENTS -R <owner/repo> --sha <reviewed-sha> --body-file <tmpfile>
+```
+
+   `-n` does a dry run: it runs every check and approves nothing.
+
+Exit codes:
+
+- **0**: approved. Report the review id, state and commit it printed.
+- **1**: PR not found. Check the number and repo.
+- **2**: usage error or gh failure. If the message says "approved, but ...", the approval exists and only the re-read failed: tell the user to verify it by hand. Don't re-run.
+- **3**: refused. Show the user the message (not open, draft, you are the author, GitHub rejected the commit, or the head moved). If the head moved since the review, re-review the delta (`/reviewit $ARGUMENTS` on the new head) and approve against that run's `Reviewed SHA`. **Never retry with the new SHA** to get past the refusal. If it reports an approval recorded on a different commit, tell the user to dismiss it by hand.

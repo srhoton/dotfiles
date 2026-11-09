@@ -1,6 +1,6 @@
 export const meta = {
   name: 'review-fanout',
-  description: 'Five specialist reviewers in parallel, dedup, then adversarial verification of CRITICAL/HIGH findings',
+  description: 'Five specialist reviewers in parallel, dedup, then adversarial verification of CRITICAL/HIGH findings. args: { repoRoot, files, intent, scopeNote? } as an object or a JSON string',
   phases: [
     { title: 'Review', detail: 'five specialist reviewers over the changed files' },
     { title: 'Verify', detail: 'one skeptic per CRITICAL/HIGH finding tries to refute it' },
@@ -8,9 +8,29 @@ export const meta = {
 }
 
 // args: { repoRoot: string, files: string[], intent: string, scopeNote?: string }
+// Either a JSON object or a JSON string of that object (callers have passed the string form).
 // Invoked by ~/.claude/commands/review.md and reviewit.md (Step 2).
-const { repoRoot, files, intent } = args
-const scopeNote = args.scopeNote ||
+const ARGS_SHAPE = '{ repoRoot: string, files: string[], intent: string, scopeNote?: string }'
+let parsedArgs = args
+if (typeof parsedArgs === 'string') {
+  try {
+    parsedArgs = JSON.parse(parsedArgs)
+  } catch (e) {
+    throw new Error(`review-fanout: args was a string but not valid JSON (${e.message}). Expected ${ARGS_SHAPE}`)
+  }
+}
+if (!parsedArgs || typeof parsedArgs !== 'object' || Array.isArray(parsedArgs)) {
+  throw new Error(`review-fanout: args must be an object or a JSON string of one. Expected ${ARGS_SHAPE}`)
+}
+const argProblems = []
+if (typeof parsedArgs.repoRoot !== 'string' || !parsedArgs.repoRoot) argProblems.push('repoRoot (non-empty string)')
+if (!Array.isArray(parsedArgs.files) || parsedArgs.files.length === 0) argProblems.push('files (non-empty array of paths)')
+if (typeof parsedArgs.intent !== 'string' || !parsedArgs.intent) argProblems.push('intent (non-empty string)')
+if (argProblems.length) {
+  throw new Error(`review-fanout: missing or invalid args: ${argProblems.join(', ')}. Expected ${ARGS_SHAPE}`)
+}
+const { repoRoot, files, intent } = parsedArgs
+const scopeNote = parsedArgs.scopeNote ||
   'SCOPE BOUNDS: (1) the repo root and the changed-file list above are your ENTIRE scope; ' +
   '(2) do not explore sibling repos or spawn further agents; ' +
   '(3) if evidence outside that scope seems needed, report the gap as a LOW finding instead of expanding scope.'
