@@ -52,8 +52,15 @@ def status_ctx(name, state):
     return {"__typename": "StatusContext", "context": name, "state": state}
 
 def pr(threads=(), comments=(), checks=(), head="aaaaaaaaaaaa1111", mergeable="MERGEABLE",
-       reviews=(), body="synthetic body", decision="auto"):
+       reviews=(), body="synthetic body", decision="auto", files_total=None):
     # reviews: (id, author, state) or (id, author, state, body)
+    # files_total: a PR with that many files, of which GraphQL serves only the first 100.
+    files = {"totalCount": 2, "nodes": [{"path": "src/a.py", "additions": 10, "deletions": 2},
+                                        {"path": "src/b.py", "additions": 1, "deletions": 0}]}
+    if files_total is not None:
+        files = {"totalCount": files_total,
+                 "nodes": [{"path": "gql/f%03d.py" % i, "additions": 1, "deletions": 0}
+                           for i in range(min(100, files_total))]}
     return {
         "number": 7, "title": "Synthetic change", "url": "https://example.test/acme/repo/pull/7",
         "state": "OPEN", "isDraft": False, "baseRefName": "main", "headRefName": "feature-7",
@@ -61,8 +68,7 @@ def pr(threads=(), comments=(), checks=(), head="aaaaaaaaaaaa1111", mergeable="M
         "reviewDecision": (("CHANGES_REQUESTED" if any(r[2] == "CHANGES_REQUESTED" for r in reviews) else None)
                            if decision == "auto" else decision),
         "body": body,
-        "files": {"totalCount": 2, "nodes": [{"path": "src/a.py", "additions": 10, "deletions": 2},
-                                              {"path": "src/b.py", "additions": 1, "deletions": 0}]},
+        "files": files,
         "latestReviews": {"nodes": [{"state": r[2], "author": {"login": r[1]}} for r in reviews]},
         "latestOpinionatedReviews": {"nodes": [{"id": r[0], "state": r[2], "author": {"login": r[1]},
                                                 "body": r[3] if len(r) > 3 else "",
@@ -86,7 +92,13 @@ cat > "$STUB" <<'EOS'
 #!/bin/bash
 case "$1" in
   repo) echo "acme/repo" ;;
-  api)  cat "$STUB_JSON"; exit "${STUB_RC:-0}" ;;
+  api)  case "$*" in
+          *"--paginate repos/"*)  # the REST files list (STUB_FILES_JSON: one JSON array per page)
+            echo "$*" >> "$STUB_FILES_ARGS"
+            [ "${STUB_FILES_RC:-0}" = 0 ] || { echo "boom: files API failed" >&2; exit "$STUB_FILES_RC"; }
+            cat "$STUB_FILES_JSON" ;;
+          *) cat "$STUB_JSON"; exit "${STUB_RC:-0}" ;;
+        esac ;;
   pr)   if [ "$2" = view ]; then
           # The post-diff head recheck. STUB_VIEW_HEADS is a file of one head per call (the
           # last line repeats); without it the fixture's own headRefOid is returned.
@@ -111,6 +123,7 @@ EOS
 chmod +x "$STUB"
 
 export STUB_DIFF="$WORK/pr7.diff" STUB_PR_ARGS="$WORK/pr-args.log" STUB_VIEW_ARGS="$WORK/view-args.log"
+export STUB_FILES_ARGS="$WORK/files-args.log" STUB_FILES_JSON="$WORK/rest-files.json"
 ctx() {  # FIXTURE-NAME [pr-context args...]   (stdout+stderr, run outside any git repo)
   local name="$1"; shift
   ( cd "$WORK" && GH="$STUB" STUB_JSON="$WORK/$name.json" "$CTX" "$@" 2>&1 )
@@ -622,6 +635,81 @@ import json, sys
 d = json.load(sys.stdin)
 assert d["body"] == "" and "diff" not in d, sorted(d)
 ' && ok "--json --body with no description gives an empty string" || bad "json empty body" ""
+
+# ---- more than 100 files -----------------------------------------------------------
+# GraphQL serves 100 files; the complete list comes from the paginated REST files API (one
+# JSON array per page, here 100 + 28), and a failing REST call must be loud, never silent.
+python3 - "$STUB_FILES_JSON" <<'PY'
+import json, sys
+files = [{"filename": "rest/f%03d.py" % i, "additions": 2, "deletions": 1, "status": "modified"}
+         for i in range(128)]
+with open(sys.argv[1], "w") as fh:
+    fh.write(json.dumps(files[:100]) + "\n" + json.dumps(files[100:]) + "\n")
+PY
+fixture many 'pr(files_total=128)'
+
+rm -f "$STUB_FILES_ARGS"
+out=$(ctx many 7 -R acme/repo)
+expect "128 files: the header counts all of them" "$out" "^FILES \(128 changed, \+256 -128\)$"
+expect "  the REST list replaced the 100 GraphQL files (listed paths come from REST)" "$out" "^  rest/f000\.py  \+2 -1$"
+reject "  no GraphQL-only path is left" "$out" "gql/"
+reject "  no truncation warning" "$out" "WARNING|truncated"
+expect "  asked gh to paginate the PR's files at 100 per page" "$(cat "$STUB_FILES_ARGS")" "^api --paginate repos/acme/repo/pulls/7/files\?per_page=100$"
+out=$(ctx many 7 -R acme/repo --json)
+printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+n = d["files"]["nodes"]
+assert d["files"]["totalCount"] == 128 and len(n) == 128, len(n)
+assert [f["path"] for f in n] == ["rest/f%03d.py" % i for i in range(128)], [f["path"] for f in n][:3]
+assert all(f == {"path": f["path"], "additions": 2, "deletions": 1} for f in n), n[0]
+assert "files_truncated" not in d["files"] and d["truncated"]["files"] == 0, d["files"].keys()
+' && ok "  --json lists all 128 files in the GraphQL shape, no truncation fields" || bad "  json 128 files" "$(printf '%s' "$out" | head -c 300)"
+out=$(ctx many 7 -R acme/repo --diff --only src/new.ts)
+expect "  --diff --only still works with the REST file list" "$out" "^=== src/new\.ts \(\+2 -0, new file\) ==="
+
+# exactly 100 files and the 2-file default: no REST call at all
+fixture hundred 'pr(files_total=100)'
+rm -f "$STUB_FILES_ARGS"
+out=$(ctx hundred 7 -R acme/repo)
+expect "100 files: listed from GraphQL (text shows the first 50, the rest in --json)" "$out" "^  gql/f049\.py  \+1 -0$"
+expect "  and none is marked truncated or missing" "$out" "^  \.\.\. 50 more listed in --json$"
+if [ ! -e "$STUB_FILES_ARGS" ]; then ok "  and the REST files API is not called"; else bad "REST called for 100 files" "$(cat "$STUB_FILES_ARGS")"; fi
+ctx human 7 -R acme/repo >/dev/null
+if [ ! -e "$STUB_FILES_ARGS" ]; then ok "a 2-file PR does not call the REST files API"; else bad "REST called for 2 files" "$(cat "$STUB_FILES_ARGS")"; fi
+
+# REST call fails: keep the first 100, say so in text, --json and on stderr
+out=$(STUB_FILES_RC=22 ctx many 7 -R acme/repo); rc=$?
+if [ "$rc" = 0 ]; then ok "REST files call failing still exits 0"; else bad "REST failure exit code" "rc=$rc"; fi
+expect "  the text report warns the list is truncated, with the counts and reason" "$out" "^  WARNING: file list truncated: only the first 100 of 128 files listed \(gh api pulls/7/files failed: boom: files API failed\)$"
+expect "  the header still reports the true total" "$out" "^FILES \(128 changed, "
+expect "  the GraphQL files are kept" "$out" "^  gql/f000\.py  \+1 -0$"
+expect "  a WARNING goes to stderr too" "$out" "^pr-context: WARNING: file list truncated \(gh api pulls/7/files failed: boom"
+out=$(cd "$WORK" && STUB_FILES_RC=22 GH="$STUB" STUB_JSON="$WORK/many.json" "$CTX" 7 -R acme/repo --json 2>/dev/null)
+printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+f = d["files"]
+assert f["files_truncated"] is True and len(f["nodes"]) == 100 and f["totalCount"] == 128, f["totalCount"]
+assert f["files_warning"] == "only the first 100 of 128 files listed (gh api pulls/7/files failed: boom: files API failed)", f["files_warning"]
+assert d["truncated"]["files"] == 28, d["truncated"]
+' && ok "  --json: files_truncated true, files_warning with the reason, 100 nodes kept" || bad "  json REST failure" "$(printf '%s' "$out" | head -c 300)"
+
+# REST returns a short or malformed list: also truncated and loud, never taken as complete
+printf '%s\n' "[{\"filename\": \"rest/only.py\", \"additions\": 1, \"deletions\": 0}]" > "$WORK/rest-short.json"
+out=$(STUB_FILES_JSON="$WORK/rest-short.json" ctx many 7 -R acme/repo)
+expect "a REST list shorter than totalCount is flagged truncated" "$out" "^  WARNING: file list truncated: only the first 100 of 128 files listed \(the files API listed only 1 of 128 files\)$"
+reject "  and its partial list is not used" "$out" "rest/only"
+printf 'not json at all\n' > "$WORK/rest-bad.json"
+out=$(STUB_FILES_JSON="$WORK/rest-bad.json" ctx many 7 -R acme/repo)
+expect "a malformed REST response is flagged truncated" "$out" "^  WARNING: file list truncated: only the first 100 of 128 files listed \(gh api pulls/7/files returned something other than file arrays\)$"
+
+# default --json shape for a complete list is unchanged
+printf '%s' "$(ctx human 7 -R acme/repo --json)" | python3 -c '
+import json, sys
+f = json.load(sys.stdin)["files"]
+assert sorted(f) == ["nodes", "totalCount"], sorted(f)
+' && ok "a complete file list has exactly the original files keys" || bad "files keys" ""
 
 echo
 echo "passed=$PASS failed=$FAIL"
