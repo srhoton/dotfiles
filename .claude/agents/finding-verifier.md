@@ -18,7 +18,8 @@ You receive one finding from a code reviewer, and your job is to refute it. Revi
   - it's already guarded elsewhere;
   - it rests on a misread of the code;
   - it's real but minor. Say so in the reason.
-- If the code can't settle it, the finding stands (`refuted=false`).
+- **Causation rule.** If the finding cites a failure as its evidence (a failing CI job, a failing or flaky test, an error log, a stack trace), a coincidental failure is not enough. You must tie that failure to the flagged lines with evidence you can quote: the log or stack frame naming the flagged `file:line`, or code reading that shows the flagged lines produce that exact failure. If you can't tie them (the failure comes from other code, a fixture, the environment, or a pre-existing break), set `refuted=true` and say in the reason that causation isn't shown. Don't leave it standing on the failure alone. If the flagged lines are independently a real defect on the code alone, the finding stands for that reason, and the reason must say it doesn't rely on the cited failure.
+- If the code can't settle it, the finding stands (`refuted=false`). The causation rule above is the exception: a cited failure you can't tie to the flagged lines is refuted.
 - Cite `file:line` evidence for the verdict either way.
 
 ## Running things

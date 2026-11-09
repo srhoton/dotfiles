@@ -7,10 +7,17 @@
 # reach no open review. CLAUDE.md already says "never update a closed PR" —
 # this enforces it.
 #
+# Also blocks raw PR approvals (`gh pr review --approve|-a`, `gh api` posting a
+# review with event APPROVE): approve through `~/.claude/bin/pr-approve --sha`,
+# which refuses when the head moved since the review. And on `git push` to a
+# branch whose open PR already has APPROVED reviews, emits a non-blocking
+# additionalContext warning that the push may dismiss them.
+#
 # Passes through when: there is no PR for the branch, `gh` is unavailable, or
 # anything is ambiguous. A brand-new branch must always be pushable.
 #
-# Exit 2 = block, stderr is fed back to Claude. Exit 0 = allow.
+# Exit 2 = block, stderr is fed back to Claude. Exit 0 = allow (stdout may carry
+# hookSpecificOutput JSON).
 #
 
 INPUT=$(cat 2>/dev/null) || exit 0
@@ -55,10 +62,74 @@ except Exception:
     sys.exit(0)
 BODY_FLAGS = {"--body", "-b", "--message", "-m", "--comment"}
 FIELD_FLAGS = {"-f", "--raw-field"}
+# gh pr review flags that take a separate value: that value is text, not a flag.
+REVIEW_VALUE_FLAGS = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
+# gh api flags that carry a key=value field.
+API_FIELD_FLAGS = {"-f", "-F", "--field", "--raw-field"}
+REVIEWS_PATH_RE = re.compile(r"pulls/[^/\s]+/reviews")
+APPROVE_EVENT_RE = re.compile(r"^event=APPROVE$", re.I)
+JSON_APPROVE_RE = re.compile(r"\"event\"\s*:\s*\"APPROVE\"", re.I)
 
 
 def has_pair(args, first, seconds):
     return any(a == first and b in seconds for a, b in zip(args, args[1:]))
+
+
+def pr_review_approves(args):
+    """`gh pr review ... --approve|-a` (a value following -b/--body/... is text, not a flag)."""
+    if not has_pair(args, "pr", {"review"}):
+        return False
+    prev = ""
+    for a in args:
+        if prev not in REVIEW_VALUE_FLAGS and (
+            a in ("--approve", "-a") or a.startswith("--approve=")
+        ):
+            return True
+        prev = a
+    return False
+
+
+def api_event_values(args):
+    """Yield every `key=value` field string passed to gh api, in any flag spelling."""
+    for j, a in enumerate(args):
+        nxt = args[j + 1] if j + 1 < len(args) else ""
+        if a in API_FIELD_FLAGS:
+            yield nxt
+        elif a.startswith("--") and "=" in a and a.partition("=")[0] in API_FIELD_FLAGS:
+            yield a.partition("=")[2]
+        elif len(a) > 2 and a[:2] in ("-f", "-F"):
+            yield a[2:]
+
+
+def api_approves(args, cmd):
+    """`gh api` posting a review with event APPROVE (REST pulls/N/reviews, or GraphQL)."""
+    if "api" not in args:
+        return False
+    fields = list(api_event_values(args))
+    if any(REVIEWS_PATH_RE.search(a) for a in args):
+        if any(APPROVE_EVENT_RE.match(f) for f in fields):
+            return True
+        # --input <file>: read the payload when it is a readable local JSON file.
+        for j, a in enumerate(args):
+            if a == "--input" and j + 1 < len(args):
+                src = args[j + 1]
+                if src == "-":
+                    # payload comes from stdin (heredoc/pipe): look at the command text.
+                    if JSON_APPROVE_RE.search(cmd):
+                        return True
+                else:
+                    try:
+                        with open(os.path.expanduser(src)) as fh:
+                            if JSON_APPROVE_RE.search(fh.read(1 << 20)):
+                                return True
+                    except Exception:
+                        pass
+    if "graphql" in args and any(
+        re.search(r"(addPullRequestReview|submitPullRequestReview)", f) and re.search(r"\bAPPROVE\b", f)
+        for f in args
+    ):
+        return True
+    return False
 
 
 for seg in segs:
@@ -68,6 +139,9 @@ for seg in segs:
     if i >= len(seg) or os.path.basename(seg[i]) != "gh":
         continue
     args = seg[i + 1:]
+    if pr_review_approves(args) or api_approves(args, os.environ["CMD"]):
+        print("APPROVE")
+        sys.exit(0)
     body_flags = set(BODY_FLAGS)
     if has_pair(args, "pr", {"merge"}):
         # `gh pr merge -m` is --merge (a boolean), not a message; keep --body/-b.
@@ -96,7 +170,14 @@ for seg in segs:
             print(a)
             sys.exit(0)
 ' 2>/dev/null)
-    if [ -n "$GH_MSG" ]; then
+    if [ "$GH_MSG" = "APPROVE" ]; then
+      {
+        echo "BLOCKED: raw PR approvals bypass the reviewed-SHA check (they cannot pin the commit that was reviewed)."
+        echo "Use  ~/.claude/bin/pr-approve <PR#> --sha <reviewed-sha> [-R owner/repo] [--body-file <file>]"
+        echo "(-n is a dry run). The reviewed SHA is the 'Reviewed SHA' /reviewit printed."
+      } >&2
+      exit 2
+    elif [ -n "$GH_MSG" ]; then
       {
         echo "BLOCKED: gh does not expand @path ('$GH_MSG' was given a value starting with @)."
         echo "The literal text would be posted instead of the file contents."
@@ -147,4 +228,14 @@ case "$STATE" in
     exit 2
     ;;
 esac
+
+# Open PR: a push can dismiss existing approvals (repos with "dismiss stale
+# approvals"). Warn, never block. Count the latest review per author that is
+# APPROVED. Any gh failure or unexpected output -> stay silent (allow).
+APPROVALS=$(cd "$TARGET" 2>/dev/null && gh pr view "$BRANCH" --json number,latestReviews \
+  -q '"\(.number) \([.latestReviews[]? | select(.state == "APPROVED")] | length)"' 2>/dev/null)
+if [[ "$APPROVALS" =~ ^([0-9]+)\ ([0-9]+)$ ]] && [ "${BASH_REMATCH[2]}" -gt 0 ]; then
+  MSG="PR #${BASH_REMATCH[1]} has ${BASH_REMATCH[2]} approval(s); this push may dismiss them. Tell the user the PR needs re-approval (via ~/.claude/bin/pr-approve after a re-review) once the push lands." \
+    python3 -c 'import json,os; print(json.dumps({"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":os.environ["MSG"]}}))' 2>/dev/null
+fi
 exit 0
