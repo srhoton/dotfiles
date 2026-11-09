@@ -1,7 +1,17 @@
 #!/bin/bash
 #
-# pr-review-queue — find the open PRs where my review is requested and start a
-# Claude Code session running `/reviewit <PR#>` for each one.
+# pr-review-queue — find the open PRs where my review is requested (or that were
+# posted for review in my Slack channels) and start a Claude Code session running
+# `/reviewit <PR#>` for each one.
+#
+# Slack sweep: one headless `claude -p --model haiku` call, limited to the Slack
+# read-channel tool, copies the github.com/<owner>/<repo>/pull/<N> URLs out of
+# the last N hours of each channel. The script does every check itself: a PR
+# is kept only if it is OPEN, not authored by me, not already reviewed by me
+# and not already in the review-requested list. Slack PRs are tagged [slack].
+# If the sweep cannot read a channel, "slack sweep incomplete" goes to stderr
+# and the summary gets slack=partial; the GitHub list is still processed.
+# Only top-level channel messages are read, not thread replies.
 #
 # For each PR:
 #   - the repo's clone is DIR/<repo> (cloned if missing; skipped if its origin
@@ -21,7 +31,9 @@
 # Exit 1 if any PR FAILED, else 0.
 #
 # Usage: pr-review-queue [-n] [-f] [-m N] [-d DIR] [-o ORG ...] [--clean]
-#   -n       dry run: report what would launch, change nothing
+#                        [--no-slack] [--slack-hours N] [-c CHANNEL ...]
+#   -n       dry run: report what would launch, change nothing (the read-only
+#            Slack sweep still runs)
 #   -f       force: ignore the already-launched state
 #   -m N     max sessions launched per run (default 4; a review fans out to
 #            several subagents, so this bounds the load)
@@ -29,14 +41,23 @@
 #   -o ORG   only PRs in this org/owner (repeatable; default: all)
 #   --clean  remove review worktrees whose PR is no longer open (clean
 #            worktrees only) and drop their state entries
+#   --no-slack         skip the Slack sweep (GitHub review requests only)
+#   --slack-hours N    how far back to read each channel (default 24)
+#   -c CHANNEL         Slack channel ID to read (repeatable; any -c replaces
+#                      the defaults). Default: $PR_REVIEW_SLACK_CHANNELS
+#                      (space-separated), else #peo-hub-team, #peo-data-platform
+#                      and #peo-principals.
 
 set -uo pipefail
 
 STATE="$HOME/.claude/state/pr-review-queue.json"
 DIR="${PR_REVIEW_DIR:-$HOME/git}"
 DRY=0; FORCE=0; MAX=4; CLEAN=0; ORGS=""
+SLACK=1; SLACK_HOURS=24; SLACK_CHANNELS=""
+DEFAULT_SLACK_CHANNELS="${PR_REVIEW_SLACK_CHANNELS:-C09BP4Y6N81 C0BFKM2DKNX C07SU6VV47L}"
+SUMMARY_EXTRA=""
 
-usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; }
 first_line() { printf '%s' "$1" | sed -n '1p'; }
 
 while [ $# -gt 0 ]; do
@@ -47,12 +68,20 @@ while [ $# -gt 0 ]; do
     -d) DIR="${2:?-d needs a directory}"; DIR="${DIR/#\~/$HOME}"; shift ;;
     -o) ORGS="$ORGS ${2:?-o needs an org}"; shift ;;
     --clean) CLEAN=1 ;;
+    --no-slack) SLACK=0 ;;
+    --slack-hours) SLACK_HOURS="${2:?--slack-hours needs a number}"; shift ;;
+    -c) SLACK_CHANNELS="$SLACK_CHANNELS ${2:?-c needs a channel id}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "pr-review-queue: unknown option '$1'" >&2; usage >&2; exit 1 ;;
   esac
   shift
 done
 case "$MAX" in ''|*[!0-9]*) echo "pr-review-queue: -m needs a number" >&2; exit 1 ;; esac
+case "$SLACK_HOURS" in ''|*[!0-9]*) echo "pr-review-queue: --slack-hours needs a number" >&2; exit 1 ;; esac
+[ -n "${SLACK_CHANNELS# }" ] || SLACK_CHANNELS="$DEFAULT_SLACK_CHANNELS"
+for ch in $SLACK_CHANNELS; do   # the IDs go into the model prompt, so keep them plain
+  case "$ch" in *[!A-Za-z0-9]*) echo "pr-review-queue: bad Slack channel id '$ch'" >&2; exit 1 ;; esac
+done
 
 for t in gh git python3 claude; do
   command -v "$t" >/dev/null 2>&1 || { echo "pr-review-queue: '$t' is required" >&2; exit 1; }
@@ -100,10 +129,10 @@ report() {
       | awk -F'\t' '{printf "%-14s %-40s %s\n", $1, $2, $3}'
   done
   echo
-  printf '%s' "$RESULTS" | awk -F'\t' -v order="$order" '{c[$1]++} END{
+  printf '%s' "$RESULTS" | awk -F'\t' -v order="$order" -v extra="$SUMMARY_EXTRA" '{c[$1]++} END{
     n=split(order, o, " "); s="summary:";
     for(i=1;i<=n;i++) if(o[i] in c) s=s" "tolower(o[i])"="c[o[i]];
-    if (s=="summary:") s=s" nothing to do"; print s}'
+    if (s=="summary:") s=s" nothing to do"; print s extra}'
   printf '%s' "$RESULTS" | awk -F'\t' '$1=="FAILED"{f=1} END{exit f?1:0}'
 }
 
@@ -140,29 +169,159 @@ if ! LIST=$(gh search prs --review-requested=@me --state=open --limit 100 \
   echo "pr-review-queue: gh search prs failed: $(first_line "$LIST")" >&2; exit 1
 fi
 
-# One line per PR: slug<TAB>repo<TAB>number<TAB>label   (oldest activity first).
-# The JSON goes through a temp file because the heredoc owns stdin.
-TMP=$(mktemp) || exit 1
-trap 'rm -f "$TMP"' EXIT
+# Temp files (the heredocs own stdin, so JSON goes through files):
+#   TMP  = gh search JSON      TMPS = raw headless-Slack output
+#   TMPJ = one "slug#N<TAB>gh pr view JSON" line per Slack candidate
+TMP=""; TMPS=""; TMPJ=""
+trap 'rm -f "$TMP" "$TMPS" "$TMPJ"' EXIT
+TMP=$(mktemp) && TMPS=$(mktemp) && TMPJ=$(mktemp) || exit 1
 printf '%s' "$LIST" > "$TMP"
-PLAN=$(ORGS="$ORGS" python3 - "$TMP" <<'PY'
+
+# ---- slack sweep ---------------------------------------------------------------
+# Sets SLACK_CANDS (one "slug<TAB>N" per line) and returns 1 if any channel could
+# not be read. The model only copies URLs; the strict regex below is the filter.
+SLACK_CANDS=""
+slack_prs() {
+  local oldest prompt raw rc out kind a b missing="" detail tmo=""
+  oldest=$(( $(date +%s) - SLACK_HOURS * 3600 ))
+  # macOS has no `timeout`; use gtimeout/timeout when present, else no limit.
+  if command -v gtimeout >/dev/null 2>&1; then tmo="gtimeout 120"
+  elif command -v timeout >/dev/null 2>&1; then tmo="timeout 120"; fi
+  prompt="Use only the slack_read_channel tool. For each of these Slack channel IDs: ${SLACK_CHANNELS# }
+For each channel, call slack_read_channel with channel_id=<id>, oldest=$oldest, response_format=concise, limit=100. If the result contains a next_cursor, call it again with the same arguments and cursor=<next_cursor>, and repeat until there is no next_cursor.
+When all channels are done, first print one status line per channel: exactly 'CHANNEL <id> OK' if every call for it succeeded, or 'CHANNEL <id> ERROR <reason>' if any call failed. Then print every https://github.com/<owner>/<repo>/pull/<N> URL that appears in any message, one per line. Print nothing else."
+  # The prompt goes on stdin: --allowedTools is variadic and would swallow a trailing argument.
+  raw=$(printf '%s' "$prompt" | $tmo claude -p --model haiku --output-format text --tools "" \
+          --allowedTools mcp__claude_ai_Slack__slack_read_channel 2>/dev/null)
+  rc=$?
+  printf '%s' "$raw" > "$TMPS"
+  out=$(CHANNELS="$SLACK_CHANNELS" ORGS="$ORGS" python3 - "$TMPS" "$TMP" <<'PY'
+import json, os, re, sys
+PR_RE = re.compile(r"^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)$")
+CH_RE = re.compile(r"^CHANNEL (\S+) (OK|ERROR)\b")
+channels = os.environ.get("CHANNELS", "").split()
+orgs = set(os.environ.get("ORGS", "").split())
+with open(sys.argv[1], errors="replace") as fh:
+    lines = fh.read().splitlines()
+with open(sys.argv[2]) as fh:
+    requested = {f"{p['repository']['nameWithOwner']}#{p['number']}" for p in json.load(fh)}
+
+def normalize(line):
+    # Slack renders <https://github.com/o/r/pull/N|label>; strip that, /files and #fragments.
+    s = line.strip().lstrip("<").split("|")[0].rstrip(">").split("#")[0]
+    return re.sub(r"/files/?$", "", s).rstrip("/")
+
+ok, bad, seen = set(), set(), set()
+for line in lines:
+    m = CH_RE.match(line.strip())
+    if m:
+        (ok if m.group(2) == "OK" else bad).add(m.group(1))
+        continue
+    m = PR_RE.match(normalize(line))
+    if not m:
+        continue
+    slug, num = m.groups()
+    key = f"{slug}#{num}"
+    if key in seen or key in requested or (orgs and slug.split("/")[0] not in orgs):
+        continue
+    seen.add(key)
+    print(f"PR\t{slug}\t{num}")
+for ch in channels:
+    if ch not in ok or ch in bad:
+        print(f"MISSING\t{ch}")
+PY
+)
+  while IFS=$'\t' read -r kind a b; do
+    case "$kind" in
+      PR) SLACK_CANDS="${SLACK_CANDS}${a}"$'\t'"${b}"$'\n' ;;
+      MISSING) missing="${missing:+$missing }$a" ;;
+    esac
+  done <<< "$out"
+  detail="$missing"
+  [ "$rc" -eq 0 ] || detail="${detail:+$detail; }claude exit $rc"
+  if [ -n "$detail" ]; then
+    echo "pr-review-queue: slack sweep incomplete ($detail)" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Fetch each candidate once into TMPJ; prints nothing, returns 1 if any fetch failed.
+slack_fetch() {
+  local slug num json rc=0
+  while IFS=$'\t' read -r slug num; do
+    [ -n "$slug" ] || continue
+    if json=$(gh pr view "$num" -R "$slug" --json state,author,isDraft,title,updatedAt,reviews </dev/null 2>&1); then
+      printf '%s\t%s\n' "$slug#$num" "$(printf '%s' "$json" | tr -d '\n')" >> "$TMPJ"
+    else
+      echo "pr-review-queue: slack PR $slug#$num unreadable: $(first_line "$json")" >&2
+      rc=1
+    fi
+  done <<< "$SLACK_CANDS"
+  return $rc
+}
+
+ME=""
+if [ "$SLACK" = 1 ]; then
+  slack_prs || SUMMARY_EXTRA=" slack=partial"
+  if [ -n "$SLACK_CANDS" ]; then
+    if ME=$(gh api user -q .login 2>/dev/null) && [ -n "$ME" ]; then
+      slack_fetch || SUMMARY_EXTRA=" slack=partial"
+    else
+      echo "pr-review-queue: could not read my GitHub login; ignoring Slack PRs" >&2
+      ME=""; SUMMARY_EXTRA=" slack=partial"
+    fi
+  fi
+fi
+
+# One line per PR: slug<TAB>repo<TAB>number<TAB>label   (oldest activity first).
+# Review requests and kept Slack PRs (tagged [slack]) are sorted together.
+PLAN=$(ORGS="$ORGS" ME="$ME" python3 - "$TMP" "$TMPJ" <<'PY'
 import json, os, sys
 with open(sys.argv[1]) as fh:
     prs = json.load(fh)
 orgs = set(os.environ.get("ORGS", "").split())
-for p in sorted(prs, key=lambda p: p.get("updatedAt", "")):
-    slug = p["repository"]["nameWithOwner"]
-    if orgs and slug.split("/")[0] not in orgs:
-        continue
+me = os.environ.get("ME", "").lower()
+rows = []  # (updatedAt, slug, repo, number, label)
+
+def label(p, suffix=""):
     title = " ".join((p.get("title") or "-").split())[:60]
     author = (p.get("author") or {}).get("login") or "?"
     draft = " [draft]" if p.get("isDraft") else ""
-    print(f"{slug}\t{p['repository']['name']}\t{p['number']}\t@{author}{draft}: {title}")
+    return f"@{author}{draft}: {title}{suffix}"
+
+for p in prs:
+    slug = p["repository"]["nameWithOwner"]
+    if orgs and slug.split("/")[0] not in orgs:
+        continue
+    rows.append((p.get("updatedAt", ""), slug, p["repository"]["name"], p["number"], label(p)))
+
+with open(sys.argv[2]) as fh:
+    for line in fh:
+        key, _, raw = line.rstrip("\n").partition("\t")
+        slug, _, num = key.partition("#")
+        if not me or not raw:
+            continue
+        p = json.loads(raw)
+        if orgs and slug.split("/")[0] not in orgs:
+            continue
+        if p.get("state") != "OPEN":
+            continue
+        if ((p.get("author") or {}).get("login") or "").lower() == me:
+            continue
+        # A submitted review of mine (PENDING = unsent draft, not counted) means skip.
+        if any(((r.get("author") or {}).get("login") or "").lower() == me
+               and r.get("state") != "PENDING" for r in p.get("reviews") or []):
+            continue
+        rows.append((p.get("updatedAt", ""), slug, slug.split("/")[1], int(num), label(p, " [slack]")))
+
+for _, slug, repo, num, lab in sorted(rows, key=lambda r: r[0]):
+    print(f"{slug}\t{repo}\t{num}\t{lab}")
 PY
 )
 
 if [ -z "$PLAN" ]; then
-  echo "pr-review-queue: no open PRs are waiting on your review${ORGS:+ in:$ORGS}"
+  echo "pr-review-queue: no open PRs are waiting on your review${ORGS:+ in:$ORGS}${SUMMARY_EXTRA:+ (slack sweep incomplete)}"
   exit 0
 fi
 
