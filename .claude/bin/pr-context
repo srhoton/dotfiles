@@ -26,6 +26,11 @@ Usage: pr-context <PR#|URL> [-R owner/repo] [--json] [--body] [--diff [--only PA
   --only PATH     with --diff: render only PATH (repeatable; a rename matches by either path),
                   e.g. to skip a lockfile. Without --diff it is a usage error.
 
+Files: GraphQL lists at most 100, so a PR with more has its list replaced by the complete one
+from `gh api --paginate repos/OWNER/REPO/pulls/N/files`. If that call fails the first 100 are
+kept and the report says so: a `WARNING: file list truncated` line (text), `files_truncated`
+and `files_warning` inside `files` (--json), and a WARNING on stderr. Never silent.
+
 Exit 0 normally (actionable feedback is not an error), 1 if the PR is not found,
 2 on any other failure. Read-only. Standard library only.
 Testing: GH=<command> replaces the gh binary (see bin/tests/pr-context.sh).
@@ -188,6 +193,53 @@ def fetch_numbered_diff(slug: str, num: int, only: list[str] | None = None) -> s
     return numbered_diff.render_diff(proc.stdout, only or None)
 
 
+def fetch_all_files(slug: str, num: int, total: int) -> list[dict[str, Any]]:
+    """The complete changed-file list from the REST API, shaped like the GraphQL nodes.
+
+    GraphQL `files` stops at 100 nodes; `gh api --paginate` follows the REST pages. Without
+    `--jq` gh prints one JSON array per page back to back (or a single array), so the output
+    is read as a stream of JSON values. Raises Failure if the call fails, the output is not
+    file arrays, or it still holds fewer than `total` files (REST serves at most 3000).
+    """
+    owner, name = slug.split("/", 1)
+    proc = run([*gh_cmd(), "api", "--paginate", f"repos/{owner}/{name}/pulls/{num}/files?per_page=100"])
+    if proc.returncode != 0:
+        raise Failure(f"gh api pulls/{num}/files failed: {first_line(proc.stderr or proc.stdout) or f'exit {proc.returncode}'}")
+    decoder, text, pos, nodes = json.JSONDecoder(), proc.stdout, 0, []
+    try:
+        while True:
+            while pos < len(text) and text[pos].isspace():
+                pos += 1
+            if pos >= len(text):
+                break
+            page, pos = decoder.raw_decode(text, pos)
+            if not isinstance(page, list):
+                raise ValueError("not a file array")
+            for f in page:
+                nodes.append({"path": f["filename"], "additions": f.get("additions"),
+                              "deletions": f.get("deletions")})
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise Failure(f"gh api pulls/{num}/files returned something other than file arrays") from None
+    if len(nodes) < total:
+        raise Failure(f"the files API listed only {len(nodes)} of {total} files")
+    return nodes
+
+
+def complete_files(slug: str, num: int, pr: dict[str, Any]) -> str | None:
+    """GraphQL lists at most 100 files. When the PR has more, replace the list with the full
+    REST one. Returns None when the list is complete, else the reason it is not (the first
+    100 are kept, so the caller must flag the truncation; it is never silent)."""
+    files = pr.get("files") or {}
+    total, nodes = files.get("totalCount") or 0, files.get("nodes") or []
+    if total <= len(nodes):
+        return None
+    try:
+        pr["files"] = {"totalCount": total, "nodes": fetch_all_files(slug, num, total)}
+    except Failure as e:
+        return str(e)
+    return None
+
+
 def check_head_unmoved(slug: str, num: int, head_oid: str) -> None:
     """The diff is fetched after the GraphQL context; raise Failure if the PR head is not
     still the context's, or cannot be re-read (a diff that cannot be tied to the head is
@@ -294,7 +346,8 @@ def login(node: dict[str, Any] | None) -> str:
     return ((node or {}).get("author") or {}).get("login") or "ghost"
 
 
-def build_context(slug: str, got: dict[str, Any], local: dict[str, Any]) -> dict[str, Any]:
+def build_context(slug: str, got: dict[str, Any], local: dict[str, Any],
+                  files_warning: str | None = None) -> dict[str, Any]:
     pr, me = got["pr"], got["viewer"]
     threads, thread_skips = pr_feedback.classify_threads(pr, me)
     comments, _my_newest, comment_skips = pr_feedback.classify_comments(pr, me)
@@ -328,6 +381,17 @@ def build_context(slug: str, got: dict[str, Any], local: dict[str, Any]) -> dict
                if reply is not None else {}),
         })
 
+    files_out: dict[str, Any] = {
+        "totalCount": files.get("totalCount") or 0,
+        "nodes": [{"path": f.get("path"), "additions": f.get("additions"),
+                   "deletions": f.get("deletions")} for f in files.get("nodes") or []]}
+    if len(files_out["nodes"]) < files_out["totalCount"]:
+        # Present only when the list is incomplete; a complete list has exactly the old shape.
+        files_out["files_truncated"] = True
+        files_out["files_warning"] = (
+            f"only the first {len(files_out['nodes'])} of {files_out['totalCount']} files listed"
+            + (f" ({files_warning})" if files_warning else ""))
+
     return {
         "repo": slug,
         "viewer": me,
@@ -335,9 +399,7 @@ def build_context(slug: str, got: dict[str, Any], local: dict[str, Any]) -> dict
             "number", "title", "url", "state", "isDraft", "baseRefName", "headRefName",
             "headRefOid", "mergeable", "mergeStateStatus", "reviewDecision", "body")},
         "local": local,
-        "files": {"totalCount": files.get("totalCount") or 0,
-                  "nodes": [{"path": f.get("path"), "additions": f.get("additions"),
-                             "deletions": f.get("deletions")} for f in files.get("nodes") or []]},
+        "files": files_out,
         "reviews": [{"author": login(r), "state": r.get("state")}
                     for r in (pr.get("latestReviews") or {}).get("nodes") or []],
         "changesRequestedReviews": [
@@ -422,8 +484,8 @@ def render_text(ctx: dict[str, Any]) -> str:
         out.append(f"  {f['path']}  +{f['additions']} -{f['deletions']}")
     if len(files["nodes"]) > FILE_LIST_LIMIT:
         out.append(f"  ... {len(files['nodes']) - FILE_LIST_LIMIT} more listed in --json")
-    if ctx["truncated"]["files"]:
-        out.append(f"  (only the first {len(files['nodes'])} files fetched)")
+    if files.get("files_truncated"):
+        out.append(f"  WARNING: file list truncated: {files['files_warning']}")
 
     body = (pr.get("body") or "").strip()
     if body:
@@ -490,7 +552,11 @@ def main(argv: list[str]) -> int:
         repo, num = parse_target(args.pr, args.repo)
         slug = resolve_repo(repo)
         got = fetch(slug, num)
-        ctx = build_context(slug, got, local_state(slug, str(got["pr"].get("headRefOid") or "")))
+        files_warning = complete_files(slug, num, got["pr"])
+        if files_warning:
+            print(f"pr-context: WARNING: file list truncated ({files_warning})", file=sys.stderr)
+        ctx = build_context(slug, got, local_state(slug, str(got["pr"].get("headRefOid") or "")),
+                            files_warning)
         if args.body:
             ctx["body"] = got["pr"].get("body") or ""
         if args.diff:
