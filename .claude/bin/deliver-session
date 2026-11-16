@@ -1,0 +1,161 @@
+#!/bin/bash
+#
+# deliver-session - start (or rejoin) one tmux + Claude session per Jira ticket,
+# already running /deliver on that ticket.
+#
+# The tmux session is named after the ticket key and starts in ~/git/<repo>. Claude
+# runs on Opus in plan mode with its own session name set to the key, and /deliver
+# <url> is submitted as the first prompt. Nothing is typed into the pane: every
+# setting is a native claude flag. When claude exits the pane falls back to a login
+# shell in the repo, so the tmux session survives.
+#
+# Usage:
+#   deliver-session <repo> <ticket> [-d|--detach] [--dry-run] [-h|--help]
+#
+#   <repo>        bare directory name (no "/") of a git work tree under
+#                 ${DELIVER_SESSION_GIT_ROOT:-$HOME/git}.
+#   <ticket>      a Jira key (HUB-841) or a URL ending /browse/<KEY> (a trailing
+#                 slash, ?query or #fragment is tolerated). The key must match
+#                 ^[A-Z][A-Z0-9]+-[0-9]+$. /deliver always receives the canonical
+#                 https://fullbay.atlassian.net/browse/<KEY>.
+#   -d, --detach  create the session but do not attach or switch to it.
+#   --dry-run     print the tmux new-session command (shell-quoted) and exit 0.
+#                 Only `has-session` is run; nothing is created or attached.
+#   -h, --help    show this help.
+#   Options may appear before or after the positionals.
+#
+# If a tmux session named <KEY> already exists no second claude is started: it
+# prints "deliver-session: session <KEY> already exists, attaching" to stderr and
+# attaches (a no-op with --detach).
+#
+# Attach: inside tmux ($TMUX set) it runs `tmux switch-client`; otherwise it execs
+# `tmux attach-session`.
+#
+# Exit codes: 0 ok, 1 invalid ticket or repo (not a bare name, missing, not a git
+# work tree), 3 usage error or tmux/git not found, 4 tmux failed to create the
+# session or switch to it.
+#
+# Environment (also the test hooks):
+#   DELIVER_SESSION_GIT_ROOT  directory holding the repos (default $HOME/git)
+#   TMUX_BIN                  command to run instead of `tmux`
+#   CLAUDE_BIN                command to run instead of `claude`; passed to the
+#                             pane as an argument, never interpolated into a shell
+#                             string
+#
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$SELF"; }
+die_usage() {
+  echo "deliver-session: $1" >&2
+  echo "usage: deliver-session <repo> <ticket> [-d|--detach] [--dry-run] [-h|--help]" >&2
+  exit 3
+}
+die() { echo "deliver-session: $1" >&2; exit 1; }
+
+TMUX_CMD="${TMUX_BIN:-tmux}"
+CLAUDE_CMD="${CLAUDE_BIN:-claude}"
+GIT_ROOT="${DELIVER_SESSION_GIT_ROOT:-$HOME/git}"
+JIRA_BROWSE="https://fullbay.atlassian.net/browse"
+
+POS=(); DETACH=0; DRY=0; ONLY_POS=0
+while [ $# -gt 0 ]; do
+  if [ "$ONLY_POS" -eq 1 ]; then POS+=("$1"); shift; continue; fi
+  case "$1" in
+    -d|--detach) DETACH=1 ;;
+    --dry-run) DRY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --) ONLY_POS=1 ;;
+    -*) die_usage "unknown option: $1" ;;
+    *) POS+=("$1") ;;
+  esac
+  shift
+done
+[ "${#POS[@]}" -ge 2 ] || die_usage "expected <repo> and <ticket>"
+[ "${#POS[@]}" -le 2 ] || die_usage "too many arguments: ${POS[2]}"
+REPO="${POS[0]}"
+TICKET="${POS[1]}"
+
+# ---- ticket ------------------------------------------------------------------
+# parse_ticket VALUE : sets KEY, or returns 1 when VALUE is not a key or a Jira URL.
+KEY=""
+parse_ticket() {
+  local LC_ALL=C   # keep [A-Z] ASCII-only; local, so it never reaches tmux or claude
+  local t=$1
+  case "$t" in
+    */*)
+      t=${t%%[?#]*}
+      while [ "${t%/}" != "$t" ]; do t=${t%/}; done
+      case "$t" in
+        */browse/*) t=${t##*/browse/}; t=${t%%/*} ;;
+        *) return 1 ;;
+      esac ;;
+  esac
+  [[ $t =~ ^[A-Z][A-Z0-9]+-[0-9]+$ ]] || return 1
+  KEY=$t
+}
+parse_ticket "$TICKET" || die "not a Jira key or /browse/ URL: $TICKET (expected e.g. HUB-841)"
+URL="$JIRA_BROWSE/$KEY"
+
+# ---- repo --------------------------------------------------------------------
+case "$REPO" in
+  ''|.|..|-*|*/*) die "repo must be a bare directory name under $GIT_ROOT, got: $REPO" ;;
+esac
+DIR="$GIT_ROOT/$REPO"
+[ -d "$DIR" ] || die "repo not found: $DIR"
+if ! command -v git >/dev/null 2>&1; then
+  echo "deliver-session: git not found" >&2
+  exit 3
+fi
+# .git must be in the directory itself: rev-parse alone accepts a plain
+# subdirectory of some other work tree.
+if [ ! -e "$DIR/.git" ] || ! git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  die "not a git work tree: $DIR"
+fi
+
+# ---- tmux --------------------------------------------------------------------
+if ! command -v "$TMUX_CMD" >/dev/null 2>&1; then
+  echo "deliver-session: tmux not found ($TMUX_CMD)" >&2
+  exit 3
+fi
+
+attach() {
+  if [ -n "${TMUX:-}" ]; then
+    "$TMUX_CMD" switch-client -t "=$KEY" || { echo "deliver-session: tmux switch-client to $KEY failed" >&2; exit 4; }
+    exit 0
+  fi
+  exec "$TMUX_CMD" attach-session -t "=$KEY"
+}
+
+if "$TMUX_CMD" has-session -t "=$KEY" 2>/dev/null; then
+  if [ "$DRY" -eq 1 ]; then
+    echo "deliver-session: dry-run: session $KEY already exists; would attach, nothing created"
+    exit 0
+  fi
+  if [ "$DETACH" -eq 1 ]; then
+    echo "deliver-session: session $KEY already exists, not attaching (--detach)" >&2
+    exit 0
+  fi
+  echo "deliver-session: session $KEY already exists, attaching" >&2
+  attach
+fi
+
+# The pane command is a fixed script that takes the claude binary as $1, so
+# CLAUDE_BIN is never parsed as shell. The rest of argv goes to claude as-is.
+# shellcheck disable=SC2016  # the $ are meant to expand in the pane's bash, not here
+PANE_SCRIPT='claude_bin="$1"; shift; "$claude_bin" "$@"; exec bash -l'
+NEW_CMD=("$TMUX_CMD" new-session -d -s "$KEY" -c "$DIR" -- bash -lc "$PANE_SCRIPT" _ \
+         "$CLAUDE_CMD" --model opus --permission-mode plan -n "$KEY" "/deliver $URL")
+
+if [ "$DRY" -eq 1 ]; then
+  printf '%q ' "${NEW_CMD[@]}"
+  printf '\n'
+  exit 0
+fi
+
+"${NEW_CMD[@]}" || { echo "deliver-session: tmux new-session for $KEY failed" >&2; exit 4; }
+if [ "$DETACH" -eq 1 ]; then
+  echo "deliver-session: created session $KEY (detached)"
+  exit 0
+fi
+attach
