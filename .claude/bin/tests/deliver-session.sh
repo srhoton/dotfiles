@@ -1,7 +1,8 @@
 #!/bin/bash
 #
 # Tests for deliver-session. A fake tmux (TMUX_BIN) records every call's argv as
-# [arg][arg]... on one line and answers has-session from FAKE_HAS_SESSION; the git
+# [arg][arg]... on one line and answers has-session, list-panes and split-window
+# from FAKE_* env vars (see the fake below); the git
 # root is a temp dir (DELIVER_SESSION_GIT_ROOT) with throwaway repos. No real tmux
 # session and no real claude is ever started. Every name here is synthetic.
 #
@@ -43,7 +44,10 @@ mkdir -p "$WORK/home/git"
 git init -q "$WORK/home/git/homerepo" || exit 1
 
 # Fake tmux. FAKE_HAS_SESSION=1 makes has-session succeed; FAKE_NEW_RC makes
-# new-session exit with that status.
+# new-session exit with that status. FAKE_LIST_PANES is printed verbatim by
+# list-panes (FAKE_LIST_RC is its exit status); FAKE_SPLIT_OUT is what split-window
+# prints as the new pane id (default %42, set-but-empty prints nothing) and
+# FAKE_SPLIT_RC is its exit status.
 FAKE_TMUX="$WORK/fake-tmux"
 cat > "$FAKE_TMUX" <<'EOF'
 #!/bin/bash
@@ -51,6 +55,12 @@ cat > "$FAKE_TMUX" <<'EOF'
 case "$1" in
   has-session) [ "${FAKE_HAS_SESSION:-0}" = "1" ] && exit 0; exit 1 ;;
   new-session) exit "${FAKE_NEW_RC:-0}" ;;
+  list-panes)
+    [ -n "${FAKE_LIST_PANES:-}" ] && printf '%s\n' "$FAKE_LIST_PANES"
+    exit "${FAKE_LIST_RC:-0}" ;;
+  split-window)
+    [ -n "${FAKE_SPLIT_OUT-%42}" ] && printf '%s\n' "${FAKE_SPLIT_OUT-%42}"
+    exit "${FAKE_SPLIT_RC:-0}" ;;
   *) exit 0 ;;
 esac
 EOF
@@ -149,11 +159,14 @@ assert_eq "outside tmux - no switch-client" 0 "$(calls switch-client)"
 assert_eq "outside tmux - session created first" 1 "$(calls new-session)"
 
 new_case a2
-TMUX="/tmp/fake-tmux-socket,1,0" run_ds myrepo HUB-841
-assert_eq "inside tmux - exit 0" 0 "$RC"
-assert_eq "inside tmux - switch-client on the exact target" "[switch-client][-t][=HUB-841]" "$(line_of switch-client)"
-assert_eq "inside tmux - no attach-session" 0 "$(calls attach-session)"
-assert_eq "inside tmux - session created" 1 "$(calls new-session)"
+TMUX="/tmp/fake-tmux-socket,1,0" run_ds myrepo HUB-841 --new-session
+assert_eq "inside tmux --new-session - exit 0" 0 "$RC"
+assert_eq "inside tmux --new-session - switch-client on the exact target" "[switch-client][-t][=HUB-841]" "$(line_of switch-client)"
+assert_eq "inside tmux --new-session - no attach-session" 0 "$(calls attach-session)"
+assert_eq "inside tmux --new-session - session created" 1 "$(calls new-session)"
+assert_eq "inside tmux --new-session - no pane split" 0 "$(calls split-window)"
+assert_eq "inside tmux --new-session - exact new-session argv" "$NEW_HUB" "$(line_of new-session)"
+assert_eq "inside tmux --new-session - no pane lookup" 0 "$(calls list-panes)"
 
 # ---- 6. --detach and option placement ------------------------------------------------------
 new_case d1
@@ -162,7 +175,7 @@ assert_eq "--detach after positionals - no attach" 0 "$(calls attach-session)"
 assert_eq "--detach - no switch-client" 0 "$(calls switch-client)"
 assert_eq "--detach - session still created" 1 "$(calls new-session)"
 new_case d2
-TMUX="/tmp/fake-tmux-socket,1,0" run_ds -d myrepo HUB-841
+TMUX="/tmp/fake-tmux-socket,1,0" run_ds -d myrepo HUB-841 --new-session
 assert_eq "-d before positionals inside tmux - no switch-client" 0 "$(calls switch-client)"
 assert_eq "-d before positionals - session created" 1 "$(calls new-session)"
 new_case d3
@@ -209,7 +222,7 @@ assert_eq "--dry-run - round-trips: last argument" "/deliver $URL1" "${DRY_ARGV[
 assert_eq "--dry-run - round-trips: argument count" 20 "${#DRY_ARGV[@]}"
 
 new_case n2
-TMUX="/tmp/fake-tmux-socket,1,0" FAKE_HAS_SESSION=1 run_ds --dry-run myrepo HUB-841
+TMUX="/tmp/fake-tmux-socket,1,0" FAKE_HAS_SESSION=1 run_ds --dry-run --new-session myrepo HUB-841
 assert_eq "--dry-run with existing session - exit 0" 0 "$RC"
 assert_eq "--dry-run with existing session - only has-session ran" "[has-session][-t][=HUB-841]" "$(cat "$ARGV_LOG")"
 
@@ -236,7 +249,129 @@ DS_TMUX="$WORK/no-such-tmux" run_ds myrepo HUB-841
 assert_eq "missing tmux - exit 3" 3 "$RC"
 assert_err_has "missing tmux - message" "tmux not found"
 
-# ---- 11. usage ---------------------------------------------------------------------------------------
+# ---- 11. pane mode ($TMUX set, no --new-session) --------------------------------------------------------
+INSIDE="/tmp/fake-tmux-socket,1,0"
+SPLIT_HEAD="[split-window][-h]"
+SPLIT_TAIL="[-P][-F][#{pane_id}][-c][$GIT_ROOT/myrepo][--][bash][-lc][$BASHC][_][claude][--model][opus][--permission-mode][plan][-n][HUB-841][/deliver $URL1]"
+
+new_case p1
+TMUX="$INSIDE" run_ds myrepo HUB-841
+assert_eq "pane mode - exit 0" 0 "$RC"
+assert_eq "pane mode - exact split-window argv" "$SPLIT_HEAD$SPLIT_TAIL" "$(line_of split-window)"
+assert_eq "pane mode - exactly one split-window" 1 "$(calls split-window)"
+assert_eq "pane mode - no new-session" 0 "$(calls new-session)"
+assert_eq "pane mode - no attach-session" 0 "$(calls attach-session)"
+assert_eq "pane mode - no switch-client" 0 "$(calls switch-client)"
+assert_eq "pane mode - pane lookup is across all sessions" "[list-panes][-a][-F][#{pane_id} #{@deliver_ticket}]" "$(line_of list-panes)"
+assert_eq "pane mode - tags the new pane" "[set-option][-p][-t][%42][@deliver_ticket][HUB-841]" "$(line_of set-option)"
+assert_eq "pane mode - titles the new pane" "[select-pane][-t][%42][-T][HUB-841]" "$(line_of select-pane)"
+assert_eq "pane mode - session is not renamed" 0 "$(calls rename-session)"
+assert_err_has "pane mode - reports the pane" "deliver-session: started HUB-841 in pane %42"
+assert_eq "pane mode - call order" "list-panes has-session split-window set-option select-pane" \
+  "$(sed 's/^\[\([^]]*\)\].*/\1/' "$ARGV_LOG" | tr '\n' ' ' | sed 's/ $//')"
+
+new_case p2
+TMUX="$INSIDE" run_ds myrepo HUB-841 --detach
+assert_eq "pane mode --detach - exit 0" 0 "$RC"
+assert_eq "pane mode --detach - split-window gets -d" "${SPLIT_HEAD}[-d]${SPLIT_TAIL}" "$(line_of split-window)"
+assert_eq "pane mode --detach - still tags the pane" "[set-option][-p][-t][%42][@deliver_ticket][HUB-841]" "$(line_of set-option)"
+assert_eq "pane mode --detach - no switch-client" 0 "$(calls switch-client)"
+
+new_case p3
+TMUX="$INSIDE" FAKE_LIST_PANES=$'%3 \n%7 HUB-999\n%9 HUB-841' run_ds myrepo HUB-841
+assert_eq "existing pane - exit 0" 0 "$RC"
+assert_eq "existing pane - no split-window" 0 "$(calls split-window)"
+assert_eq "existing pane - no new-session" 0 "$(calls new-session)"
+assert_eq "existing pane - no set-option" 0 "$(calls set-option)"
+assert_err_has "existing pane - message" "deliver-session: pane %9 already running HUB-841, selecting it"
+assert_eq "existing pane - switch-client" "[switch-client][-t][%9]" "$(line_of switch-client)"
+assert_eq "existing pane - select-window" "[select-window][-t][%9]" "$(line_of select-window)"
+assert_eq "existing pane - select-pane" "[select-pane][-t][%9]" "$(line_of select-pane)"
+assert_eq "existing pane - focus order" "switch-client select-window select-pane" \
+  "$(sed 's/^\[\([^]]*\)\].*/\1/' "$ARGV_LOG" | grep -v '^list-panes$' | tr '\n' ' ' | sed 's/ $//')"
+
+new_case p4
+TMUX="$INSIDE" FAKE_LIST_PANES=$'%9 HUB-841' run_ds myrepo HUB-841 --detach
+assert_eq "existing pane --detach - exit 0" 0 "$RC"
+assert_err_has "existing pane --detach - message" "already running HUB-841, not selecting (--detach)"
+assert_eq "existing pane --detach - no split-window" 0 "$(calls split-window)"
+assert_eq "existing pane --detach - no switch-client" 0 "$(calls switch-client)"
+assert_eq "existing pane --detach - no select-window" 0 "$(calls select-window)"
+assert_eq "existing pane --detach - no select-pane" 0 "$(calls select-pane)"
+
+new_case p5
+TMUX="$INSIDE" FAKE_LIST_PANES=$'%7 HUB-8410\n%8 HUB-84\n%9 XHUB-841' run_ds myrepo HUB-841
+assert_eq "other tickets' panes are not a match - split-window ran" 1 "$(calls split-window)"
+
+new_case p6
+TMUX="$INSIDE" FAKE_HAS_SESSION=1 run_ds myrepo HUB-841
+assert_eq "pane mode with existing session - exit 0" 0 "$RC"
+assert_eq "pane mode with existing session - switch-client" "[switch-client][-t][=HUB-841]" "$(line_of switch-client)"
+assert_eq "pane mode with existing session - no split-window" 0 "$(calls split-window)"
+assert_eq "pane mode with existing session - no new-session" 0 "$(calls new-session)"
+assert_err_has "pane mode with existing session - message" "session HUB-841 already exists, attaching"
+
+new_case p7
+TMUX="$INSIDE" FAKE_HAS_SESSION=1 FAKE_LIST_PANES=$'%9 HUB-841' run_ds myrepo HUB-841
+assert_eq "pane and session both exist - the pane wins" "[switch-client][-t][%9]" "$(line_of switch-client)"
+assert_eq "pane and session both exist - session is not consulted" 0 "$(calls has-session)"
+
+new_case p8
+TMUX="$INSIDE" run_ds myrepo HUB-841 --dry-run
+assert_eq "pane mode --dry-run - exit 0" 0 "$RC"
+assert_eq "pane mode --dry-run - only list-panes and has-session ran" \
+  "[list-panes][-a][-F][#{pane_id} #{@deliver_ticket}]
+[has-session][-t][=HUB-841]" "$(cat "$ARGV_LOG")"
+assert_out_has "pane mode --dry-run - prints split-window" "split-window -h -P -F"
+eval "DRY_ARGV=($OUT)"
+assert_eq "pane mode --dry-run - round-trips: tmux binary" "$FAKE_TMUX" "${DRY_ARGV[0]}"
+assert_eq "pane mode --dry-run - round-trips: -F format is one argument" "#{pane_id}" "${DRY_ARGV[5]}"
+assert_eq "pane mode --dry-run - round-trips: pane script is one argument" "$BASHC" "${DRY_ARGV[11]}"
+assert_eq "pane mode --dry-run - round-trips: last argument" "/deliver $URL1" "${DRY_ARGV[${#DRY_ARGV[@]}-1]}"
+assert_eq "pane mode --dry-run - round-trips: argument count" 21 "${#DRY_ARGV[@]}"
+new_case p8b
+TMUX="$INSIDE" run_ds myrepo HUB-841 --dry-run -d
+eval "DRY_ARGV=($OUT)"
+assert_eq "pane mode --dry-run --detach - prints -d" "-d" "${DRY_ARGV[3]}"
+new_case p8c
+CLAUDE_BIN="/opt/my claude/bin/cl'aude" TMUX="$INSIDE" run_ds myrepo HUB-841 --dry-run
+eval "DRY_ARGV=($OUT)"
+assert_eq "pane mode --dry-run - CLAUDE_BIN arrives as one argument" "/opt/my claude/bin/cl'aude" "${DRY_ARGV[13]}"
+new_case p8d
+TMUX="$INSIDE" FAKE_LIST_PANES=$'%9 HUB-841' run_ds myrepo HUB-841 --dry-run
+assert_eq "pane mode --dry-run with existing pane - exit 0" 0 "$RC"
+assert_eq "pane mode --dry-run with existing pane - only list-panes ran" "[list-panes][-a][-F][#{pane_id} #{@deliver_ticket}]" "$(cat "$ARGV_LOG")"
+
+new_case p9
+TMUX="$INSIDE" FAKE_SPLIT_RC=1 run_ds myrepo HUB-841
+assert_eq "split-window failure - exit 4" 4 "$RC"
+assert_err_has "split-window failure - message" "split-window for HUB-841 failed"
+assert_eq "split-window failure - pane is not tagged" 0 "$(calls set-option)"
+new_case p10
+TMUX="$INSIDE" FAKE_SPLIT_OUT="" run_ds myrepo HUB-841
+assert_eq "split-window empty pane id - exit 4" 4 "$RC"
+assert_err_has "split-window empty pane id - message" "returned no pane id"
+assert_eq "split-window empty pane id - no set-option" 0 "$(calls set-option)"
+new_case p11
+TMUX="$INSIDE" FAKE_LIST_RC=1 run_ds myrepo HUB-841
+assert_eq "list-panes failure - exit 4" 4 "$RC"
+assert_eq "list-panes failure - no second claude started" 0 "$(calls split-window)"
+
+new_case p12
+run_ds myrepo HUB-841 --new-session --detach
+assert_eq "--new-session outside tmux - exit 0" 0 "$RC"
+assert_eq "--new-session outside tmux - exact new-session argv" "$NEW_HUB" "$(line_of new-session)"
+assert_eq "--new-session outside tmux - no pane lookup" 0 "$(calls list-panes)"
+new_case p13
+TMUX="$INSIDE" run_ds myrepo HUB-841 --new-session --detach
+assert_eq "--new-session inside tmux --detach - uses new-session" "$NEW_HUB" "$(line_of new-session)"
+assert_eq "--new-session inside tmux --detach - no split-window" 0 "$(calls split-window)"
+new_case p14
+run_ds myrepo HUB-841 --detach
+assert_eq "outside tmux - no pane mode" 0 "$(calls split-window)"
+assert_eq "outside tmux - no pane lookup" 0 "$(calls list-panes)"
+
+# ---- 12. usage ---------------------------------------------------------------------------------------
 new_case u1
 run_ds
 assert_eq "no arguments - exit 3" 3 "$RC"
