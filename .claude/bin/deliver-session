@@ -1,16 +1,18 @@
 #!/bin/bash
 #
-# deliver-session - start (or rejoin) one tmux + Claude session per Jira ticket,
-# already running /deliver on that ticket.
+# deliver-session - start (or rejoin) one Claude per Jira ticket, already running
+# /deliver on that ticket: a new pane when run inside tmux, else a new tmux session.
 #
-# The tmux session is named after the ticket key and starts in ~/git/<repo>. Claude
-# runs on Opus in plan mode with its own session name set to the key, and /deliver
-# <url> is submitted as the first prompt. Nothing is typed into the pane: every
-# setting is a native claude flag. When claude exits the pane falls back to a login
-# shell in the repo, so the tmux session survives.
+# Outside tmux (or with --new-session) a tmux session named after the ticket key is
+# created in ~/git/<repo>. Inside tmux ($TMUX set) a new pane is split off the
+# current window instead, and the current session is left alone. Claude runs on Opus
+# in plan mode with its own session name set to the key, and /deliver <url> is
+# submitted as the first prompt. Nothing is typed into the pane: every setting is a
+# native claude flag. When claude exits the pane falls back to a login shell in the
+# repo, so the pane (or session) survives.
 #
 # Usage:
-#   deliver-session <repo> <ticket> [-d|--detach] [--dry-run] [-h|--help]
+#   deliver-session <repo> <ticket> [-d|--detach] [--new-session] [--dry-run] [-h|--help]
 #
 #   <repo>        bare directory name (no "/") of a git work tree under
 #                 ${DELIVER_SESSION_GIT_ROOT:-$HOME/git}.
@@ -18,11 +20,25 @@
 #                 slash, ?query or #fragment is tolerated). The key must match
 #                 ^[A-Z][A-Z0-9]+-[0-9]+$. /deliver always receives the canonical
 #                 https://fullbay.atlassian.net/browse/<KEY>.
-#   -d, --detach  create the session but do not attach or switch to it.
-#   --dry-run     print the tmux new-session command (shell-quoted) and exit 0.
-#                 Only `has-session` is run; nothing is created or attached.
+#   -d, --detach  start it but do not focus it (pane mode adds `split-window -d`;
+#                 session mode does not attach or switch).
+#   --new-session inside tmux, create a new tmux session as outside tmux does,
+#                 instead of a pane; attach then uses `switch-client`.
+#   --dry-run     print the tmux split-window (pane mode) or new-session command
+#                 (shell-quoted) and exit 0. Only the read-only `list-panes` and
+#                 `has-session` are run; nothing is created, set or focused.
 #   -h, --help    show this help.
 #   Options may appear before or after the positionals.
+#
+# Pane mode ($TMUX set, no --new-session):
+#   1. `list-panes -a` is checked for a pane whose @deliver_ticket option is <KEY>.
+#      If one exists no second claude is started: it prints "deliver-session: pane
+#      <id> already running <KEY>, selecting it" to stderr and runs switch-client,
+#      select-window and select-pane on it (with --detach it only prints "not
+#      selecting (--detach)").
+#   2. Else a tmux session named <KEY> that exists is switched to, as below.
+#   3. Else `split-window -h` starts claude in a new pane in <repo>, then sets the
+#      pane option @deliver_ticket and the pane title to <KEY>.
 #
 # If a tmux session named <KEY> already exists no second claude is started: it
 # prints "deliver-session: session <KEY> already exists, attaching" to stderr and
@@ -33,7 +49,7 @@
 #
 # Exit codes: 0 ok, 1 invalid ticket or repo (not a bare name, missing, not a git
 # work tree), 3 usage error or tmux/git not found, 4 tmux failed to create the
-# session or switch to it.
+# session or pane, to list panes, or to switch to / select it.
 #
 # Environment (also the test hooks):
 #   DELIVER_SESSION_GIT_ROOT  directory holding the repos (default $HOME/git)
@@ -48,7 +64,7 @@ SELF="${BASH_SOURCE[0]}"
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$SELF"; }
 die_usage() {
   echo "deliver-session: $1" >&2
-  echo "usage: deliver-session <repo> <ticket> [-d|--detach] [--dry-run] [-h|--help]" >&2
+  echo "usage: deliver-session <repo> <ticket> [-d|--detach] [--new-session] [--dry-run] [-h|--help]" >&2
   exit 3
 }
 die() { echo "deliver-session: $1" >&2; exit 1; }
@@ -58,11 +74,12 @@ CLAUDE_CMD="${CLAUDE_BIN:-claude}"
 GIT_ROOT="${DELIVER_SESSION_GIT_ROOT:-$HOME/git}"
 JIRA_BROWSE="https://fullbay.atlassian.net/browse"
 
-POS=(); DETACH=0; DRY=0; ONLY_POS=0
+POS=(); DETACH=0; DRY=0; ONLY_POS=0; NEW_SESSION=0
 while [ $# -gt 0 ]; do
   if [ "$ONLY_POS" -eq 1 ]; then POS+=("$1"); shift; continue; fi
   case "$1" in
     -d|--detach) DETACH=1 ;;
+    --new-session) NEW_SESSION=1 ;;
     --dry-run) DRY=1 ;;
     -h|--help) usage; exit 0 ;;
     --) ONLY_POS=1 ;;
@@ -127,6 +144,45 @@ attach() {
   exec "$TMUX_CMD" attach-session -t "=$KEY"
 }
 
+PANE_MODE=0
+if [ -n "${TMUX:-}" ] && [ "$NEW_SESSION" -eq 0 ]; then PANE_MODE=1; fi
+
+# find_pane : sets PANE_ID to a pane (any session) already tagged @deliver_ticket=KEY.
+# Returns 1 when none is, 2 when tmux could not list panes: a failed listing must not
+# read as "no pane", or a second claude would start on the same ticket.
+PANE_ID=""
+find_pane() {
+  local listing id ticket
+  listing=$("$TMUX_CMD" list-panes -a -F '#{pane_id} #{@deliver_ticket}') || return 2
+  while read -r id ticket _; do
+    if [ -n "$id" ] && [ "$ticket" = "$KEY" ]; then PANE_ID=$id; return 0; fi
+  done <<< "$listing"
+  return 1
+}
+
+if [ "$PANE_MODE" -eq 1 ]; then
+  find_pane; rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "deliver-session: tmux list-panes failed" >&2
+    exit 4
+  fi
+  if [ "$rc" -eq 0 ]; then
+    if [ "$DRY" -eq 1 ]; then
+      echo "deliver-session: dry-run: pane $PANE_ID already running $KEY; would select it, nothing created"
+      exit 0
+    fi
+    if [ "$DETACH" -eq 1 ]; then
+      echo "deliver-session: pane $PANE_ID already running $KEY, not selecting (--detach)" >&2
+      exit 0
+    fi
+    echo "deliver-session: pane $PANE_ID already running $KEY, selecting it" >&2
+    for sub in switch-client select-window select-pane; do
+      "$TMUX_CMD" "$sub" -t "$PANE_ID" || { echo "deliver-session: tmux $sub to pane $PANE_ID failed" >&2; exit 4; }
+    done
+    exit 0
+  fi
+fi
+
 if "$TMUX_CMD" has-session -t "=$KEY" 2>/dev/null; then
   if [ "$DRY" -eq 1 ]; then
     echo "deliver-session: dry-run: session $KEY already exists; would attach, nothing created"
@@ -144,8 +200,31 @@ fi
 # CLAUDE_BIN is never parsed as shell. The rest of argv goes to claude as-is.
 # shellcheck disable=SC2016  # the $ are meant to expand in the pane's bash, not here
 PANE_SCRIPT='claude_bin="$1"; shift; "$claude_bin" "$@"; exec bash -l'
-NEW_CMD=("$TMUX_CMD" new-session -d -s "$KEY" -c "$DIR" -- bash -lc "$PANE_SCRIPT" _ \
-         "$CLAUDE_CMD" --model opus --permission-mode plan -n "$KEY" "/deliver $URL")
+CLAUDE_ARGV=("$CLAUDE_CMD" --model opus --permission-mode plan -n "$KEY" "/deliver $URL")
+
+if [ "$PANE_MODE" -eq 1 ]; then
+  SPLIT_CMD=("$TMUX_CMD" split-window -h)
+  if [ "$DETACH" -eq 1 ]; then SPLIT_CMD+=(-d); fi
+  SPLIT_CMD+=(-P -F '#{pane_id}' -c "$DIR" -- bash -lc "$PANE_SCRIPT" _ "${CLAUDE_ARGV[@]}")
+  if [ "$DRY" -eq 1 ]; then
+    printf '%q ' "${SPLIT_CMD[@]}"
+    printf '\n'
+    exit 0
+  fi
+  NEW_PANE=$("${SPLIT_CMD[@]}") || { echo "deliver-session: tmux split-window for $KEY failed" >&2; exit 4; }
+  if [ -z "$NEW_PANE" ]; then
+    echo "deliver-session: tmux split-window for $KEY returned no pane id" >&2
+    exit 4
+  fi
+  "$TMUX_CMD" set-option -p -t "$NEW_PANE" @deliver_ticket "$KEY" \
+    || { echo "deliver-session: tmux set-option on pane $NEW_PANE failed" >&2; exit 4; }
+  "$TMUX_CMD" select-pane -t "$NEW_PANE" -T "$KEY" \
+    || { echo "deliver-session: tmux select-pane -T on pane $NEW_PANE failed" >&2; exit 4; }
+  echo "deliver-session: started $KEY in pane $NEW_PANE" >&2
+  exit 0
+fi
+
+NEW_CMD=("$TMUX_CMD" new-session -d -s "$KEY" -c "$DIR" -- bash -lc "$PANE_SCRIPT" _ "${CLAUDE_ARGV[@]}")
 
 if [ "$DRY" -eq 1 ]; then
   printf '%q ' "${NEW_CMD[@]}"
