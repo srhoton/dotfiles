@@ -65,13 +65,18 @@ fi
 # Combine version indicators
 versions_str="${py_str}${java_str}${node_str}"
 
-# Account indicator (set CLAUDE_ACCOUNT env var to "max" or "enterprise")
-account="${CLAUDE_ACCOUNT:-}"
-if [ -n "$account" ]; then
-    account_str=" | ${account}"
+# Effort level indicator (from statusLine JSON stdin's .effort.level; falls
+# back to the .effortLevel key in ~/.claude/settings.json if the JSON input
+# doesn't carry it, e.g. on a model without reasoning effort)
+effort=$(echo "$input" | jq -r '.effort.level // empty')
+if [ -z "$effort" ] && [ -f "$HOME/.claude/settings.json" ]; then
+    effort=$(jq -r '.effortLevel // empty' "$HOME/.claude/settings.json" 2>/dev/null)
+fi
+if [ -n "$effort" ]; then
+    effort_str=" | effort:${effort}"
 else
-    account_str=""
+    effort_str=""
 fi
 
 printf "\033[32m%s@%s\033[0m \033[34m%s\033[0m\033[35m%s\033[0m\033[33m%s%s\033[0m\033[36m%s\033[0m" \
-    "$user" "$host" "$short_cwd" "$account_str" "$model_str" "$ctx_str" "$versions_str"
+    "$user" "$host" "$short_cwd" "$effort_str" "$model_str" "$ctx_str" "$versions_str"
