@@ -1,0 +1,1 @@
+Prompt: when invoked inside an existing tmux session, do all this in a new tmux pane in the existing session.
