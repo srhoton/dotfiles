@@ -1,0 +1,7 @@
+Session prompts:
+1. User asked: "evaluate the most recent changes in the .claude directory, and port them over to opencode"
+   - Analyzed git diff HEAD~1..HEAD -- .claude/ to identify new/updated files
+   - Ported 4 new sections from CLAUDE.md to AGENTS.md (heredocs, git state verification, deployment workflow, output token discipline)
+   - Created premise-verifier.md agent, fleet.md, ship-when-clean.md, shipit-batch.md, verify-premise.md commands
+2. User asked: "copy these changes to the analogous location in the ~/.opencode directory"
+   - Applied same AGENTS.md updates and copied all 5 new files to global ~/.opencode/

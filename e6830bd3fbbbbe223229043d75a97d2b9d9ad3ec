@@ -1,0 +1,4 @@
+Usage inventory: scratchpad usage-inventory.json (commands/skills/agents/MCP/bin counts since 2026-07-18).
+jdtls: ~2,700 Java diagnostics in 14 days, mostly false ('log cannot be resolved' x517, same-change classes unresolved); LSP tool called 11 times total.
+Suites: generator 17 OK, plugin 12/0, all hooks/tests and bin/tests pass; guard-agent-model still blocks sonnet->functional-reviewer, opus->implementer, haiku->finding-verifier.
+Local (not in this PR): removed MCP Kagi, micro-status, ~/.claude project github/aws (backup ~/.claude/archive-local/claude.json.2026-11-02); uninstalled aws-core, discord; removed thedotmack marketplace.

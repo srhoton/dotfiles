@@ -1,0 +1,2 @@
+Tests 54/0 (dedupe, streaming rewrite, 1h/5m split, tiers, meta/journal types, windows, filters, json/text parity, bad lines, synthetic). Hand mutation of the dedupe key: 4 tests fail; mutation-probe VALID.
+Live: 2026-10-24..10-31 TOTAL $1,726 (reference script $1,723.80 on the same window; my report's $1,679 used a local-midnight mtime prefilter). Implementer $754 over 140 runs.

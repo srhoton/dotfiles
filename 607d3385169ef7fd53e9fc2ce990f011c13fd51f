@@ -1,0 +1,1 @@
+Prompt: build a ~/.claude/bin script taking <repo> and a Jira ticket that starts a tmux session in ~/git/<repo> named after the ticket, launches claude on opus in plan mode named after the ticket, and runs /deliver <ticket url>.

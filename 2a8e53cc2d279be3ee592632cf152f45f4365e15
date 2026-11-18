@@ -1,0 +1,24 @@
+# Prompt History for Commit
+
+## Original User Request
+> I've noticed something of a problem when using opus 5 ... when I enter the
+> review loop on functionality with opus 5, we keep finding issues, in some
+> cases having to back out entire pieces of work, because they couldn't work
+> right, or were coded so badly as to be non-functional. This results in > 3
+> review loops, sometimes more. Is there something I can do, or modifications
+> we can make to my configuration to avoid this?
+
+## Investigation
+- Config audit of ~/.claude (agents, commands, settings, hooks) via Explore subagent
+- Transcript mining of July-Aug 2026 sessions (mig-usr-mg-fun 11 rounds,
+  mig-unt-mg-fun 10 rounds + full layer revert, mig-dms-s3endpoint-iac 5 rounds)
+- Diagnosis: churn is fix-side (partial fix application, fix-induced regressions,
+  design relitigated in-loop, unenforced iteration cap) — not reviewer or model
+  quality. Mechanical gates were green in every blocking round.
+- Full evidence: ~/.claude/plans/i-ve-noticed-something-of-playful-charm.md
+
+## Plan
+Approved plan: enforce cap + descope escalation + diff-growth tripwire in
+commands/review.md; add Design Gate + Fix Discipline to CLAUDE.md; repair the
+unused-but-live routing-agent pipeline (model pins, verify-before-return,
+parallel reviews, verdict protocol); refresh stale generator prompts.

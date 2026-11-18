@@ -1,0 +1,6 @@
+Evidence (2026-10-26):
+- Tool use across past runs: adr 283 runs = Bash/Read/StructuredOutput only; verify 249 runs = Bash, Read, Write 8, AWS MCP 9, ToolSearch 1; premise-verifier 70 runs = Bash, Read, Grep, WebFetch 7, ToolSearch 1.
+- Fresh headless sessions on mig-transform-common-iac#30 (dd87843f4): first turn adr 17,617 / finding-verifier 14,480 / premise-verifier 15,949 tokens.
+- ADR findings parity with the pre-change run on the same input: currency + PUID, no CRITICAL/HIGH either way.
+- Suites: generator 17 OK, plugin 12/0, claude-to-opencode --check clean, guard: finding-verifier+sonnet blocked (rc 2), +opus / no model allowed.
+- Spend estimate: ~$150 per 5 weeks of $1,246 review spend (5-minute cache pricing).

@@ -1,0 +1,1 @@
+Live read-only checks 2026-11-02: batched list_entities (mig-pay-signal-fun, 5 envs) returned all five; get_run on action run r_Wy8qsenwrI3ERVNC returned status/summary; search_audit_logs filter shape accepted (0 FAILURE logs for mig-pay-signal-fun-qa). Review: ~/.claude/scratch/claude-usage/port-mcp-review-2026-11-02.md

@@ -1,0 +1,3 @@
+Review: Opus functional + code-quality reviewers; round 1 fixed 3 HIGH (approval race, retarget target, live-branch false positive) + MEDIUM/LOW; re-review found the gitflow protected-branch case (HIGH) and post-approval head move (MEDIUM); round 2 fixed both. Fix cap (2) reached; one LOW (rank MERGED over CLOSED) deliberately not taken.
+Tests: pr-stack 94/0, pr-approve 63/0, pr-context 120/0, generator 17 OK, plugin 12/0, opencode --check clean, ruff clean. Hand mutations of each HIGH fix fail their tests.
+Live read-only: pr-stack on svo-opportunities-svc #2 #3 #21 and svo-pipeline-iac #3-#6 give correct verdicts.

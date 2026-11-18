@@ -1,0 +1,1 @@
+Live dry runs (deploy/approve tools blocked via --disallowedTools as a safety net): 'qa --dry-run' -> 2-step plan, 'stage' via --to -> 5-step plan, 'demo' -> usage error; transcripts show only list_entities + sha-relation, no trigger/run/approve calls.
