@@ -21,7 +21,12 @@
 #     uncommitted changes are never touched and several PRs of one repo can
 #     be reviewed at once
 #   - inside tmux: one new window per PR, named <repo>#<PR#>, running claude.
-#     Outside tmux: the sessions run one after another in this terminal.
+#     Inside Rex ($REX_SESSION set, $TMUX not): one new background Rex tab per PR
+#     with the same name (`rex window new --focus=false`; $REX_BIN overrides `rex`).
+#     Elsewhere: the sessions run one after another in this terminal.
+#     tmux wins over Rex when both are set, since tmux is the innermost multiplexer.
+#     A rex failure is reported as FAILED; it never falls back to running in this
+#     terminal.
 #
 # The head SHA is recorded at launch in ~/.claude/state/pr-review-queue.json;
 # a PR is not launched again until its head moves (or -f). The script cannot
@@ -57,7 +62,7 @@ SLACK=1; SLACK_HOURS=24; SLACK_CHANNELS=""
 DEFAULT_SLACK_CHANNELS="${PR_REVIEW_SLACK_CHANNELS:-C09BP4Y6N81 C0BFKM2DKNX C07SU6VV47L}"
 SUMMARY_EXTRA=""
 
-usage() { sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//'; }
 first_line() { printf '%s' "$1" | sed -n '1p'; }
 
 while [ $# -gt 0 ]; do
@@ -325,8 +330,37 @@ if [ -z "$PLAN" ]; then
   exit 0
 fi
 
+# Multiplexer: tmux when $TMUX is set (checked first: tmux run inside a Rex pane
+# inherits $REX_* too), else Rex when $REX_SESSION is set, else none (sequential).
+REX_CMD="${REX_BIN:-rex}"
 IN_TMUX=0
-[ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1 && IN_TMUX=1
+MUX=none
+if [ -n "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+  IN_TMUX=1; MUX=tmux
+elif [ -n "${REX_SESSION:-}" ]; then
+  if ! command -v "$REX_CMD" >/dev/null 2>&1; then
+    echo "pr-review-queue: REX_SESSION is set but '$REX_CMD' was not found; running sequentially" >&2
+  elif ! command -v jq >/dev/null 2>&1; then
+    echo "pr-review-queue: 'jq' is required in Rex mode" >&2; exit 1
+  else
+    MUX=rex
+  fi
+fi
+
+# rex_tab_open LABEL : 0 when a Rex tab with that label exists in any session, 1 when
+# none does, 2 when rex could not be read. A failed listing must not read as "no tab",
+# or a second review would start on the same PR.
+rex_tab_open() {
+  local sids sid wins n
+  sids=$("$REX_CMD" ls --json 2>/dev/null </dev/null | jq -r '.sessions[].session_id') || return 2
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue
+    wins=$("$REX_CMD" window ls -s "$sid" --json 2>/dev/null </dev/null) || return 2
+    n=$(printf '%s' "$wins" | jq -r --arg w "$1" '[.windows[] | select(.label == $w)] | length') || return 2
+    [ "$n" -gt 0 ] && return 0
+  done <<< "$sids"
+  return 1
+}
 LAUNCHED=0
 
 # fd 3 carries the plan so that claude (sequential mode) keeps the terminal on stdin.
@@ -341,6 +375,11 @@ while IFS=$'\t' read -r slug repo num label <&3; do
   fi
   if [ "$IN_TMUX" = 1 ] && tmux list-windows -a -F '#{window_name}' 2>/dev/null | grep -Fxq "$win"; then
     emit SKIPPED "$key" "tmux window '$win' is already open"; continue
+  fi
+  if [ "$MUX" = rex ]; then
+    rex_tab_open "$win"; rc=$?
+    if [ "$rc" -eq 2 ]; then emit FAILED "$key" "could not list Rex tabs (stale REX_SESSION?)"; continue; fi
+    if [ "$rc" -eq 0 ]; then emit SKIPPED "$key" "Rex tab '$win' is already open"; continue; fi
   fi
   if [ -e "$clone" ]; then
     origin=$(git -C "$clone" remote get-url origin 2>/dev/null || true)
@@ -384,6 +423,14 @@ while IFS=$'\t' read -r slug repo num label <&3; do
     fi
     state_put "$key" "$sha"
     emit LAUNCHED "$key" "window '$win' — $label"
+  elif [ "$MUX" = rex ]; then
+    # argv, not a shell string: nothing here needs quoting
+    if ! err=$("$REX_CMD" window new -s "$REX_SESSION" "$win" -c "$wt" --focus=false \
+          -- claude -n "review $win" "/reviewit $num" 2>&1 </dev/null); then
+      emit FAILED "$key" "rex window new: $(first_line "$err")"; continue
+    fi
+    state_put "$key" "$sha"
+    emit LAUNCHED "$key" "tab '$win' — $label"
   else
     echo ">>> $key — $label" >&2
     state_put "$key" "$sha"

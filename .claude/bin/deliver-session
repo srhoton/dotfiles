@@ -1,11 +1,14 @@
 #!/bin/bash
 #
 # deliver-session - start (or rejoin) one Claude per Jira ticket, already running
-# /deliver on that ticket: a new pane when run inside tmux, else a new tmux session.
+# /deliver on that ticket: a new pane when run inside tmux or Rex, else a new tmux
+# session.
 #
 # Outside tmux (or with --new-session) a tmux session named after the ticket key is
 # created in ~/git/<repo>. Inside tmux ($TMUX set) a new pane is split off the
-# current window instead, and the current session is left alone. Claude runs on Opus
+# current window instead, and the current session is left alone. Inside Rex
+# ($REX_SESSION set, $TMUX not) the same happens with Rex panes and sessions: see
+# "Rex mode" below. Claude runs on Opus
 # in plan mode with its own session name set to the key, and /deliver <url> is
 # submitted as the first prompt. Nothing is typed into the pane: every setting is a
 # native claude flag. When claude exits the pane falls back to a login shell in the
@@ -47,13 +50,34 @@
 # Attach: inside tmux ($TMUX set) it runs `tmux switch-client`; otherwise it execs
 # `tmux attach-session`.
 #
+# Multiplexer choice: $TMUX set (and tmux present) means tmux, because tmux started
+# inside a Rex pane inherits $REX_* and is the innermost multiplexer. Else
+# $REX_SESSION set means Rex. Else a new tmux session is created, as above.
+#
+# Rex mode ($REX_SESSION set, $TMUX not):
+#   Pane mode: every Rex session is searched (`rex block ls`) for a block labelled
+#   <KEY>; if one exists it is focused with `rex focus` (with --detach only a message
+#   is printed). Else a Rex session labelled <KEY> is selected, as below. Else
+#   `rex split --split=right` opens a pane labelled <KEY> next to $REX_BLOCK (--detach
+#   adds --focus=false), running claude in <repo>.
+#   --new-session creates a Rex session labelled <KEY> with `rex new` instead.
+#   Selecting a session is best effort: it runs the client action session.select
+#   (with `-C $REX_CLIENT` when that is set), which needs Remote Control. If that
+#   fails it prints "open session <KEY> in the Rex sidebar" and still exits 0, because
+#   the session was created. --dry-run prints the quoted `rex split` or `rex new`.
+#   There is no silent fallback: any rex failure exits 4.
+#
 # Exit codes: 0 ok, 1 invalid ticket or repo (not a bare name, missing, not a git
-# work tree), 3 usage error or tmux/git not found, 4 tmux failed to create the
-# session or pane, to list panes, or to switch to / select it.
+# work tree), 3 usage error or tmux/rex/jq/git not found (tmux is only needed in
+# tmux mode, rex and jq only in Rex mode), 4 tmux or rex failed to create the
+# session or pane, to list panes or blocks, or to switch to / select it.
 #
 # Environment (also the test hooks):
 #   DELIVER_SESSION_GIT_ROOT  directory holding the repos (default $HOME/git)
 #   TMUX_BIN                  command to run instead of `tmux`
+#   REX_BIN                   command to run instead of `rex`
+#   REX_SESSION, REX_BLOCK    set by Rex itself: the session to work in and the block
+#                             to split. REX_CLIENT (optional) is passed as `-C`.
 #   CLAUDE_BIN                command to run instead of `claude`; passed to the
 #                             pane as an argument, never interpolated into a shell
 #                             string
@@ -70,6 +94,7 @@ die_usage() {
 die() { echo "deliver-session: $1" >&2; exit 1; }
 
 TMUX_CMD="${TMUX_BIN:-tmux}"
+REX_CMD="${REX_BIN:-rex}"
 CLAUDE_CMD="${CLAUDE_BIN:-claude}"
 GIT_ROOT="${DELIVER_SESSION_GIT_ROOT:-$HOME/git}"
 JIRA_BROWSE="https://fullbay.atlassian.net/browse"
@@ -128,6 +153,132 @@ fi
 # subdirectory of some other work tree.
 if [ ! -e "$DIR/.git" ] || ! git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   die "not a git work tree: $DIR"
+fi
+
+# The pane command is a fixed script that takes the claude binary as $1, so
+# CLAUDE_BIN is never parsed as shell. The rest of argv goes to claude as-is.
+# shellcheck disable=SC2016  # the $ are meant to expand in the pane's bash, not here
+PANE_SCRIPT='claude_bin="$1"; shift; "$claude_bin" "$@"; exec bash -l'
+CLAUDE_ARGV=("$CLAUDE_CMD" --model opus --permission-mode plan -n "$KEY" "/deliver $URL")
+
+# ---- multiplexer -------------------------------------------------------------
+# $TMUX wins over $REX_SESSION: tmux run inside a Rex pane inherits $REX_* too.
+MUX=tmux
+if [ -n "${TMUX:-}" ] && command -v "$TMUX_CMD" >/dev/null 2>&1; then
+  MUX=tmux
+elif [ -n "${REX_SESSION:-}" ]; then
+  MUX=rex
+fi
+
+# ---- rex ---------------------------------------------------------------------
+# Every path through this block exits. A rex failure is never retried in tmux.
+rex_fail() { echo "deliver-session: $1" >&2; exit 4; }
+
+# rex_attach SESSION_ID : best-effort select of a Rex session, then exit 0. Selecting
+# is a client action that needs Remote Control, so failing must not fail a launch
+# that already created the session.
+rex_attach() {
+  local cmd=("$REX_CMD")
+  if [ -n "${REX_CLIENT:-}" ]; then cmd+=(-C "$REX_CLIENT"); fi
+  cmd+=(do session.select "session_id=$1")
+  if ! "${cmd[@]}" >/dev/null 2>&1; then
+    echo "deliver-session: could not select session $KEY; open session $KEY in the Rex sidebar" >&2
+  fi
+  exit 0
+}
+
+# rex_find_block : sets BLOCK_ID and BLOCK_SESSION to a block (any session) labelled
+# KEY. Returns 1 when none is, 2 when rex could not list blocks: a failed listing must
+# not read as "no block", or a second claude would start on the same ticket.
+BLOCK_ID=""; BLOCK_SESSION=""
+rex_find_block() {
+  local sids sid blocks id
+  sids=$(printf '%s' "$REX_LS" | jq -r '.sessions[].session_id') || return 2
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue
+    blocks=$("$REX_CMD" block ls -s "$sid" --json) || return 2
+    id=$(printf '%s' "$blocks" | jq -r --arg k "$KEY" '[.blocks[] | select(.label == $k) | .block_id][0] // empty') || return 2
+    if [ -n "$id" ]; then BLOCK_ID=$id; BLOCK_SESSION=$sid; return 0; fi
+  done <<< "$sids"
+  return 1
+}
+
+if [ "$MUX" = rex ]; then
+  if ! command -v "$REX_CMD" >/dev/null 2>&1; then
+    echo "deliver-session: rex not found ($REX_CMD)" >&2
+    exit 3
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "deliver-session: jq not found (needed in Rex mode)" >&2
+    exit 3
+  fi
+  REX_LS=$("$REX_CMD" ls --json) || rex_fail "rex ls failed"
+
+  if [ "$NEW_SESSION" -eq 0 ]; then
+    rex_find_block; rc=$?
+    if [ "$rc" -eq 2 ]; then rex_fail "rex block listing failed"; fi
+    if [ "$rc" -eq 0 ]; then
+      where=""
+      if [ "$BLOCK_SESSION" != "$REX_SESSION" ]; then where=" in session $BLOCK_SESSION"; fi
+      if [ "$DRY" -eq 1 ]; then
+        echo "deliver-session: dry-run: block $BLOCK_ID$where already running $KEY; would focus it, nothing created"
+        exit 0
+      fi
+      if [ "$DETACH" -eq 1 ]; then
+        echo "deliver-session: block $BLOCK_ID$where already running $KEY, not focusing (--detach)" >&2
+        exit 0
+      fi
+      echo "deliver-session: block $BLOCK_ID$where already running $KEY, focusing it" >&2
+      "$REX_CMD" focus -s "$BLOCK_SESSION" "$BLOCK_ID" || rex_fail "rex focus on block $BLOCK_ID failed"
+      exit 0
+    fi
+  fi
+
+  EXISTING_SESSION=$(printf '%s' "$REX_LS" | jq -r --arg k "$KEY" '[.sessions[] | select(.label == $k) | .session_id][0] // empty') \
+    || rex_fail "could not read the rex session list"
+  if [ -n "$EXISTING_SESSION" ]; then
+    if [ "$DRY" -eq 1 ]; then
+      echo "deliver-session: dry-run: session $KEY already exists; would select it, nothing created"
+      exit 0
+    fi
+    if [ "$DETACH" -eq 1 ]; then
+      echo "deliver-session: session $KEY already exists, not selecting (--detach)" >&2
+      exit 0
+    fi
+    echo "deliver-session: session $KEY already exists, selecting it" >&2
+    rex_attach "$EXISTING_SESSION"
+  fi
+
+  if [ "$NEW_SESSION" -eq 0 ]; then
+    REX_CREATE=("$REX_CMD" split -s "$REX_SESSION")
+    if [ -n "${REX_BLOCK:-}" ]; then REX_CREATE+=(-b "$REX_BLOCK"); fi
+    REX_CREATE+=(--split=right --label "$KEY" -c "$DIR" --shell=none)
+    if [ "$DETACH" -eq 1 ]; then REX_CREATE+=(--focus=false); fi
+    REX_CREATE+=(--json -- bash -lc "$PANE_SCRIPT" _ "${CLAUDE_ARGV[@]}")
+  else
+    REX_CREATE=("$REX_CMD" new "$KEY" -c "$DIR" --shell=none --json -- bash -lc "$PANE_SCRIPT" _ "${CLAUDE_ARGV[@]}")
+  fi
+  if [ "$DRY" -eq 1 ]; then
+    printf '%q ' "${REX_CREATE[@]}"
+    printf '\n'
+    exit 0
+  fi
+  REX_OUT=$("${REX_CREATE[@]}") || rex_fail "rex ${REX_CREATE[1]} for $KEY failed"
+  if [ "$NEW_SESSION" -eq 0 ]; then
+    NEW_BLOCK=$(printf '%s' "$REX_OUT" | jq -r '.block_ids[0] // empty') \
+      || rex_fail "rex split for $KEY returned unreadable output"
+    if [ -z "$NEW_BLOCK" ]; then rex_fail "rex split for $KEY returned no block id"; fi
+    echo "deliver-session: started $KEY in block $NEW_BLOCK" >&2
+    exit 0
+  fi
+  NEW_SID=$(printf '%s' "$REX_OUT" | jq -r '.session_id // empty') \
+    || rex_fail "rex new for $KEY returned unreadable output"
+  if [ -z "$NEW_SID" ]; then rex_fail "rex new for $KEY returned no session id"; fi
+  if [ "$DETACH" -eq 1 ]; then
+    echo "deliver-session: created session $KEY (detached)"
+    exit 0
+  fi
+  rex_attach "$NEW_SID"
 fi
 
 # ---- tmux --------------------------------------------------------------------
@@ -195,12 +346,6 @@ if "$TMUX_CMD" has-session -t "=$KEY" 2>/dev/null; then
   echo "deliver-session: session $KEY already exists, attaching" >&2
   attach
 fi
-
-# The pane command is a fixed script that takes the claude binary as $1, so
-# CLAUDE_BIN is never parsed as shell. The rest of argv goes to claude as-is.
-# shellcheck disable=SC2016  # the $ are meant to expand in the pane's bash, not here
-PANE_SCRIPT='claude_bin="$1"; shift; "$claude_bin" "$@"; exec bash -l'
-CLAUDE_ARGV=("$CLAUDE_CMD" --model opus --permission-mode plan -n "$KEY" "/deliver $URL")
 
 if [ "$PANE_MODE" -eq 1 ]; then
   SPLIT_CMD=("$TMUX_CMD" split-window -h)
