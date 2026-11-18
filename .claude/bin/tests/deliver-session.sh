@@ -2,9 +2,12 @@
 #
 # Tests for deliver-session. A fake tmux (TMUX_BIN) records every call's argv as
 # [arg][arg]... on one line and answers has-session, list-panes and split-window
-# from FAKE_* env vars (see the fake below); the git
+# from FAKE_* env vars (see the fake below); a fake rex (REX_BIN) does the same for
+# ls, block ls, split, new, focus and do. The git
 # root is a temp dir (DELIVER_SESSION_GIT_ROOT) with throwaway repos. No real tmux
-# session and no real claude is ever started. Every name here is synthetic.
+# or rex session and no real claude is ever started. Every name here is synthetic.
+# REX_SESSION, REX_BLOCK and REX_CLIENT are unset below, because the suite may run
+# inside a Rex pane; only the Rex cases set them, as prefix assignments to run_ds.
 #
 # Usage: bin/tests/deliver-session.sh        (exit 1 if any case fails)
 
@@ -34,6 +37,16 @@ line_of() {
   if [ -f "$ARGV_LOG" ]; then grep -F -- "[$1]" "$ARGV_LOG" | head -1; fi
 }
 total_calls() { if [ -f "$ARGV_LOG" ]; then wc -l < "$ARGV_LOG" | tr -d ' '; else echo 0; fi; }
+# rcalls SUBCOMMAND / rline_of SUBCOMMAND / rtotal : the same for the fake rex's log.
+rcalls() {
+  if [ -f "$REX_LOG" ]; then grep -c -F -- "[$1]" "$REX_LOG" | head -1; else echo 0; fi
+}
+rline_of() {
+  if [ -f "$REX_LOG" ]; then grep -F -- "[$1]" "$REX_LOG" | head -1; fi
+}
+rtotal() { if [ -f "$REX_LOG" ]; then wc -l < "$REX_LOG" | tr -d ' '; else echo 0; fi; }
+# rorder : the fake rex's subcommands in call order, space separated.
+rorder() { sed 's/^\[\([^]]*\)\].*/\1/' "$REX_LOG" | tr '\n' ' ' | sed 's/ $//'; }
 
 GIT_ROOT="$WORK/git"
 mkdir -p "$GIT_ROOT"
@@ -66,19 +79,64 @@ esac
 EOF
 chmod +x "$FAKE_TMUX"
 
+# Fake rex (REX_BIN). Records argv like the fake tmux, to FAKE_REX_LOG. Answers the
+# subcommands deliver-session uses with canned JSON:
+#   ls                FAKE_REX_LS         (default: one session, session:cur)
+#   block ls -s S     FAKE_REX_BLOCKS     (default: no blocks); when FAKE_REX_BLOCKS_SESSION
+#                     is set, only that session has them, every other one has none
+#   split             FAKE_REX_SPLIT_OUT  (default: {"block_ids":["block:new1"]}; set-but-empty
+#                     prints nothing)
+#   new               FAKE_REX_NEW_OUT    (default: {"session_id":"session:new1"})
+# FAKE_REX_RC is the exit status: of every subcommand, or only of the one named by
+# FAKE_REX_FAIL_ON (ls, block, split, new, focus, do) when that is set.
+FAKE_REX="$WORK/fake-rex"
+cat > "$FAKE_REX" <<'EOF'
+#!/bin/bash
+{ printf '[%s]' "$@"; echo; } >> "$FAKE_REX_LOG"
+args=("$@")
+if [ "${1:-}" = "-C" ]; then shift 2; fi
+sub="${1:-}"
+if [ "${FAKE_REX_RC:-0}" != "0" ] && { [ -z "${FAKE_REX_FAIL_ON:-}" ] || [ "$FAKE_REX_FAIL_ON" = "$sub" ]; }; then
+  echo "fake rex: $sub failed" >&2
+  exit "$FAKE_REX_RC"
+fi
+no_blocks='{"blocks":[]}'
+def_ls='{"sessions":[{"session_id":"session:cur","label":"main"}]}'
+def_split='{"block_ids":["block:new1"]}'
+def_new='{"session_id":"session:new1"}'
+case "$sub" in
+  ls) printf '%s\n' "${FAKE_REX_LS-$def_ls}" ;;
+  block)
+    sid=""
+    for ((i = 0; i < ${#args[@]}; i++)); do [ "${args[$i]}" = "-s" ] && sid="${args[$((i + 1))]}"; done
+    if [ -n "${FAKE_REX_BLOCKS_SESSION:-}" ] && [ "$sid" != "$FAKE_REX_BLOCKS_SESSION" ]; then
+      printf '%s\n' "$no_blocks"
+    else
+      printf '%s\n' "${FAKE_REX_BLOCKS-$no_blocks}"
+    fi ;;
+  split) out="${FAKE_REX_SPLIT_OUT-$def_split}"; [ -n "$out" ] && printf '%s\n' "$out"; exit 0 ;;
+  new) out="${FAKE_REX_NEW_OUT-$def_new}"; [ -n "$out" ] && printf '%s\n' "$out"; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$FAKE_REX"
+
 # run_ds [args...] : stdout -> OUT, stderr -> ERR, exit -> RC. Fake behaviour is
-# set through the caller's prefix assignments.
+# set through the caller's prefix assignments (TMUX, REX_SESSION, FAKE_* ...).
 run_ds() {
   local errf="$WORK/stderr.txt"
-  OUT=$(DELIVER_SESSION_GIT_ROOT="${DS_ROOT:-$GIT_ROOT}" TMUX_BIN="${DS_TMUX:-$FAKE_TMUX}" FAKE_ARGV_LOG="$ARGV_LOG" \
+  OUT=$(DELIVER_SESSION_GIT_ROOT="${DS_ROOT:-$GIT_ROOT}" TMUX_BIN="${DS_TMUX:-$FAKE_TMUX}" REX_BIN="${DS_REX:-$FAKE_REX}" \
+        FAKE_ARGV_LOG="$ARGV_LOG" FAKE_REX_LOG="$REX_LOG" \
         "$DS" "$@" 2>"$errf" < /dev/null)
   RC=$?
   ERR=$(cat "$errf")
 }
 
-new_case() { ARGV_LOG="$WORK/tmux-$1.argv"; rm -f "$ARGV_LOG"; }
+new_case() { ARGV_LOG="$WORK/tmux-$1.argv"; REX_LOG="$WORK/rex-$1.argv"; rm -f "$ARGV_LOG" "$REX_LOG"; }
 
-unset TMUX CLAUDE_BIN DELIVER_SESSION_GIT_ROOT TMUX_BIN
+# The suite may itself be running inside Rex (REX_SESSION set) or tmux: strip every
+# variable that selects a multiplexer, so only a case that sets one gets it.
+unset TMUX CLAUDE_BIN DELIVER_SESSION_GIT_ROOT TMUX_BIN REX_BIN REX_SESSION REX_BLOCK REX_CLIENT
 
 # shellcheck disable=SC2016  # literal text compared against the logged argv
 BASHC='claude_bin="$1"; shift; "$claude_bin" "$@"; exec bash -l'
@@ -371,7 +429,192 @@ run_ds myrepo HUB-841 --detach
 assert_eq "outside tmux - no pane mode" 0 "$(calls split-window)"
 assert_eq "outside tmux - no pane lookup" 0 "$(calls list-panes)"
 
-# ---- 12. usage ---------------------------------------------------------------------------------------
+# ---- 12. Rex mode ($REX_SESSION set, $TMUX not) ----------------------------------------------------------
+RS="session:cur"; RB="block:cur"
+RX_TAIL="[--][bash][-lc][$BASHC][_][claude][--model][opus][--permission-mode][plan][-n][HUB-841][/deliver $URL1]"
+RX_SPLIT="[split][-s][$RS][-b][$RB][--split=right][--label][HUB-841][-c][$GIT_ROOT/myrepo][--shell=none]"
+BLK_MINE='{"blocks":[{"block_id":"block:b9","label":"HUB-841","window_id":"window:w1"}]}'
+BLK_OTHERS='{"blocks":[{"block_id":"block:b1","label":"HUB-8410","window_id":"window:w1"},{"block_id":"block:b2","label":"","window_id":"window:w1"}]}'
+LS_TWO='{"sessions":[{"session_id":"session:other","label":"misc"},{"session_id":"session:cur","label":"main"}]}'
+LS_HAS_KEY='{"sessions":[{"session_id":"session:cur","label":"main"},{"session_id":"session:k1","label":"HUB-841"}]}'
+
+new_case x1
+REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841
+assert_eq "rex pane - exit 0" 0 "$RC"
+assert_eq "rex pane - exact split argv" "$RX_SPLIT[--json]$RX_TAIL" "$(rline_of split)"
+assert_eq "rex pane - exactly one split" 1 "$(rcalls split)"
+assert_eq "rex pane - lookups then split" "ls block split" "$(rorder)"
+assert_eq "rex pane - block lookup is per session, json" "[block][ls][-s][$RS][--json]" "$(rline_of block)"
+assert_eq "rex pane - no tmux call" 0 "$(total_calls)"
+assert_eq "rex pane - no session selection" 0 "$(rcalls do)"
+assert_err_has "rex pane - reports the block" "deliver-session: started HUB-841 in block block:new1"
+
+new_case x2
+REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841 --detach
+assert_eq "rex pane --detach - exit 0" 0 "$RC"
+assert_eq "rex pane --detach - split gets --focus=false" "$RX_SPLIT[--focus=false][--json]$RX_TAIL" "$(rline_of split)"
+
+new_case x3
+REX_SESSION="$RS" run_ds myrepo HUB-841
+assert_eq "rex pane without REX_BLOCK - exit 0" 0 "$RC"
+assert_eq "rex pane without REX_BLOCK - no -b" \
+  "[split][-s][$RS][--split=right][--label][HUB-841][-c][$GIT_ROOT/myrepo][--shell=none][--json]$RX_TAIL" "$(rline_of split)"
+
+new_case x4
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_BLOCKS="$BLK_MINE" run_ds myrepo HUB-841
+assert_eq "rex existing block - exit 0" 0 "$RC"
+assert_eq "rex existing block - no split" 0 "$(rcalls split)"
+assert_eq "rex existing block - no new" 0 "$(rcalls new)"
+assert_eq "rex existing block - focuses it" "[focus][-s][$RS][block:b9]" "$(rline_of focus)"
+assert_err_has "rex existing block - message" "deliver-session: block block:b9 already running HUB-841, focusing it"
+
+new_case x5
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_LS="$LS_TWO" FAKE_REX_BLOCKS="$BLK_MINE" FAKE_REX_BLOCKS_SESSION="session:other" run_ds myrepo HUB-841
+assert_eq "rex block in another session - exit 0" 0 "$RC"
+assert_eq "rex block in another session - focus is scoped to that session" "[focus][-s][session:other][block:b9]" "$(rline_of focus)"
+assert_eq "rex block in another session - no split" 0 "$(rcalls split)"
+assert_err_has "rex block in another session - names the session" "in session session:other"
+
+new_case x6
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_BLOCKS="$BLK_MINE" run_ds myrepo HUB-841 --detach
+assert_eq "rex existing block --detach - exit 0" 0 "$RC"
+assert_eq "rex existing block --detach - no focus" 0 "$(rcalls focus)"
+assert_eq "rex existing block --detach - no split" 0 "$(rcalls split)"
+assert_err_has "rex existing block --detach - message" "not focusing (--detach)"
+
+new_case x7
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_BLOCKS="$BLK_OTHERS" run_ds myrepo HUB-841
+assert_eq "rex other labels are not a match - split ran" 1 "$(rcalls split)"
+
+new_case x8
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_RC=1 FAKE_REX_FAIL_ON=block run_ds myrepo HUB-841
+assert_eq "rex block listing failure - exit 4" 4 "$RC"
+assert_eq "rex block listing failure - no second claude started" 0 "$(rcalls split)"
+assert_eq "rex block listing failure - no tmux fallback" 0 "$(total_calls)"
+assert_err_has "rex block listing failure - message" "rex block listing failed"
+new_case x8b
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_RC=1 FAKE_REX_FAIL_ON=ls run_ds myrepo HUB-841
+assert_eq "rex ls failure - exit 4" 4 "$RC"
+assert_eq "rex ls failure - nothing created" 0 "$(rcalls split)"
+assert_eq "rex ls failure - no tmux fallback" 0 "$(total_calls)"
+new_case x8c
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_BLOCKS="not json" run_ds myrepo HUB-841
+assert_eq "rex unreadable block listing - exit 4" 4 "$RC"
+assert_eq "rex unreadable block listing - no split" 0 "$(rcalls split)"
+
+new_case x9
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_RC=1 FAKE_REX_FAIL_ON=split run_ds myrepo HUB-841
+assert_eq "rex split failure - exit 4" 4 "$RC"
+assert_err_has "rex split failure - message" "rex split for HUB-841 failed"
+assert_eq "rex split failure - no tmux fallback" 0 "$(total_calls)"
+new_case x9b
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_SPLIT_OUT="" run_ds myrepo HUB-841
+assert_eq "rex split without output - exit 4" 4 "$RC"
+assert_err_has "rex split without output - message" "returned no block id"
+new_case x9c
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_SPLIT_OUT='{"block_ids":[]}' run_ds myrepo HUB-841
+assert_eq "rex split with no block ids - exit 4" 4 "$RC"
+
+new_case x10
+REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841 --new-session --detach
+assert_eq "rex --new-session - exit 0" 0 "$RC"
+assert_eq "rex --new-session - exact new argv" "[new][HUB-841][-c][$GIT_ROOT/myrepo][--shell=none][--json]$RX_TAIL" "$(rline_of new)"
+assert_eq "rex --new-session - no split" 0 "$(rcalls split)"
+assert_eq "rex --new-session - no block lookup" 0 "$(rcalls block)"
+assert_eq "rex --new-session --detach - session is not selected" 0 "$(rcalls do)"
+assert_eq "rex --new-session - no tmux call" 0 "$(total_calls)"
+new_case x10b
+REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841 --new-session
+assert_eq "rex --new-session attach - exit 0" 0 "$RC"
+assert_eq "rex --new-session attach - selects the new session" "[do][session.select][session_id=session:new1]" "$(rline_of do)"
+new_case x10c
+REX_SESSION="$RS" REX_BLOCK="$RB" REX_CLIENT="mac mini" run_ds myrepo HUB-841 --new-session
+assert_eq "rex REX_CLIENT - passed as -C before the subcommand" "[-C][mac mini][do][session.select][session_id=session:new1]" "$(rline_of do)"
+new_case x10d
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_RC=1 FAKE_REX_FAIL_ON=new run_ds myrepo HUB-841 --new-session
+assert_eq "rex new failure - exit 4" 4 "$RC"
+assert_err_has "rex new failure - message" "rex new for HUB-841 failed"
+assert_eq "rex new failure - nothing selected" 0 "$(rcalls do)"
+new_case x10e
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_NEW_OUT="" run_ds myrepo HUB-841 --new-session
+assert_eq "rex new without output - exit 4" 4 "$RC"
+assert_err_has "rex new without output - message" "returned no session id"
+
+new_case x11
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_RC=1 FAKE_REX_FAIL_ON=do run_ds myrepo HUB-841 --new-session
+assert_eq "rex failed session.select - exit 0 (non-fatal)" 0 "$RC"
+assert_eq "rex failed session.select - the session was created" 1 "$(rcalls new)"
+assert_err_has "rex failed session.select - points at the sidebar" "open session HUB-841 in the Rex sidebar"
+
+new_case x12
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_LS="$LS_HAS_KEY" run_ds myrepo HUB-841
+assert_eq "rex existing session - exit 0" 0 "$RC"
+assert_eq "rex existing session - no split" 0 "$(rcalls split)"
+assert_eq "rex existing session - no new" 0 "$(rcalls new)"
+assert_eq "rex existing session - selects it" "[do][session.select][session_id=session:k1]" "$(rline_of do)"
+assert_err_has "rex existing session - message" "session HUB-841 already exists, selecting it"
+new_case x12b
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_LS="$LS_HAS_KEY" run_ds myrepo HUB-841 --detach
+assert_eq "rex existing session --detach - exit 0" 0 "$RC"
+assert_eq "rex existing session --detach - no select" 0 "$(rcalls do)"
+assert_eq "rex existing session --detach - no split" 0 "$(rcalls split)"
+new_case x12c
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_LS="$LS_HAS_KEY" FAKE_REX_BLOCKS="$BLK_MINE" run_ds myrepo HUB-841
+assert_eq "rex block and session both exist - the block wins" "[focus][-s][$RS][block:b9]" "$(rline_of focus)"
+assert_eq "rex block and session both exist - session not selected" 0 "$(rcalls do)"
+
+new_case x13
+REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841 --dry-run
+assert_eq "rex --dry-run - exit 0" 0 "$RC"
+assert_eq "rex --dry-run - only the read-only lookups ran" "ls block" "$(rorder)"
+assert_out_has "rex --dry-run - prints split" "split -s session:cur -b block:cur --split=right --label HUB-841"
+eval "DRY_ARGV=($OUT)"
+assert_eq "rex --dry-run - round-trips: rex binary" "$FAKE_REX" "${DRY_ARGV[0]}"
+assert_eq "rex --dry-run - round-trips: pane script is one argument" "$BASHC" "${DRY_ARGV[16]}"
+assert_eq "rex --dry-run - round-trips: last argument" "/deliver $URL1" "${DRY_ARGV[${#DRY_ARGV[@]}-1]}"
+assert_eq "rex --dry-run - round-trips: argument count" 26 "${#DRY_ARGV[@]}"
+new_case x13b
+CLAUDE_BIN="/opt/my claude/bin/cl'aude" REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841 --dry-run -d
+eval "DRY_ARGV=($OUT)"
+assert_eq "rex --dry-run --detach - prints --focus=false" "--focus=false" "${DRY_ARGV[12]}"
+assert_eq "rex --dry-run - CLAUDE_BIN arrives as one argument" "/opt/my claude/bin/cl'aude" "${DRY_ARGV[19]}"
+new_case x13c
+REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841 --dry-run --new-session
+eval "DRY_ARGV=($OUT)"
+assert_eq "rex --dry-run --new-session - prints new" "new" "${DRY_ARGV[1]}"
+assert_eq "rex --dry-run --new-session - session label" "HUB-841" "${DRY_ARGV[2]}"
+assert_eq "rex --dry-run --new-session - nothing created" "ls" "$(rorder)"
+new_case x13d
+REX_SESSION="$RS" REX_BLOCK="$RB" FAKE_REX_BLOCKS="$BLK_MINE" run_ds myrepo HUB-841 --dry-run
+assert_eq "rex --dry-run with existing block - exit 0" 0 "$RC"
+assert_eq "rex --dry-run with existing block - nothing focused" 0 "$(rcalls focus)"
+
+new_case x14
+DS_REX="$WORK/no-such-rex" REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841
+assert_eq "rex missing - exit 3" 3 "$RC"
+assert_err_has "rex missing - message" "rex not found"
+assert_eq "rex missing - no tmux fallback" 0 "$(total_calls)"
+
+new_case x15
+TMUX="$INSIDE" REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841
+assert_eq "TMUX and REX_SESSION both set - exit 0" 0 "$RC"
+assert_eq "TMUX and REX_SESSION both set - tmux splits" 1 "$(calls split-window)"
+assert_eq "TMUX and REX_SESSION both set - zero rex calls" 0 "$(rtotal)"
+new_case x15b
+TMUX="$INSIDE" REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841 --new-session --detach
+assert_eq "TMUX and REX_SESSION, --new-session - tmux new-session" "$NEW_HUB" "$(line_of new-session)"
+assert_eq "TMUX and REX_SESSION, --new-session - zero rex calls" 0 "$(rtotal)"
+
+new_case x16
+DS_TMUX="$WORK/no-such-tmux" REX_SESSION="$RS" REX_BLOCK="$RB" run_ds myrepo HUB-841
+assert_eq "rex mode needs no tmux - exit 0" 0 "$RC"
+assert_eq "rex mode needs no tmux - split ran" 1 "$(rcalls split)"
+new_case x16b
+REX_BLOCK="$RB" run_ds myrepo HUB-841 --detach
+assert_eq "REX_BLOCK alone does not select rex - tmux session created" 1 "$(calls new-session)"
+assert_eq "REX_BLOCK alone does not select rex - zero rex calls" 0 "$(rtotal)"
+
+# ---- 13. usage ---------------------------------------------------------------------------------------
 new_case u1
 run_ds
 assert_eq "no arguments - exit 3" 3 "$RC"
