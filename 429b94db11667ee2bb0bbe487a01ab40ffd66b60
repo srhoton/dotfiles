@@ -1,0 +1,22 @@
+Session prompts (Claude Code, 2026-11-18)
+
+1. Can we add the psp- repos to fb-repo-sync?
+   (Answer: already present in DEFAULT_SPECS; no change made.)
+
+2. Great, thank you. Next question: we have several scripts (like
+   deliver-session, pr-review-queue, pr-my-turn) that open into a tmux
+   session. What I would like to do is this: If the command is opened in
+   tmux, open a tmux session (the way it works today). But, if it's being
+   opened *in Rex*, open a Rex session instead. Is that possible?
+   (Plan approved; pr-my-turn does not launch tmux, pr-fix-queue does, so
+   the scope was deliver-session, pr-review-queue and pr-fix-queue.)
+
+3. /trueup: commit the work, add the session prompts as git notes, push,
+   and open a PR whose description matches the full diff against the base
+   branch.
+
+Verification at commit time:
+- tests/deliver-session.sh: passed=273 failed=0 (inside Rex and with REX_* unset)
+- tests/pr-fix-queue-classify.sh: passed=50 failed=0
+- bash -n clean on all three scripts and the test file
+- review-fanout: 0 CRITICAL/HIGH, 15 informational, 1 refuted
