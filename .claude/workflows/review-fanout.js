@@ -1,16 +1,18 @@
 export const meta = {
   name: 'review-fanout',
-  description: 'Five specialist reviewers in parallel, dedup, then adversarial verification of CRITICAL/HIGH findings. args: { repoRoot, files, intent, scopeNote? } as an object or a JSON string',
+  description: 'Specialist reviewers in parallel (performance and data-side-effects only when the diff has a perf or persistence signal), dedup, then adversarial verification of CRITICAL/HIGH findings. args: { repoRoot, files, intent, scopeNote?, perf?, dataSideEffects? } as an object or a JSON string; perf/dataSideEffects: true force those reviewers on',
   phases: [
-    { title: 'Review', detail: 'five specialist reviewers over the changed files' },
+    { title: 'Review', detail: 'a cheap signal check, then the specialist reviewers over the changed files' },
     { title: 'Verify', detail: 'one skeptic per CRITICAL/HIGH finding tries to refute it' },
   ],
 }
 
-// args: { repoRoot: string, files: string[], intent: string, scopeNote?: string }
+// args: { repoRoot: string, files: string[], intent: string, scopeNote?: string, perf?: boolean, dataSideEffects?: boolean }
 // Either a JSON object or a JSON string of that object (callers have passed the string form).
+// Functional, quality and adr always run. performance runs only when the diff has a perf signal
+// (or perf: true); data-side-effects only when it has a persistence signal (or dataSideEffects: true).
 // Invoked by ~/.claude/commands/review.md and reviewit.md (Step 2).
-const ARGS_SHAPE = '{ repoRoot: string, files: string[], intent: string, scopeNote?: string }'
+const ARGS_SHAPE = '{ repoRoot: string, files: string[], intent: string, scopeNote?: string, perf?: boolean, dataSideEffects?: boolean }'
 let parsedArgs = args
 if (typeof parsedArgs === 'string') {
   try {
@@ -68,7 +70,7 @@ const VERDICT_SCHEMA = {
   },
 }
 
-// Shared severity calibration; part of `header`, so all five reviewers get it (the verify prompt does not).
+// Shared severity calibration; part of `header`, so every review prompt gets it (the verify prompt does not).
 const severityNote =
   'Rate a finding CRITICAL or HIGH only if it breaks correctness, data safety, security, or a stated requirement. ' +
   'Style, extra abstraction, and defensive hardening are MEDIUM or LOW at most.'
@@ -127,13 +129,58 @@ const REVIEWERS = [
   },
 ]
 
+// Workflow scripts have no shell, so a cheap agent runs bin/review-signals and relays its JSON.
+const SIGNALS_SCHEMA = {
+  type: 'object',
+  required: ['perf', 'persistence'],
+  properties: {
+    perf: { type: 'boolean', description: "the script's perf field, verbatim" },
+    persistence: { type: 'boolean', description: "the script's persistence field, verbatim" },
+    perfMatches: { type: 'array', items: { type: 'string' } },
+    persistenceMatches: { type: 'array', items: { type: 'string' } },
+    error: { type: 'string', description: "the script's error field, if present" },
+  },
+}
+
 phase('Review')
-// Barrier is intentional: dedup below needs the full finding set from all five reviewers.
-const reviews = await parallel(REVIEWERS.map(r => () =>
+const signalsRaw = await agent(
+  'Run exactly this one command and nothing else, then return its JSON fields verbatim (do not interpret, edit or re-derive them):\n' +
+  `~/.claude/bin/review-signals -C ${JSON.stringify(repoRoot)} ${files.map(f => JSON.stringify(f)).join(' ')}\n` +
+  'It prints one JSON line with perf, persistence, perfMatches, persistenceMatches (and error, if it failed). ' +
+  'If the command fails or prints something that is not that JSON, return perf: true and persistence: true.',
+  { label: 'signals', phase: 'Review', model: 'haiku', schema: SIGNALS_SCHEMA }
+)
+// Fail open: a missing or malformed signal runs every reviewer.
+const signalsValid = !!signalsRaw && typeof signalsRaw.perf === 'boolean' && typeof signalsRaw.persistence === 'boolean'
+const signals = signalsValid ? signalsRaw : { perf: true, persistence: true }
+if (!signalsValid) log('signals agent returned nothing usable; running every reviewer')
+else if (signals.error) log(`review-signals reported an error (${signals.error}); it fails open, so no reviewer is gated`)
+
+const GATES = {
+  performance: {
+    on: signals.perf || parsedArgs.perf === true,
+    reason: 'no perf signal in diff (pass perf: true to force)',
+  },
+  'data-side-effects': {
+    on: signals.persistence || parsedArgs.dataSideEffects === true,
+    reason: 'no persistence signal in diff (pass dataSideEffects: true to force)',
+  },
+}
+const reviewersGated = []
+const selected = REVIEWERS.filter(r => {
+  const gate = GATES[r.key]
+  if (!gate || gate.on) return true
+  reviewersGated.push({ key: r.key, reason: gate.reason })
+  log(`${r.key} skipped: ${gate.reason}`)
+  return false
+})
+
+// Barrier is intentional: dedup below needs the full finding set from all selected reviewers.
+const reviews = await parallel(selected.map(r => () =>
   agent(r.prompt, { label: `review:${r.key}`, phase: 'Review', agentType: r.agentType, model: REVIEW_MODEL, schema: FINDINGS_SCHEMA })
     .then(res => res && res.findings.map(f => ({ ...f, source: r.key })))
 ))
-const skipped = REVIEWERS.filter((r, i) => !reviews[i]).map(r => r.key)
+const skipped = selected.filter((r, i) => !reviews[i]).map(r => r.key)
 if (skipped.length) log(`reviewers returned nothing (skipped or errored): ${skipped.join(', ')}`)
 
 // Dedup by file:line, merging sources; keep the highest severity and longest description.
@@ -191,4 +238,4 @@ for (let i = 0; i < toVerify.length; i++) {
 for (const f of unverified) actionable.push({ ...f, verified: false })
 
 log(`${actionable.length} actionable, ${refuted.length} refuted, ${informational.length} informational`)
-return { actionable, informational, refuted, reviewersSkipped: skipped }
+return { actionable, informational, refuted, reviewersSkipped: skipped, reviewersGated }

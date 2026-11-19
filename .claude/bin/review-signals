@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+#
+# review-signals - does this diff call for the performance and data-side-effects reviewers?
+#
+# The review-fanout workflow has no filesystem or shell access, so a cheap agent runs
+# this script and hands the one JSON line back. A reviewer is skipped only when its
+# signal is false; anything unexpected reports true, so a broken signal never silently
+# drops a reviewer.
+#
+# Usage:
+#   review-signals [-C DIR] [--base BRANCH] [FILE...]
+#
+#   --base BRANCH   compare against BRANCH (a local ref, else origin/BRANCH).
+#                   Default: the branch origin/HEAD points at, else master, else main;
+#                   the default prefers origin/<branch> over a possibly stale local one
+#                   (the same rule as review-context).
+#   -C DIR          run as if started in DIR
+#   FILE...         paths relative to the repo root; restricts the diff to them
+#                   (default: every changed file)
+#   -h, --help      this text
+#
+# Output, one JSON line on stdout:
+#   {"perf": bool, "persistence": bool, "perfMatches": [...], "persistenceMatches": [...]}
+# Each matches list has up to 5 short strings naming the pattern and the line or path
+# that tripped it. The diff is the merge base against the working tree (committed,
+# staged, unstaged) plus untracked files as all-added. Only added and removed lines
+# are scanned, never context lines, and only in source files (.ts .tsx .js .jsx .mjs
+# .cjs .java .kt .py .go .tf .sql .scala .cs .rb); docs, logs, XML, YAML, JSON and
+# lockfiles are ignored for line patterns. Perf also skips test files (*.test.*,
+# *.spec.*, anything under test/, tests/ or __tests__/). Persistence also trips on a
+# changed path (any file type) that looks like a schema (a path segment or file name
+# containing "schema" ending .json/.ts/.java/.sql), migration, transform, SQL file,
+# *.v1.json, or a *.tf file that mentions aws_dynamodb_table.
+#
+# On any git error (not a repo, base not found, git failing) it prints
+#   {"perf": true, "persistence": true, "error": "<msg>"}
+# and still exits 0. Exit 2 = bad usage. Read-only.
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+MAX_MATCHES = 5
+SNIPPET = 80
+MAX_UNTRACKED_BYTES = 2_000_000
+
+I = re.IGNORECASE
+
+# Line patterns only run on changed lines of these source files. Everything else (docs,
+# logs, XML/POM, YAML, JSON, lockfiles...) is ignored for line patterns; path patterns
+# below still apply to any file.
+SOURCE_EXTS = frozenset(
+    ".ts .tsx .js .jsx .mjs .cjs .java .kt .py .go .tf .sql .scala .cs .rb".split())
+# Perf patterns also skip test files: *.test.*, *.spec.*, or under test/tests/__tests__.
+TEST_FILE_RE = re.compile(r"\.(?:test|spec)\.|/(?:test|tests|__tests__)/", I)
+
+# (label, regex). Every regex runs against one added or removed line.
+_LOOP = r"\bfor\s*\(|\bfor\b.+\bof\b|\.forEach\(|\.map\("
+_IO = r"\bawait\b|\bfetch\(|\baxios\b|\bhttps?\b|\bquery|\bscan\b|\.send\(|\.get\(|\.put\(|readFile|writeFile|\bclient\b|\bdb\b|\bsql\b"
+PERF = [
+    ("loop around IO", None),  # handled specially: both _LOOP and _IO on the same line
+    ("Promise.all", re.compile(r"Promise\.all(?:Settled)?\b")),
+    ("db call", re.compile(
+        r"\.(?:query|scan)\s*\(|QueryCommand|ScanCommand|BatchGetItem|BatchWriteItem"
+        r"|BatchGetCommand|BatchWriteCommand|paginate[A-Z]\w*\(|Paginator")),
+    ("SQL", re.compile(r"\bSELECT\s|\bJOIN\s|\bselect\s.+\bfrom\b", 0)),
+    ("concurrency", re.compile(r"parallelStream\(|CompletableFuture|ExecutorService|Executors\.|new Thread\(")),
+    ("flatMap around IO", None),  # handled specially: .flatMap( and _IO on the same line
+    ("retry/backoff", re.compile(r"\b(?:retry|retries|backoff|setTimeout|Thread\.sleep)\b", I)),
+    ("N+1", re.compile(r"N\+1", I)),
+]
+LOOP_RE = re.compile(_LOOP, I)
+IO_RE = re.compile(_IO, I)
+FLATMAP_RE = re.compile(r"\.flatMap\(")
+
+PERSIST = [
+    ("dynamodb write", re.compile(
+        r"PutItem|UpdateItem|DeleteItem|BatchWrite|TransactWrite|PutCommand|UpdateCommand|DeleteCommand"
+        r"|TransactWriteCommand|putItem|updateItem|deleteItem")),
+    ("s3 write", re.compile(r"PutObject|CopyObject|DeleteObject|Upload\(|S3Client|aws_s3_bucket")),
+    ("hash/idempotency", re.compile(
+        r"\bhash\w*\(|sourceHash|createHash|\bchecksum|\bidempotency\w*|\bdedup\w*", I)),
+    ("schema/version", re.compile(r"schemaVersion|SCHEMA_VERSION|\$schema|\"version\"\s*:")),
+    ("status write", re.compile(r"\bstatus\s*:|\bstatus\s*=(?!=)|set\w*Status\(|withStatus\(|\"status\"\s*:")),
+    ("migration/transform", re.compile(
+        r"\b(?:migrat\w*|transform\w*)\s*\(|^\s*(?:import|from)\b.*(?:migrat|transform)"
+        r"|\brequire\(.*(?:migrat|transform)", I)),
+]
+PATH_RES = [
+    ("*.v1.json", re.compile(r"\.v1\.json$", I)),
+    ("migration path", re.compile(r"/migration", I)),
+    ("transform path", re.compile(r"/transform", I)),
+    ("schema path", re.compile(r"schema[^/]*(?:/.*)?\.(?:json|ts|java|sql)$", I)),
+    ("sql file", re.compile(r"\.sql$", I)),
+]
+
+
+class GitError(Exception):
+    pass
+
+
+def git(args, check=True):
+    p = subprocess.run(["git", "--literal-pathspecs", "-c", "core.quotepath=off"] + args,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if check and p.returncode != 0:
+        msg = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise GitError("git %s failed: %s" % (args[0], msg[0] if msg else "rc=%d" % p.returncode))
+    return p
+
+
+def out(args):
+    return git(args).stdout.decode("utf-8", "replace")
+
+
+def resolve_ref(name, prefer_origin=False):
+    order = ["origin/" + name, name] if prefer_origin else [name, "origin/" + name]
+    for ref in order:
+        if git(["rev-parse", "--verify", "-q", ref + "^{commit}"], check=False).returncode == 0:
+            return ref
+    return ""
+
+
+def resolve_base(base_arg):
+    if base_arg:
+        ref = resolve_ref(base_arg)
+        if not ref:
+            raise GitError("base branch not found: " + base_arg)
+        return ref
+    p = git(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], check=False)
+    name = p.stdout.decode().strip().replace("refs/remotes/origin/", "", 1) if p.returncode == 0 else ""
+    ref = resolve_ref(name, True) if name else ""
+    if not ref:
+        for cand in ("master", "main"):
+            ref = resolve_ref(cand, True)
+            if ref:
+                break
+    if not ref:
+        raise GitError("base branch not found (tried origin/HEAD, master, main)")
+    return ref
+
+
+def diff_path(header):
+    """Path from a 'diff --git a/P b/P' line (--no-renames, so both sides match).
+    '' when it cannot be read (e.g. a quoted name); the caller then scans the file."""
+    rest = header[len("diff --git "):]
+    n = (len(rest) - 5) // 2
+    if rest.startswith("a/") and n > 0 and rest == "a/%s b/%s" % (rest[2:2 + n], rest[2:2 + n]):
+        return rest[2:2 + n]
+    return ""
+
+
+def changed_lines(diff_text):
+    """(path, line) for each added and removed line of a -U0 diff, never headers or context."""
+    lines = []
+    in_hunk = False
+    path = ""
+    for raw in diff_text.split("\n"):
+        if raw.startswith("diff --git "):
+            in_hunk = False
+            path = diff_path(raw)
+        elif raw.startswith("@@"):
+            in_hunk = True
+        elif in_hunk and raw[:1] in ("+", "-"):
+            lines.append((path, raw[1:]))
+    return lines
+
+
+def snippet(line):
+    s = " ".join(line.split())
+    return s if len(s) <= SNIPPET else s[:SNIPPET - 3] + "..."
+
+
+def scan_lines(lines):
+    perf, pers = [], []
+
+    def add(bucket, label, line):
+        entry = "%s: %s" % (label, snippet(line))
+        if entry not in bucket and len(bucket) < MAX_MATCHES:
+            bucket.append(entry)
+
+    for path, line in lines:
+        if not line.strip():
+            continue
+        # An unreadable path ('') is scanned as source: fail toward running the reviewer.
+        if path and os.path.splitext(path)[1].lower() not in SOURCE_EXTS:
+            continue
+        if not TEST_FILE_RE.search("/" + path):
+            if LOOP_RE.search(line) and IO_RE.search(line):
+                add(perf, "loop around IO", line)
+            if FLATMAP_RE.search(line) and IO_RE.search(line):
+                add(perf, "flatMap around IO", line)
+            for label, rx in PERF[1:]:
+                if rx is not None and rx.search(line):
+                    add(perf, label, line)
+        for label, rx in PERSIST:
+            if rx.search(line):
+                add(pers, label, line)
+    return perf, pers
+
+
+def scan_paths(paths, from_rev):
+    pers = []
+    for path in paths:
+        probe = "/" + path
+        for label, rx in PATH_RES:
+            if rx.search(probe):
+                e = "path %s: %s" % (label, path)
+                if e not in pers and len(pers) < MAX_MATCHES:
+                    pers.append(e)
+        if path.lower().endswith(".tf"):
+            text = ""
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            else:
+                text = git(["show", "%s:%s" % (from_rev, path)], check=False).stdout.decode("utf-8", "replace")
+            if "aws_dynamodb_table" in text:
+                e = "path aws_dynamodb_table in tf: %s" % path
+                if e not in pers and len(pers) < MAX_MATCHES:
+                    pers.append(e)
+    return pers
+
+
+def compute(dir_, base_arg, files):
+    if dir_:
+        try:
+            os.chdir(dir_)
+        except OSError:
+            raise GitError("cannot cd to " + dir_)
+    root = git(["rev-parse", "--show-toplevel"]).stdout.decode().strip()
+    os.chdir(root)
+
+    base_ref = resolve_base(base_arg)
+    mb = git(["merge-base", base_ref, "HEAD"], check=False)
+    from_rev = mb.stdout.decode().strip()
+    if mb.returncode != 0 or not from_rev:
+        raise GitError("no merge base with " + base_ref)
+
+    only = [f[2:] if f.startswith("./") else f for f in files]
+    spec = ["--"] + only if only else []
+    flags = ["diff", "--no-color", "--no-ext-diff", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"]
+
+    diff = out(flags + ["-U0", from_rev] + spec)
+    names = [n for n in out(flags[:1] + ["--no-renames", "--name-only", "-z", from_rev] + spec).split("\0") if n]
+    lines = changed_lines(diff)
+
+    untracked = [n for n in out(["ls-files", "--others", "--exclude-standard", "-z"] + spec).split("\0") if n]
+    for path in untracked:
+        if os.path.isdir(path) and not os.path.islink(path):
+            continue
+        names.append(path)
+        try:
+            if os.path.getsize(path) > MAX_UNTRACKED_BYTES:
+                continue
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        if b"\0" in data:
+            continue
+        lines.extend((path, ln) for ln in data.decode("utf-8", "replace").split("\n"))
+
+    perf, pers = scan_lines(lines)
+    for e in scan_paths(sorted(set(names)), from_rev):
+        if e not in pers and len(pers) < MAX_MATCHES:
+            pers.append(e)
+    return {"perf": bool(perf), "persistence": bool(pers), "perfMatches": perf, "persistenceMatches": pers}
+
+
+def usage():
+    with open(__file__, encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
+            if i == 0:
+                continue
+            if not line.startswith("#"):
+                break
+            print(line[2:].rstrip("\n") if line.startswith("# ") else "")
+
+
+def main(argv):
+    dir_, base_arg, files = "", "", []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            usage()
+            return 0
+        if a in ("-C", "--base"):
+            if i + 1 >= len(argv):
+                print("review-signals: %s needs a value" % a, file=sys.stderr)
+                return 2
+            if a == "-C":
+                dir_ = argv[i + 1]
+            else:
+                base_arg = argv[i + 1]
+            i += 2
+        elif a == "--":
+            files.extend(argv[i + 1:])
+            break
+        elif a.startswith("-"):
+            print("review-signals: unknown argument: %s (see --help)" % a, file=sys.stderr)
+            return 2
+        else:
+            files.append(a)
+            i += 1
+    try:
+        result = compute(dir_, base_arg, files)
+    except Exception as e:  # fail open: any error means "run the reviewer"
+        result = {"perf": True, "persistence": True, "error": str(e) or e.__class__.__name__}
+    print(json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

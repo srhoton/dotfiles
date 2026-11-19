@@ -13,6 +13,10 @@ Helper executables on `PATH` for Claude Code workflows.
 - `ca-token` — fetches the CodeArtifact authorization token and caches it under `${XDG_CACHE_HOME:-~/.cache}/claude-bin/` (files 0600, dir 0700) until the earlier of 30 minutes before expiry and 11 hours.
   - Prints nothing secret by default. `eval "$(ca-token --env gradle|npm)"` puts the token in the environment (`ORG_GRADLE_PROJECT_codeartifactToken` / `AWS_CODEARTIFACT_TOKEN`); `--print` is the explicit opt-in; `--check` tests the cache without calling aws.
   - A failed fetch never falls back to a stale token: it prints `aws sso login --profile <P>` and exits 4 (3 = usage or no `aws`). `repo-gate` calls it for Gradle and Node repos that need it. Tests: `bin/tests/ca-token.sh`.
+- `aws-target` — `aws-target <dev|qa|stage|prod|demo|datalake> [--check]`: maps the env to its profile from the CLAUDE.md table, runs `aws sts get-caller-identity --profile <P>` and compares the account id.
+  - On a match it prints exactly `export AWS_PROFILE='<P>'` on stdout (a status line goes to stderr), so `eval "$(aws-target prod)"` works. `--check` validates only and prints nothing on stdout.
+  - There is no option to pick another profile, and qa, stage, prod and demo only ever map to their ReadOnly profile.
+  - Exit codes: 0 match, 1 account mismatch (names expected and actual), 2 the sts call failed, e.g. expired SSO session (prints `run: aws sso login --profile <P>`), 3 usage error, unknown env or no `aws`. `AWS_TARGET_AWS` overrides the aws binary for tests. Tests: `bin/tests/aws-target.sh`.
 - `deliver-session` — `deliver-session <repo> <ticket> [-d|--detach] [--new-session] [--dry-run]`: starts one Claude per Jira ticket, already running `/deliver` on it: in a new pane when run inside tmux or Rex, else in a new tmux session.
   - The key (a bare key or a `/browse/` URL; `/deliver` always gets `https://fullbay.atlassian.net/browse/<KEY>`) names the session and tags the pane (`@deliver_ticket`, title). It starts in `${DELIVER_SESSION_GIT_ROOT:-~/git}/<repo>`, which must be a bare repo name and a git work tree. Claude runs with `--model opus --permission-mode plan -n <KEY>` and `/deliver <url>` as its first prompt; no keystrokes are injected. When Claude exits the pane falls back to a login shell.
   - Inside tmux it splits a pane (`split-window -h`; `--detach` keeps focus) and leaves the current session alone; `--new-session` forces a session. If a pane tagged `<KEY>` (any session) or a session named `<KEY>` already exists it selects or attaches instead of starting a second Claude. Attach is `switch-client` inside tmux and `attach-session` otherwise. `--dry-run` prints the quoted `split-window` or `new-session` command and creates nothing.
@@ -76,6 +80,10 @@ Helper executables on `PATH` for Claude Code workflows.
   - `--files-only` prints just the deduplicated changed-file list for the review workflow: branch diff, staged, unstaged and untracked, with deleted files left out.
   - `--diff [-U N] [FILE...]` prints only a numbered diff (merge base to working tree, untracked files as all-added) as `<new-file line>| +added`, so reviewers don't need `git diff` plus `grep -n`. A path that isn't changed exits 3.
   - `--base`, `--no-defects`, `-C`.
+- `review-signals` — tells the `review-fanout` workflow whether the diff needs the `performance` and `data-side-effects` reviewers (a Haiku agent runs it, since workflows have no shell).
+  - Prints one JSON line: `{"perf", "persistence", "perfMatches", "persistenceMatches"}`. Only added and removed lines count (never context), and persistence also trips on changed paths such as `*.v1.json`, `/migration`, `/transform`, `schema`, `.sql` and `.tf` files with `aws_dynamodb_table`.
+  - Any git error prints `{"perf": true, "persistence": true, "error": …}` and exits 0, so a broken signal never drops a reviewer. Exit 2 is bad usage.
+  - `[-C DIR] [--base BRANCH] [FILE...]`; the base is chosen as in `review-context`.
 - `sha-relation` — classifies a deployed SHA as ahead/behind/equal for env-drift checks.
 - `stale-prs` — lists open PRs being ignored in the current repo.
 
