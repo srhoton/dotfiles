@@ -66,6 +66,7 @@ Language and tool rules live in `~/.claude/rules/` and load when matching files 
   | data lake / Athena | `fb-datalake-prod/Admin` (no ReadOnly assignment) | 230514136789 |
 
   "Prod" means `fb-live-us-prod`, never `fb-demo-us-prod`. The qa/stage/prod/demo `Admin` profiles are for deploys I run myself; never use them, even for a read. If a ReadOnly call is denied, the action needs Admin, so write it up for me instead of switching profiles.
+- Verify the target with `eval "$(~/.claude/bin/aws-target <env>)"` (or `aws-target <env> --check` to validate only) instead of a hand-run `aws sts get-caller-identity`. It exits 1 on an account mismatch and 2 on an expired session (printing the `aws sso login` command).
 - **Prod is read-only. With `fb-live-us-prod` (account 211125509520) you NEVER modify data** — no DynamoDB/S3/RDS writes or deletes, no Step Functions starts, stops, or redrives, no Lambda invokes that write, no queue sends or purges, no Terraform apply, no console-equivalent mutations. Only describe/get/list/query/scan and log reads; the `ReadOnly` role enforces this in IAM. If a fix needs a prod change, write up the exact change and hand it to me; do not run it, even if asked mid-task to "just fix it".
 - Confirm the SSO session isn't expired before starting a long AWS/Terraform task — re-authenticate proactively (`aws sso login --profile <p>`) rather than discovering the expiry mid-run on a rejected call or blocked dependency install.
 

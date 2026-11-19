@@ -348,7 +348,11 @@ Stopping here is required behavior, not premature stopping — see the escalatio
 This section is **authoritative** for the pipeline's polling behavior (CLAUDE.md defers to it).
 
 - Poll `get_run` every 30 seconds for action completion
-- Poll entity `short_sha` every 30 seconds for SHA verification after deploy steps
+- Poll entity `short_sha` every 30 seconds for SHA verification after deploy steps, but **not in this loop**. Each "wait for `{stack}-{env}` `short_sha` == X" is handed to ONE `Agent` dispatch with `model: haiku`, because every poll in the Opus main loop re-reads the whole context. This is the one allowed exception to "Port MCP only" besides Step 0.5.
+  - **Prompt:** the entity identifier (`{stack}-{env}`), the expected SHA, and this section's cadence and cap: poll every 30 seconds, at most 40 polls (20 minutes). Tell it to poll with the Port MCP `list_entities` on `stack_environment_status` with `identifiers: [<id>]` and `include: ["short_sha"]`, waiting 30 seconds between polls (e.g. `sleep 30`; that is its only non-Port action).
+  - **Return:** exactly one line, `MATCH <sha> after <N>m` or `TIMEOUT last=<sha> after <N>m`. It makes no other Port calls and never triggers or approves anything.
+  - **Main loop keeps** every approval gate, every SHA verification decision, and `trigger_run`/`get_run`. Treat `MATCH` as the SHA landing only when `<sha>` equals the expected SHA.
+  - **On `TIMEOUT`:** follow the timeout rule below (report the step as TIMED_OUT and stop) and **Failure Behavior**.
 - **Cache flicker:** a run's status can oscillate between IN_PROGRESS and SUCCESS. Read the same terminal state on 2-3 consecutive polls before treating it as final.
 - **Stale entity:** before firing a deploy or terraform action, confirm the target entity's `short_sha` matches the expected commit on origin. If it doesn't, wait 30s and re-fetch; never fire against a stale entity.
 - Maximum 40 polls per step (20 minutes) before timing out

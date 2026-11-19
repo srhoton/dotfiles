@@ -1,0 +1,96 @@
+#!/bin/bash
+#
+# aws-target - pick the AWS SSO profile for an environment and prove it points at
+# the right account before anything runs against it.
+#
+# The env -> profile/account map is the profile table in ~/.claude/CLAUDE.md (AWS
+# Commands). It calls `aws sts get-caller-identity` with that profile and compares
+# the account id, so a wrong or stale profile fails here instead of mid-task.
+#
+# Usage:
+#   aws-target <dev|qa|stage|prod|demo|datalake> [--check]
+#
+#   (no flag)   on success print exactly: export AWS_PROFILE='<profile>'
+#               and a one-line status on stderr. Use as
+#               eval "$(~/.claude/bin/aws-target <env>)"
+#   --check     validate only: same checks and exit codes, nothing on stdout.
+#   -h, --help  show this help.
+#
+# There is deliberately no option to choose another profile. The qa, stage, prod
+# and demo Admin profiles are never selected: those four environments map to their
+# ReadOnly profile only. Admin is used only for dev and datalake, as in the table.
+#
+# Exit codes: 0 the profile's account matches the expected one, 1 account mismatch
+# (the message names the expected and the actual account), 2 the sts call failed
+# (expired or missing SSO session, no credentials, any other sts failure; the exact
+# `aws sso login --profile <P>` command is printed to stderr), 3 usage error, unknown
+# env, or `aws` missing.
+#
+# Environment (tests only):
+#   AWS_TARGET_AWS   command to run instead of `aws`
+#
+set -uo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$SELF"; }
+die_usage() {
+  echo "aws-target: $1" >&2
+  echo "usage: aws-target <dev|qa|stage|prod|demo|datalake> [--check]" >&2
+  exit 3
+}
+
+AWS="${AWS_TARGET_AWS:-aws}"
+ENV_NAME=""; CHECK=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) CHECK=1 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) die_usage "unknown argument: $1" ;;
+    *)
+      [ -z "$ENV_NAME" ] || die_usage "only one environment allowed (got $ENV_NAME and $1)"
+      ENV_NAME="$1" ;;
+  esac
+  shift
+done
+[ -n "$ENV_NAME" ] || die_usage "environment required"
+
+# Map copied from the CLAUDE.md profile table. Keep the two in step.
+case "$ENV_NAME" in
+  dev)      PROFILE="fb-dev-non-prod/Admin";       ACCOUNT="147997133155" ;;
+  qa)       PROFILE="fb-qa-non-prod/ReadOnly";     ACCOUNT="343218192518" ;;
+  stage)    PROFILE="fb-stage-non-prod/ReadOnly";  ACCOUNT="528757793739" ;;
+  prod)     PROFILE="fb-live-us-prod/ReadOnly";    ACCOUNT="211125509520" ;;
+  demo)     PROFILE="fb-demo-us-prod/ReadOnly";    ACCOUNT="979667334065" ;;
+  datalake) PROFILE="fb-datalake-prod/Admin";      ACCOUNT="230514136789" ;;
+  *) die_usage "unknown environment: $ENV_NAME (expected dev, qa, stage, prod, demo or datalake)" ;;
+esac
+
+if ! command -v "$AWS" >/dev/null 2>&1; then
+  echo "aws-target: aws CLI not found ($AWS)" >&2
+  exit 3
+fi
+
+errf="$(mktemp "${TMPDIR:-/tmp}/aws-target-err.XXXXXX")" || { echo "aws-target: cannot create temp file" >&2; exit 3; }
+trap 'rm -f "$errf"' EXIT
+
+json="$("$AWS" sts get-caller-identity --profile "$PROFILE" --output json 2> "$errf" < /dev/null)"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "aws-target: sts get-caller-identity failed for $ENV_NAME (profile $PROFILE, exit $rc):" >&2
+  grep -v '^[[:space:]]*$' "$errf" | head -3 | sed 's/^/  /' >&2
+  echo "run: aws sso login --profile $PROFILE" >&2
+  exit 2
+fi
+
+actual="$(printf '%s' "$json" | sed -n 's/.*"Account"[[:space:]]*:[[:space:]]*"\([0-9]*\)".*/\1/p' | head -1)"
+if [ "$actual" != "$ACCOUNT" ]; then
+  echo "aws-target: account mismatch for $ENV_NAME (profile $PROFILE): expected $ACCOUNT, got ${actual:-<none in response>}" >&2
+  exit 1
+fi
+
+echo "aws-target: $ENV_NAME -> $PROFILE (account $ACCOUNT)" >&2
+if [ "$CHECK" -eq 0 ]; then
+  printf "export AWS_PROFILE='%s'\n" "$PROFILE"
+fi
+exit 0
