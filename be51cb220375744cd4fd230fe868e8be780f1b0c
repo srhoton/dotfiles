@@ -1,0 +1,2 @@
+Added std- to DEFAULT_SPECS, the -h header list and bin/README.md.
+Verified: bash -n clean; fb-repo-sync -n std- -> would-clone=8 would-pull=4.
