@@ -206,6 +206,18 @@ Push rules:
 - Rejected as non-fast-forward (someone else pushed): `git fetch origin <headRefName> && git merge FETCH_HEAD`, resolve, re-run tests, then retry the push **once**. If it is rejected again, stop and report.
 - Rejected by branch protection: stop and report. Do not try to work around it.
 
+### Refresh the risk block
+
+Once the push succeeds, the PR body's score is stale. Re-score and replace it, following the block format and replace rule in `~/.claude/commands/trueup.md` (the `<!-- risk-score -->` span):
+
+```bash
+~/.claude/bin/risk-score --base origin/<baseRefName> --md                # add --fanout <last output file> if this run re-ran review-fanout
+gh pr view $ARGUMENTS --json body,state                                  # edit only when state is OPEN
+gh pr edit $ARGUMENTS --body-file <scratchpad>/fixit-body.md
+```
+
+`origin/<baseRefName>` is current from the Step 3 fetch; a bare `<baseRefName>` can resolve to a stale local branch and score commits the PR never made. Write the whole updated body to the tempfile, never an inline `--body`. If the PR is no longer OPEN, skip the edit; a merged or closed PR is not touched. If the score or the edit fails, say so in the Step 8 report and carry on to Step 7, since the replies don't depend on it.
+
 ---
 
 ## Step 7: Reply on every thread, then reply to and mark every conversation comment
@@ -262,6 +274,7 @@ Close with a compact summary:
 - any rocket that failed to post, and any new comment that arrived while you worked and was left for the next run
 - tests: what you ran and the result
 - the pushed SHA and the PR url
+- risk block: the new score and phase, or why it was not updated
 - anything left for me to decide
 
 Keep it to the table plus a short note, per CLAUDE.md output discipline. If any step stopped early, lead with that — do not bury a blocker under a list of successes.

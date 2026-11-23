@@ -38,6 +38,14 @@ Report anything it surfaces as findings **before** Step 2, and fix them first. N
 - It reports `SKIPPED` rather than failing when a repo has no eslint config — that is expected in several repos here, not an error.
 - If the gate is clean, say so in one line and continue to Step 2.
 
+Then score the change. This is deterministic (git and regexes, no model) and costs nothing:
+
+```bash
+~/.claude/bin/risk-score --md
+```
+
+It prints a short block: a 1-5 score, the four dimensions (hot path, complexity, config, review gap) and the top three drivers. Show it to the user and continue. A dimension listed as `unknown` counts as 3 (never as low risk), so report it rather than hiding it. Add `--live` for a service or function repo to fold in prod traffic (a read-only CloudWatch query); if it reports live as unknown (no SSO session, no such function), carry on, since it never lowers the score. The score is information. It doesn't stop the review.
+
 ---
 
 ## Step 2: Run Reviews via the review-fanout Workflow
@@ -50,7 +58,7 @@ Invoke the **Workflow tool** with the saved orchestration script (this slash com
   - `files`: the changed-file list from Step 1
   - `intent`: the user's stated requirements — the contents of `sdlc-plan.md` if one exists in the repo root, otherwise recent commit messages on this branch
 
-The workflow runs the five specialist reviewers (functional, code-quality, adr-compliance, performance, data-side-effects) in parallel with schema-validated findings, dedupes by file:line, checks the diff against the defect-class checklist (`~/.claude/knowledge/defect-classes.md`), then adversarially verifies each CRITICAL/HIGH finding with a skeptic agent. It returns `{ actionable, informational, refuted, reviewersSkipped }`.
+The workflow runs the five specialist reviewers (functional, code-quality, adr-compliance, performance, data-side-effects) in parallel with schema-validated findings, dedupes by file:line, checks the diff against the defect-class checklist (`~/.claude/knowledge/defect-classes.md`), then adversarially verifies each CRITICAL/HIGH finding with a skeptic agent. It returns `{ actionable, informational, refuted, reviewersSkipped, reviewersGated, files }`.
 
 - `actionable` findings carry `verified: true/false` — `false` means the skeptic errored or the finding was beyond the verify cap; treat those with extra suspicion, don't drop them.
 - `refuted` findings were disproved with cited evidence — do NOT act on them, but include them in the report so the user can spot-check the refutations.
@@ -63,6 +71,14 @@ The workflow runs the five specialist reviewers (functional, code-quality, adr-c
 ## Step 3: Display
 
 First run `~/.claude/bin/fanout-report <workflow output file> --repo <repo name>`. It writes the full report to `~/.claude/scratch/<repo>/` (CLAUDE.md's scratch-file rule) and prints the path and counts. Give the user that path.
+
+Then compute the final risk score, which adds the review's results (gated or skipped reviewers, actionable findings, the refuted ratio) to the Step 1.5 inputs, and append it to that report file. The workflow output records no resolved flag, so when the review ran in several rounds pass the LAST round's output file (earlier rounds' findings may already be fixed):
+
+```bash
+~/.claude/bin/risk-score --fanout <workflow output file> --md | tee -a <report path>
+```
+
+Show the block to the user. If the final score is higher than the pre-review one, say why (the drivers name it).
 
 Using the workflow's returned structure (or your own aggregation in the fallback case), display ALL findings:
 
