@@ -1,0 +1,1 @@
+Follow-up to the question: does risk-score fire on our own PRs? Before this, only /deliver did; /review+/trueup, /fixit and direct fan-out calls did not.
