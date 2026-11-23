@@ -39,22 +39,19 @@
 import json
 import os
 import re
-import subprocess
 import sys
+
+# The base/diff helpers, SOURCE_EXTS, TEST_FILE_RE and the persistence path rules live in
+# lib/diff_scope.py, shared with risk-score. Perf patterns skip test files (TEST_FILE_RE).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+from diff_scope import (  # noqa: E402
+    SOURCE_EXTS, TEST_FILE_RE, changed_names, diff_text, enter_repo, git, merge_base,
+    path_labels, pathspec, read_untracked, resolve_base)
 
 MAX_MATCHES = 5
 SNIPPET = 80
-MAX_UNTRACKED_BYTES = 2_000_000
 
 I = re.IGNORECASE
-
-# Line patterns only run on changed lines of these source files. Everything else (docs,
-# logs, XML/POM, YAML, JSON, lockfiles...) is ignored for line patterns; path patterns
-# below still apply to any file.
-SOURCE_EXTS = frozenset(
-    ".ts .tsx .js .jsx .mjs .cjs .java .kt .py .go .tf .sql .scala .cs .rb".split())
-# Perf patterns also skip test files: *.test.*, *.spec.*, or under test/tests/__tests__.
-TEST_FILE_RE = re.compile(r"\.(?:test|spec)\.|/(?:test|tests|__tests__)/", I)
 
 # (label, regex). Every regex runs against one added or removed line.
 _LOOP = r"\bfor\s*\(|\bfor\b.+\bof\b|\.forEach\(|\.map\("
@@ -88,59 +85,6 @@ PERSIST = [
         r"\b(?:migrat\w*|transform\w*)\s*\(|^\s*(?:import|from)\b.*(?:migrat|transform)"
         r"|\brequire\(.*(?:migrat|transform)", I)),
 ]
-PATH_RES = [
-    ("*.v1.json", re.compile(r"\.v1\.json$", I)),
-    ("migration path", re.compile(r"/migration", I)),
-    ("transform path", re.compile(r"/transform", I)),
-    ("schema path", re.compile(r"schema[^/]*(?:/.*)?\.(?:json|ts|java|sql)$", I)),
-    ("sql file", re.compile(r"\.sql$", I)),
-]
-
-
-class GitError(Exception):
-    pass
-
-
-def git(args, check=True):
-    p = subprocess.run(["git", "--literal-pathspecs", "-c", "core.quotepath=off"] + args,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if check and p.returncode != 0:
-        msg = p.stderr.decode("utf-8", "replace").strip().splitlines()
-        raise GitError("git %s failed: %s" % (args[0], msg[0] if msg else "rc=%d" % p.returncode))
-    return p
-
-
-def out(args):
-    return git(args).stdout.decode("utf-8", "replace")
-
-
-def resolve_ref(name, prefer_origin=False):
-    order = ["origin/" + name, name] if prefer_origin else [name, "origin/" + name]
-    for ref in order:
-        if git(["rev-parse", "--verify", "-q", ref + "^{commit}"], check=False).returncode == 0:
-            return ref
-    return ""
-
-
-def resolve_base(base_arg):
-    if base_arg:
-        ref = resolve_ref(base_arg)
-        if not ref:
-            raise GitError("base branch not found: " + base_arg)
-        return ref
-    p = git(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], check=False)
-    name = p.stdout.decode().strip().replace("refs/remotes/origin/", "", 1) if p.returncode == 0 else ""
-    ref = resolve_ref(name, True) if name else ""
-    if not ref:
-        for cand in ("master", "main"):
-            ref = resolve_ref(cand, True)
-            if ref:
-                break
-    if not ref:
-        raise GitError("base branch not found (tried origin/HEAD, master, main)")
-    return ref
-
-
 def diff_path(header):
     """Path from a 'diff --git a/P b/P' line (--no-renames, so both sides match).
     '' when it cannot be read (e.g. a quoted name); the caller then scans the file."""
@@ -203,12 +147,10 @@ def scan_lines(lines):
 def scan_paths(paths, from_rev):
     pers = []
     for path in paths:
-        probe = "/" + path
-        for label, rx in PATH_RES:
-            if rx.search(probe):
-                e = "path %s: %s" % (label, path)
-                if e not in pers and len(pers) < MAX_MATCHES:
-                    pers.append(e)
+        for label in path_labels(path):
+            e = "path %s: %s" % (label, path)
+            if e not in pers and len(pers) < MAX_MATCHES:
+                pers.append(e)
         if path.lower().endswith(".tf"):
             text = ""
             if os.path.isfile(path):
@@ -224,43 +166,16 @@ def scan_paths(paths, from_rev):
 
 
 def compute(dir_, base_arg, files):
-    if dir_:
-        try:
-            os.chdir(dir_)
-        except OSError:
-            raise GitError("cannot cd to " + dir_)
-    root = git(["rev-parse", "--show-toplevel"]).stdout.decode().strip()
-    os.chdir(root)
+    enter_repo(dir_)
+    from_rev = merge_base(resolve_base(base_arg))
+    spec = pathspec(files)
 
-    base_ref = resolve_base(base_arg)
-    mb = git(["merge-base", base_ref, "HEAD"], check=False)
-    from_rev = mb.stdout.decode().strip()
-    if mb.returncode != 0 or not from_rev:
-        raise GitError("no merge base with " + base_ref)
-
-    only = [f[2:] if f.startswith("./") else f for f in files]
-    spec = ["--"] + only if only else []
-    flags = ["diff", "--no-color", "--no-ext-diff", "--no-renames", "--src-prefix=a/", "--dst-prefix=b/"]
-
-    diff = out(flags + ["-U0", from_rev] + spec)
-    names = [n for n in out(flags[:1] + ["--no-renames", "--name-only", "-z", from_rev] + spec).split("\0") if n]
-    lines = changed_lines(diff)
-
-    untracked = [n for n in out(["ls-files", "--others", "--exclude-standard", "-z"] + spec).split("\0") if n]
-    for path in untracked:
-        if os.path.isdir(path) and not os.path.islink(path):
-            continue
+    names = changed_names(from_rev, spec)
+    lines = changed_lines(diff_text(from_rev, spec))
+    for path, text in read_untracked(spec):
         names.append(path)
-        try:
-            if os.path.getsize(path) > MAX_UNTRACKED_BYTES:
-                continue
-            with open(path, "rb") as fh:
-                data = fh.read()
-        except OSError:
-            continue
-        if b"\0" in data:
-            continue
-        lines.extend((path, ln) for ln in data.decode("utf-8", "replace").split("\n"))
+        if text is not None:
+            lines.extend((path, ln) for ln in text.split("\n"))
 
     perf, pers = scan_lines(lines)
     for e in scan_paths(sorted(set(names)), from_rev):

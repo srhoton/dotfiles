@@ -1,0 +1,857 @@
+#!/usr/bin/env python3
+#
+# risk-score - a deterministic 1-5 risk rating for a code change.
+#
+# No model is involved: it is git, regexes and file counting (plus, with --live, one
+# read-only CloudWatch query). /review and /reviewit run it in the main loop, so the score
+# costs nothing and the same diff always scores the same.
+#
+# Usage:
+#   risk-score [-C DIR] [--base BRANCH | --range A..B] [--live] [--fanout FILE]
+#              [--pr N [-R owner/repo]] [--md] [FILE...]
+#
+#   -C DIR          run as if started in DIR
+#   --base BRANCH   compare against BRANCH (same rule as review-signals: a local ref, else
+#                   origin/BRANCH; default origin/HEAD's branch, else master, else main).
+#                   The diff is the merge base against the working tree (committed, staged,
+#                   unstaged) plus untracked files as all-added.
+#   --range A..B    score the committed change A..B instead (a plain tree diff A B; nothing
+#                   is checked out, the working tree is ignored). For back-testing history.
+#   --live          hot path also uses prod traffic: runs `aws-target prod` (ReadOnly), then
+#                   lambda get-function and cloudwatch get-metric-statistics for
+#                   AWS/Lambda Invocations of FunctionName=<repo name> (us-west-2, Sum over
+#                   7 days, daily rate bucketed). Those two calls are the only AWS calls made.
+#                   Any failure (SSO expired, no such function, no aws) reports live as
+#                   unknown and never lowers the score.
+#   --fanout FILE   a review-fanout workflow output (the same shapes fanout-report takes).
+#                   Makes it the final phase and feeds the review gap.
+#   --pr N [-R o/r] read PR N through pr-context: unresolved threads and human approvals feed
+#                   the review gap, and a PR head SHA that is not the local HEAD (the SHA the
+#                   score covers) forces the review gap to 5.
+#   --md            print a short markdown block (for reports and PR bodies) instead of JSON
+#   FILE...         paths relative to the repo root; restricts the diff to them
+#   -h, --help      this text
+#
+# Output, one JSON line on stdout:
+#   {"score": 1-5, "phase": "pre"|"final",
+#    "dims": {"hot", "complexity", "config", "reviewGap"}, "drivers": [<=3 strings],
+#    "unknown": [dims lacking data]}
+# plus "live" ({status, reason|perDay, function, region}) with --live and "errors" when
+# something could not be computed. Each dim is 1-5 (thresholds and weights are the named
+# constants at the top of this file).
+#   hot         fan-in, 90-day churn, entry-point paths, shared-lib floor (3), live traffic
+#   complexity  lines changed, files/dirs spread, branch tokens added, nesting depth
+#   config      Terraform kinds, app config, env-var keys, dependency manifests, schemas
+#   reviewGap   test ratio, untested files, diff size, generated files, config without
+#               tests; with --fanout gated/skipped reviewers, actionable findings, refuted
+#               ratio, files outside the reviewed list; with --pr threads and approvals
+# score = clamp(1..5, max(round(weighted mean), max(dim) - 1)). A dim that could not be
+# computed is listed in "unknown" and counts as 3 (at least 3 when only partly computed),
+# so missing data never makes a change look safer.
+#
+# Exit codes: 0 always for a result (git failures give all four dims unknown, score 3, plus
+# "errors"), 2 bad usage. Read-only. Standard library only.
+#
+# Environment (tests only):
+#   RISK_SCORE_AWS_TARGET   command to run instead of the sibling aws-target
+#   RISK_SCORE_AWS          command to run instead of `aws`
+#   RISK_SCORE_PR_CONTEXT   command to run instead of the sibling pr-context
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "lib"))
+import fanout_result  # noqa: E402
+import numbered_diff  # noqa: E402
+from diff_scope import (  # noqa: E402
+    SOURCE_EXTS, TEST_FILE_RE, GitError, enter_repo, git, merge_base,
+    path_labels, pathspec, read_untracked, resolve_base, diff_text, out as git_out)
+
+# ---- tunables ---------------------------------------------------------------------
+# A level is 1 + the number of thresholds a value reaches, so a 4-tuple gives levels 1-5.
+
+WEIGHTS = {"hot": 0.30, "complexity": 0.25, "config": 0.20, "reviewGap": 0.25}
+DIMS = tuple(WEIGHTS)
+UNKNOWN_LEVEL = 3          # an unknown dim counts as this (and at least this)
+MAX_DRIVERS = 3
+
+# hot
+FANIN_T = (3, 8, 15, 30)   # distinct non-test files importing the module
+CHURN_T = (3, 8, 15, 30)   # commits touching the file in CHURN_DAYS before the change
+CHURN_DAYS = 90
+ENTRY_LEVEL = 4            # handler / resolver / API entry-point paths
+LIB_FLOOR = 3              # *-commons-lib / *-core-lib repos: consumers are downstream
+MAX_FANIN_FILES = 40       # fan-in and churn are looked up for the 40 biggest source files
+LIVE_T = (1_000, 50_000, 500_000, 5_000_000)   # invocations per day
+LIVE_REGION = "us-west-2"
+LIVE_DAYS = 7
+LIVE_TIMEOUT_S = 60
+LIVE_CRED_ENV = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
+
+# complexity
+COMPLEXITY_WEIGHTS = {"lines": 0.40, "spread": 0.20, "branching": 0.25, "nesting": 0.15}
+LINES_T = (20, 80, 250, 600)    # added + removed non-blank lines
+SPREAD_T = (3, 7, 14, 28)       # files + directories touched
+BRANCH_T = (3, 10, 25, 60)      # branch tokens on added lines
+NEST_T = (3, 5, 7, 9)           # deepest indentation level of an added line
+
+# config points (summed, then bucketed)
+CONFIG_T = (1, 3, 6, 10)
+TF_HIGH, TF_MED, TF_LOW, TF_FILE_CAP = 3.0, 1.5, 0.5, 8.0
+APP_CONFIG_PTS = 2.0
+ENV_KEY_PTS, ENV_KEY_CAP = 1.0, 6.0
+DEP_LINE_PTS, DEP_CAP, DEP_MANIFEST_PTS = 1.5, 4.0, 1.0
+SCHEMA_PTS, SCHEMA_CAP = 3.0, 9.0
+
+# review gap: (weight) of each pre-review factor, and of each fanout / PR factor
+GAP_WEIGHTS = {"ratio": 0.25, "untested": 0.25, "size": 0.20, "generated": 0.10, "configNoTest": 0.20,
+               "gated": 0.20, "skipped": 0.20, "unresolved": 0.25, "refuted": 0.05, "unreviewed": 0.15,
+               "threads": 0.20, "approvals": 0.10}
+SIZE_T = (100, 400, 800, 1600)  # non-test source lines; past ~400 reviewers stop attending
+GEN_BIG_LINES = 500
+UNRESOLVED_T = (1, 2, 4)        # actionable findings: 0 -> level 1, 1 -> 2, 2-3 -> 3, 4+ -> 4
+UNREVIEWED_T = (1, 3, 6, 12)    # diff files absent from the fanout's reviewed list
+GATE_DIMS = {"performance": "hot", "data-side-effects": "config"}
+GATE_MATCH_MIN = 3              # a gated reviewer whose dim is at least this is a gap
+NO_APPROVAL_LEVEL = 3
+
+# ---- file kinds -------------------------------------------------------------------
+
+LOCKFILES = frozenset("package-lock.json pnpm-lock.yaml yarn.lock npm-shrinkwrap.json go.sum "
+                      "gradle.lockfile poetry.lock uv.lock Pipfile.lock Cargo.lock".split())
+GENERATED_RE = re.compile(
+    r"(?:^|/)(?:node_modules|vendor|dist|build|target|\.next|generated|__generated__)/"
+    r"|\.min\.(?:js|css)$|\.generated\.|\.pb\.go$|_pb2?\.py$|\.d\.ts$", re.I)
+JS_EXTS = frozenset(".ts .tsx .js .jsx .mjs .cjs".split())
+ENTRY_RE = re.compile(
+    r"handler|^(?:src/)?index\.[cm]?[jt]s$|LambdaFunctionHandler|Resource\.java$|/resolvers?/|^resolvers?/"
+    r"|/api/|^api/", re.I)
+LIB_REPO_RE = re.compile(r"-(?:commons|core)-lib$")
+DEP_MANIFESTS = {
+    "package.json": re.compile(r'^\s*"(?!(?:version|name|description|main|types)")(@?[\w./-]+)"\s*:\s*"[~^<>=*\d]'),
+    "build.gradle": re.compile(r"^\s*(?:implementation|api|compileOnly|runtimeOnly|testImplementation|annotationProcessor|classpath|id)\b.*['\"(]"),
+    "build.gradle.kts": re.compile(r"^\s*(?:implementation|api|compileOnly|runtimeOnly|testImplementation|annotationProcessor|classpath|id)\b.*['\"(]"),
+    "pom.xml": re.compile(r"<version>"),
+    "go.mod": re.compile(r"^\s*(?:require\s+)?\S+\s+v\d"),
+}
+REQUIREMENTS_RE = re.compile(r"^\s*[A-Za-z0-9_.\-\[\]]+\s*(?:==|>=|<=|~=|>|<)")
+BRANCH_RE = re.compile(r"\b(?:if|else|elif|case|catch|except|for|while)\b|&&|\|\||\?[^?.:][^:]*:")
+COMMENT_RE = re.compile(r"^\s*(?://|#|\*|/\*)")
+CFG_ENV_KEY_RE = re.compile(r"^\s*(?:export\s+|-\s*)?([A-Z][A-Z0-9_]{2,})\s*[=:]")
+PROP_KEY_RE = re.compile(r"^\s*([a-z%][\w.%-]*)\s*[=:]")
+SRC_ENV_RE = re.compile(
+    r"process\.env\.([A-Z][A-Z0-9_]*)|getenv\(\s*[\"']([A-Z][A-Z0-9_]*)|environ(?:\.get)?[\[(]\s*[\"']([A-Z][A-Z0-9_]*)")
+TF_HEADER_RE = re.compile(r'^(resource|data)\s+"([^"]+)"\s+"([^"]+)"|^(module|variable|output|locals|provider|terraform)\b')
+TF_HIGH_RE = re.compile(
+    r"^aws_(?:iam_|dynamodb|sqs|sns|cloudwatch_event|lambda_(?:function|permission|event_source_mapping|"
+    r"provisioned|alias)|kms|security_group|s3_bucket)|^aws_\w*_policy")
+TF_HIGH_LINE_RE = re.compile(r"\benvironment\b|reserved_concurrent_executions|provisioned_concurrent|\bpolicy\b")
+TF_TAG_OPEN_RE = re.compile(r"^\s*tags(?:_all)?\s*=?\s*\{")
+TF_SKIP_LINE_RE = re.compile(r"^\s*(?:#|//|\}|\{|\]|\)|$)")
+
+
+class Change:
+    """One changed file: added = [(new line number, text)], removed = [text]."""
+
+    def __init__(self, path, added, removed):
+        self.path, self.added, self.removed = path, added, removed
+
+    @property
+    def lines(self):
+        return sum(1 for _, t in self.added if t.strip()) + sum(1 for t in self.removed if t.strip())
+
+
+def ext(path):
+    return os.path.splitext(path)[1].lower()
+
+
+def is_test(path):
+    return bool(TEST_FILE_RE.search("/" + path))
+
+
+def kind(path):
+    """lock | generated | test | tf | source | other."""
+    if os.path.basename(path) in LOCKFILES:
+        return "lock"
+    if GENERATED_RE.search(path):
+        return "generated"
+    e = ext(path)
+    if e in SOURCE_EXTS and is_test(path):
+        return "test"
+    if e == ".tf":
+        return "tf"
+    return "source" if e in SOURCE_EXTS else "other"
+
+
+def level(value, thresholds):
+    return 1 + sum(1 for t in thresholds if value >= t)
+
+
+def half_up(x):
+    return int(x + 0.5)
+
+
+def clamp(x):
+    return max(1, min(5, x))
+
+
+def human(n):
+    if n >= 1_000_000:
+        return "%.1fM" % (n / 1_000_000)
+    if n >= 10_000:
+        return "%dk" % round(n / 1000)
+    return "%d" % round(n)
+
+
+def first_line(text):
+    lines = (text or "").strip().splitlines()
+    return lines[0] if lines else ""
+
+
+# ---- change set ------------------------------------------------------------------
+
+class Scope:
+    def __init__(self, from_rev, to_rev, spec, root):
+        self.from_rev, self.to_rev, self.spec, self.root = from_rev, to_rev, spec, root
+        self.name = repo_name(root)
+
+
+def repo_name(root):
+    """The repo's name: the origin URL's last path part (a review worktree's directory name is
+    not the repo), else the toplevel directory name."""
+    url = git(["config", "--get", "remote.origin.url"], check=False).stdout.decode().strip()
+    m = re.search(r"[:/]([^/:\s]+?)(?:\.git)?/?$", url)
+    return m.group(1) if m else os.path.basename(root)
+
+
+def rev_parse(rev):
+    p = git(["rev-parse", "--verify", "-q", rev + "^{commit}"], check=False)
+    sha = p.stdout.decode().strip()
+    if p.returncode != 0 or not sha:
+        raise GitError("revision not found: " + rev)
+    return sha
+
+
+def open_scope(dir_, base_arg, range_arg, files):
+    root = enter_repo(dir_)
+    spec = pathspec(files)
+    if range_arg:
+        a, b = range_arg.split("..", 1)
+        return Scope(rev_parse(a), rev_parse(b), spec, root)
+    return Scope(merge_base(resolve_base(base_arg)), None, spec, root)
+
+
+def collect_changes(sc):
+    changes = []
+    for fd in numbered_diff.parse_diff(diff_text(sc.from_rev, sc.spec, sc.to_rev)):
+        changes.append(Change(
+            fd.path, [(ln.new, ln.text) for ln in fd.lines if ln.kind == "+"],
+            [ln.text for ln in fd.lines if ln.kind == "-"]))
+    if sc.to_rev is None:
+        for path, text in read_untracked(sc.spec):
+            rows = text.split("\n") if text is not None else []
+            if rows and rows[-1] == "":
+                rows.pop()
+            changes.append(Change(path, list(enumerate(rows, 1)), []))
+    return changes
+
+
+def file_text(sc, path):
+    if sc.to_rev:
+        p = git(["show", "%s:%s" % (sc.to_rev, path)], check=False)
+        return p.stdout.decode("utf-8", "replace") if p.returncode == 0 else ""
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+# ---- hot path --------------------------------------------------------------------
+
+def _ere(s):
+    return re.sub(r"([.\[\](){}*+?|^$\\])", r"\\\1", s)
+
+
+def fan_in_query(path):
+    """(grep args, pattern list) matching files that import the module at PATH, or None."""
+    e, base = ext(path), os.path.splitext(os.path.basename(path))[0]
+    pkg = os.path.basename(os.path.dirname(path))
+    if e in JS_EXTS:
+        if base == "index":
+            if not pkg:
+                return None
+            return ["-E"], [r"/%s(/index(\.[a-z]+)?)?['\"]" % _ere(pkg)]
+        return ["-E"], [r"/%s(\.[a-z]+)?['\"]" % _ere(base)]
+    if e in (".java", ".kt"):
+        return ["-w", "-F"], [base]
+    if e == ".py":
+        mod = pkg if base == "__init__" else base
+        if not mod:
+            return None
+        return ["-w", "-E"], [r"(from|import)[[:space:]].*" + _ere(mod)]
+    if e == ".go" and pkg:
+        return ["-F"], ['/%s"' % pkg]
+    return None
+
+
+def fan_in(sc, path):
+    q = fan_in_query(path)
+    if not q:
+        return 0
+    flags, pats = q
+    args = ["grep", "-l", "-I", "--no-color"] + flags
+    for p in pats:
+        args += ["-e", p]
+    args += [sc.to_rev] if sc.to_rev else ["--untracked"]
+    p = git(args + ["--"], check=False)
+    if p.returncode not in (0, 1):
+        raise GitError("git grep failed: " + first_line(p.stderr.decode("utf-8", "replace")))
+    hits = set()
+    for row in p.stdout.decode("utf-8", "replace").splitlines():
+        hit = row.split(":", 1)[1] if sc.to_rev else row
+        if hit != path and not is_test(hit) and not GENERATED_RE.search(hit):
+            hits.add(hit)
+    return len(hits)
+
+
+def churn(sc, path, ref_ts):
+    since = datetime.fromtimestamp(ref_ts, timezone.utc) - timedelta(days=CHURN_DAYS)
+    p = git(["log", sc.from_rev, "--since=" + since.strftime("%Y-%m-%dT%H:%M:%SZ"), "--format=%H", "--", path],
+            check=False)
+    if p.returncode != 0:
+        raise GitError("git log failed: " + first_line(p.stderr.decode("utf-8", "replace")))
+    return len(p.stdout.decode().split())
+
+
+def hot_dim(sc, changes, live):
+    """(level, inputs); inputs are (level, text)."""
+    inputs = []
+    src = sorted((c for c in changes if kind(c.path) == "source"), key=lambda c: -c.lines)
+    ref_ts = int(git_out(["log", "-1", "--format=%ct", sc.from_rev]).strip() or 0)
+    best = 1
+    for i, c in enumerate(src):
+        parts, lvl = [], 1
+        if ENTRY_RE.search(c.path):
+            parts.append("entry point")
+            lvl = max(lvl, ENTRY_LEVEL)
+        if i < MAX_FANIN_FILES:
+            n = fan_in(sc, c.path)
+            if level(n, FANIN_T) >= 2:
+                parts.append("fan-in %d" % n)
+            lvl = max(lvl, level(n, FANIN_T))
+            n = churn(sc, c.path, ref_ts)
+            if level(n, CHURN_T) >= 2:
+                parts.append("churn %d commits/%dd" % (n, CHURN_DAYS))
+            lvl = max(lvl, level(n, CHURN_T))
+        if lvl >= 2:
+            inputs.append((lvl, "%s %s" % (os.path.basename(c.path), ", ".join(parts))))
+        best = max(best, lvl)
+    deployable = bool(src) or any(kind(c.path) == "tf" or is_config_path(c.path) for c in changes)
+    if src and LIB_REPO_RE.search(sc.name):
+        inputs.append((LIB_FLOOR, "shared library %s (consumers are downstream)" % sc.name))
+        best = max(best, LIB_FLOOR)
+    if live and live.get("status") == "ok" and deployable:
+        lv = level(live["perDay"], LIVE_T)
+        inputs.append((lv, "%s invocations/day in prod" % human(live["perDay"])))
+        best = max(best, lv)
+    return best, inputs
+
+
+# ---- complexity ------------------------------------------------------------------
+
+def indent_depth(text, e):
+    lead = text[:len(text) - len(text.lstrip())]
+    unit = 2 if e in JS_EXTS or e in (".tf", ".rb") else 4
+    return lead.count("\t") + lead.replace("\t", "").count(" ") // unit
+
+
+def complexity_dim(changes):
+    src = [c for c in changes if kind(c.path) == "source"]
+    if not src:
+        return 1, []
+    lines = sum(c.lines for c in src)
+    spread = len(src) + len({os.path.dirname(c.path) for c in src})
+    branch, depth = 0, 0
+    for c in src:
+        for _, text in c.added:
+            if not text.strip() or COMMENT_RE.match(text):
+                continue
+            branch += len(BRANCH_RE.findall(text))
+            depth = max(depth, indent_depth(text, ext(c.path)))
+    sig = {"lines": (lines, LINES_T, "%d source lines changed" % lines),
+           "spread": (spread, SPREAD_T, "spread over %d files in %d dirs" % (len(src), spread - len(src))),
+           "branching": (branch, BRANCH_T, "%d branch tokens added" % branch),
+           "nesting": (depth, NEST_T, "nesting depth %d" % depth)}
+    mean = sum(COMPLEXITY_WEIGHTS[k] * level(v, t) for k, (v, t, _) in sig.items())
+    inputs = [(level(v, t), text) for v, t, text in sig.values() if level(v, t) >= 2]
+    return clamp(half_up(mean)), inputs
+
+
+# ---- config ----------------------------------------------------------------------
+
+def is_config_path(path):
+    base = os.path.basename(path)
+    if base in LOCKFILES or is_test(path) or GENERATED_RE.search(path):
+        return False
+    return (ext(path) in (".yml", ".yaml", ".properties") or base.startswith(".env")
+            or base in DEP_MANIFESTS or bool(re.match(r"requirements.*\.txt$", base)))
+
+
+def tf_weights(sc, c):
+    """{resource kind: weight} for the Terraform changes in one file."""
+    text = file_text(sc, c.path)
+    rows = text.split("\n")
+    kinds = {}
+
+    def note(name, w):
+        kinds[name] = max(kinds.get(name, 0), w)
+
+    def header_kind(row):
+        m = TF_HEADER_RE.match(row)
+        if not m:
+            return None
+        return m.group(2) if m.group(1) else m.group(4)
+
+    def weight_for(name):
+        if name in ("output", "variable"):
+            return TF_LOW
+        return TF_HIGH if name and TF_HIGH_RE.search(name) else TF_MED
+
+    for no, row in c.added:
+        if TF_SKIP_LINE_RE.match(row):
+            continue
+        # the enclosing top-level block, found by scanning up from the line
+        owner = None
+        for i in range(min(no, len(rows)) - 1, -1, -1):
+            owner = header_kind(rows[i]) if rows[i][:1] not in (" ", "\t", "") else None
+            if owner:
+                break
+        w = weight_for(owner)
+        if TF_HIGH_LINE_RE.search(row) and w < TF_HIGH and owner not in ("output", "variable"):
+            w = TF_HIGH
+        # a line inside a tags = { ... } block is a tag change
+        want = len(row) - len(row.lstrip())
+        for i in range(min(no, len(rows)) - 2, -1, -1):
+            cur = rows[i]
+            if cur.strip() and len(cur) - len(cur.lstrip()) < want:
+                if TF_TAG_OPEN_RE.match(cur):
+                    w = TF_LOW
+                break
+        note(owner or "terraform", w)
+    for row in c.removed:
+        if TF_SKIP_LINE_RE.match(row):
+            continue
+        name = header_kind(row)
+        if name:
+            note(name, weight_for(name))
+        elif not c.added:
+            # a pure deletion has no added line to say what it touched; an edit's removed
+            # lines mirror its added ones, which were classified above
+            note("terraform", TF_LOW if TF_TAG_OPEN_RE.match(row) else TF_MED)
+    return kinds
+
+
+def config_dim(sc, changes):
+    """(level, inputs, points)."""
+    pts, inputs = 0.0, []
+
+    def add(p, text):
+        nonlocal pts
+        pts += p
+        inputs.append((level(p, CONFIG_T), text))
+
+    env_added, env_removed = set(), set()
+    schema = 0.0
+    for c in changes:
+        k, base = kind(c.path), os.path.basename(c.path)
+        if k in ("lock", "generated"):
+            continue
+        if k == "tf":
+            kinds = tf_weights(sc, c)
+            if kinds:
+                p = min(TF_FILE_CAP, sum(kinds.values()))
+                add(p, "terraform %s (%s)" % (", ".join(sorted(kinds, key=lambda x: (-kinds[x], x))[:3]), base))
+        elif base in DEP_MANIFESTS or re.match(r"requirements.*\.txt$", base):
+            rx = DEP_MANIFESTS.get(base, REQUIREMENTS_RE)
+            n = max(sum(1 for _, t in c.added if rx.search(t)), sum(1 for t in c.removed if rx.search(t)))
+            add(min(DEP_CAP, DEP_LINE_PTS * n) if n else DEP_MANIFEST_PTS,
+                "%s: %s" % (base, "%d dependency line(s)" % n if n else "changed, no dependency lines"))
+        elif is_config_path(c.path):
+            add(APP_CONFIG_PTS, "app config %s" % c.path)
+        if not is_test(c.path):
+            e = ext(c.path)
+            for rows, bucket in (([t for _, t in c.added], env_added), (c.removed, env_removed)):
+                for t in rows:
+                    if e in SOURCE_EXTS and k == "source":
+                        for m in SRC_ENV_RE.finditer(t):
+                            bucket.add(next(g for g in m.groups() if g))
+                    elif k == "tf" or is_config_path(c.path):
+                        m = CFG_ENV_KEY_RE.match(t) or (PROP_KEY_RE.match(t) if e == ".properties" else None)
+                        if m:
+                            bucket.add(m.group(1))
+        labels = path_labels(c.path)
+        if labels:
+            schema = min(SCHEMA_CAP, schema + SCHEMA_PTS)
+            inputs.append((level(SCHEMA_PTS, CONFIG_T), "%s: %s" % (labels[0], c.path)))
+    pts += schema
+    keys = (env_added - env_removed) | (env_removed - env_added)
+    if keys:
+        p = min(ENV_KEY_CAP, ENV_KEY_PTS * len(keys))
+        add(p, "env/config keys +%d -%d" % (len(env_added - env_removed), len(env_removed - env_added)))
+    return level(pts, CONFIG_T), inputs, pts
+
+
+# ---- review gap ------------------------------------------------------------------
+
+def stem_of(path):
+    base = re.sub(r"\.(?:test|spec)(?=\.)", "", os.path.basename(path).lower())
+    return os.path.splitext(base)[0]
+
+
+def test_stem(path):
+    """stem_of for a test file, with a CamelCase Test/Tests suffix (FooTest.java) and a
+    test_ prefix (test_foo.py) stripped. The suffix is matched case-sensitively so
+    `latest.ts` is not read as `la` + `test`."""
+    s = re.sub(r"^test_", "", stem_of(path))
+    if re.search(r"[a-z0-9]Tests?$", os.path.splitext(os.path.basename(path))[0]):
+        s = re.sub(r"tests?$", "", s)
+    return s
+
+
+def gap_pre(changes, config_pts):
+    """[(factor, level, text)] derived from the diff alone."""
+    src = [c for c in changes if kind(c.path) == "source"]
+    tests = [c for c in changes if kind(c.path) == "test"]
+    gen = [c for c in changes if kind(c.path) == "generated"]
+    src_lines, test_lines = sum(c.lines for c in src), sum(c.lines for c in tests)
+    f = []
+    if src:
+        ratio = test_lines / src_lines if src_lines else 0.0
+        f.append(("ratio", 1 + sum(1 for t in (0.8, 0.4, 0.15, 1e-9) if ratio < t),
+                  "tests: %d changed test lines vs %d source lines" % (test_lines, src_lines)))
+        names = {test_stem(t.path) for t in tests}
+        bare = [c for c in src if not stem_of(c.path) or stem_of(c.path) not in names]
+        frac = len(bare) / len(src)
+        f.append(("untested", 1 + sum(1 for t in (0, 0.25, 0.5, 0.75) if frac > t),
+                  "%d of %d changed source files have no sibling test change" % (len(bare), len(src))))
+    tf_lines = sum(c.lines for c in changes if kind(c.path) == "tf")
+    size = src_lines + tf_lines
+    f.append(("size", level(size, SIZE_T), "diff is %d source lines (reviewers lose attention past ~400)" % size))
+    gl = sum(c.lines for c in gen)
+    other = [c for c in changes if kind(c.path) not in ("generated", "lock")]
+    f.append(("generated", (3 if gl >= GEN_BIG_LINES else 2) if gen and other else 1,
+              "%d generated/vendored file(s) mixed in" % len(gen)))
+    f.append(("configNoTest", (4 if config_pts >= 3 else 3) if config_pts > 0 and not tests else 1,
+              "config changes (%.1f pts) with no test change" % config_pts))
+    return f
+
+
+def list_field(res, key):
+    value = res.get(key) or []
+    if not isinstance(value, list):
+        raise fanout_result.InputError('"%s" is not a list' % key)
+    return value
+
+
+def gap_fanout(path, changes, dims):
+    """[(factor, level, text)] and the floor from a review-fanout output."""
+    res = fanout_result.extract_result(Path(path).read_text(encoding="utf-8", errors="replace"))
+    actionable = fanout_result.items(res, "actionable")
+    refuted = fanout_result.items(res, "refuted")
+    info = fanout_result.items(res, "informational")
+    skipped = [str(s) for s in list_field(res, "reviewersSkipped")]
+    gated = [str(g.get("key") if isinstance(g, dict) else g) for g in list_field(res, "reviewersGated")]
+    f, floor = [], 1
+    hit = [g for g in gated if g in GATE_DIMS and dims[GATE_DIMS[g]] >= GATE_MATCH_MIN]
+    if hit:
+        f.append(("gated", 5, "reviewer gated off on a %s-risk dim: %s" % (
+            "/".join(sorted({GATE_DIMS[g] for g in hit})), ", ".join(hit))))
+        floor = 4
+    else:
+        f.append(("gated", 2 if gated else 1, "reviewers gated off: %s" % (", ".join(gated) or "none")))
+    f.append(("skipped", min(5, 3 + len(skipped)) if skipped else 1,
+              "reviewers returned nothing: %s" % (", ".join(skipped) or "none")))
+    open_n = sum(1 for a in actionable if not a.get("resolved"))
+    f.append(("unresolved", 1 + sum(1 for t in UNRESOLVED_T if open_n >= t) if open_n else 1,
+              "%d actionable finding(s) from review" % open_n))
+    total = len(actionable) + len(refuted) + len(info)
+    ratio = len(refuted) / total if total else 0.0
+    f.append(("refuted", 3 if ratio >= 0.5 and len(refuted) >= 2 else 2 if ratio >= 0.3 and refuted else 1,
+              "%d of %d findings refuted (noisy reviewers)" % (len(refuted), total)))
+    reviewed = res["files"] if res.get("files") is not None else res.get("reviewedFiles")
+    if reviewed is not None and not isinstance(reviewed, list):
+        raise fanout_result.InputError('"files" is not a list')
+    if reviewed is not None:
+        seen = {str(x) for x in reviewed}
+        missing = [c.path for c in changes if kind(c.path) not in ("lock", "generated") and c.path not in seen]
+        f.append(("unreviewed", level(len(missing), UNREVIEWED_T) if missing else 1,
+                  "%d diff file(s) not in the fanout's reviewed list" % len(missing)))
+    return f, floor
+
+
+def pr_context_cmd():
+    return shlex.split(os.environ.get("RISK_SCORE_PR_CONTEXT") or os.path.join(HERE, "pr-context"))
+
+
+def gap_pr(num, repo, local_head):
+    """([(factor, level, text)], head_mismatch_text or None) from pr-context --json."""
+    cmd = pr_context_cmd() + [str(num), "--json"] + (["-R", repo] if repo else [])
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False,
+                           timeout=LIVE_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError("pr-context could not run: %s" % e)
+    if p.returncode != 0:
+        raise RuntimeError("pr-context exit %d: %s" % (p.returncode, first_line(p.stderr)))
+    try:
+        doc = json.loads(p.stdout)
+        head = str(doc["pr"]["headRefOid"])
+        threads = len(doc["actionable"]["threads"]) + int((doc.get("truncated") or {}).get("threads") or 0)
+        approvals = sum(1 for r in doc.get("reviews") or []
+                        if r.get("state") == "APPROVED" and not str(r.get("author", "")).endswith("[bot]")
+                        and r.get("author") not in ("", "ghost", None))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise RuntimeError("pr-context output is not the expected JSON")
+    f = [("threads", 1 + sum(1 for t in (1, 2, 4) if threads >= t) if threads else 1,
+          "%d unresolved review thread(s)" % threads),
+         ("approvals", 1 if approvals else NO_APPROVAL_LEVEL,
+          "%d human approval(s)" % approvals)]
+    mismatch = None
+    if head != local_head:
+        mismatch = "PR head %s is not the reviewed SHA %s" % (head[:7], local_head[:7])
+    return f, mismatch
+
+
+# ---- live ------------------------------------------------------------------------
+
+def _run(cmd, env=None):
+    return subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False,
+                          timeout=LIVE_TIMEOUT_S, env=env, stdin=subprocess.DEVNULL)
+
+
+def live_probe(name):
+    """Prod Lambda invocations per day for FunctionName=name. Never raises: any failure is
+    {"status": "unknown", "reason": ...}. Only lambda get-function and cloudwatch
+    get-metric-statistics are called, through the ReadOnly profile aws-target prod picks."""
+    info = {"status": "unknown", "function": name, "region": LIVE_REGION}
+
+    def unknown(reason):
+        info["reason"] = reason
+        return info
+
+    target = shlex.split(os.environ.get("RISK_SCORE_AWS_TARGET") or os.path.join(HERE, "aws-target"))
+    aws = shlex.split(os.environ.get("RISK_SCORE_AWS") or "aws")
+    try:
+        p = _run(target + ["prod"])
+        if p.returncode != 0:
+            return unknown("aws-target prod exit %d: %s" % (p.returncode, first_line(p.stderr)))
+        m = re.search(r"export AWS_PROFILE='([^']+)'", p.stdout)
+        if not m:
+            return unknown("aws-target prod printed no profile")
+        profile = m.group(1)
+        # the profile is passed explicitly, and static or session credentials in the
+        # environment (which would outrank it) are dropped from the child
+        env = {k: v for k, v in os.environ.items() if k not in LIVE_CRED_ENV}
+        env["AWS_PROFILE"] = profile
+        p = _run(aws + ["--profile", profile, "lambda", "get-function", "--function-name", name,
+                        "--region", LIVE_REGION, "--query", "Configuration.FunctionName",
+                        "--output", "text"], env)
+        if p.returncode != 0:
+            if "ResourceNotFound" in p.stderr:
+                return unknown("no Lambda function named %s in %s" % (name, LIVE_REGION))
+            return unknown("lambda get-function failed: %s" % first_line(p.stderr))
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=LIVE_DAYS)
+        p = _run(aws + ["--profile", profile, "cloudwatch", "get-metric-statistics", "--namespace", "AWS/Lambda",
+                        "--metric-name", "Invocations", "--dimensions", "Name=FunctionName,Value=" + name,
+                        "--start-time", start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "--end-time", end.strftime("%Y-%m-%dT%H:%M:%SZ"), "--period", "86400",
+                        "--statistics", "Sum", "--region", LIVE_REGION, "--output", "json"], env)
+        if p.returncode != 0:
+            return unknown("cloudwatch get-metric-statistics failed: %s" % first_line(p.stderr))
+        points = json.loads(p.stdout).get("Datapoints") or []
+        total = sum(float(d.get("Sum") or 0) for d in points)
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError, TypeError) as e:
+        return unknown("%s: %s" % (e.__class__.__name__, e))
+    return {"status": "ok", "function": name, "region": LIVE_REGION, "perDay": round(total / LIVE_DAYS)}
+
+
+# ---- assemble --------------------------------------------------------------------
+
+def weighted(pairs):
+    tot = sum(w for w, _ in pairs)
+    return sum(w * lv for w, lv in pairs) / tot if tot else 1.0
+
+
+def compute(opts):
+    errors, unknown, inputs = [], set(), {d: [] for d in DIMS}
+    raw = {d: None for d in DIMS}
+    live = None
+    phase = "final" if opts.fanout else "pre"
+    sc = changes = None
+    try:
+        sc = open_scope(opts.dir, opts.base, opts.range, opts.files)
+        changes = collect_changes(sc)
+    except GitError as e:
+        errors.append(str(e))
+    except Exception as e:  # any failure leaves the dims unknown (scored 3), never silent
+        errors.append("%s: %s" % (e.__class__.__name__, e))
+
+    if opts.live:
+        live = live_probe(sc.name) if sc else {"status": "unknown", "reason": "repository not readable",
+                                               "region": LIVE_REGION}
+
+    def guard(name, fn):
+        try:
+            return fn()
+        except Exception as e:
+            errors.append("%s: %s" % (name, str(e) or e.__class__.__name__))
+            return None
+
+    config_pts = 0.0
+    if changes is not None:
+        r = guard("hot", lambda: hot_dim(sc, changes, live))
+        if r:
+            raw["hot"], inputs["hot"] = r
+        r = guard("complexity", lambda: complexity_dim(changes))
+        if r:
+            raw["complexity"], inputs["complexity"] = r
+        r = guard("config", lambda: config_dim(sc, changes))
+        if r:
+            raw["config"], inputs["config"], config_pts = r
+
+    def eff(d):
+        return UNKNOWN_LEVEL if raw[d] is None else raw[d]
+
+    # review gap: the diff, then the fanout, then the PR; a requested source that fails
+    # leaves the dim partly unknown (counted as at least 3) rather than silently narrower.
+    factors, floor, forced = [], 1, None
+    if changes is not None:
+        r = guard("reviewGap", lambda: gap_pre(changes, config_pts))
+        if r is None:
+            changes_ok = False
+        else:
+            factors, changes_ok = r, True
+            if opts.fanout:
+                try:
+                    f, floor = gap_fanout(opts.fanout, changes, {d: eff(d) for d in DIMS})
+                    factors += f
+                except (fanout_result.InputError, OSError) as e:
+                    errors.append("fanout: %s" % (str(e) or e.__class__.__name__))
+                    unknown.add("reviewGap")
+            if opts.pr is not None:
+                try:
+                    # the SHA the score covers: the range's end, else the checked-out HEAD
+                    reviewed = sc.to_rev or git(["rev-parse", "HEAD"]).stdout.decode().strip()
+                    f, mismatch = gap_pr(opts.pr, opts.repo, reviewed)
+                    factors += f
+                    if mismatch:
+                        forced = 5
+                        factors.append(("sha", 5, mismatch))
+                except (RuntimeError, GitError) as e:
+                    errors.append("pr: %s" % e)
+                    unknown.add("reviewGap")
+        if changes_ok:
+            raw["reviewGap"] = forced or clamp(max(half_up(weighted([(GAP_WEIGHTS[n], lv) for n, lv, _ in factors])), floor))
+            inputs["reviewGap"] = [(lv, t) for _, lv, t in factors if lv >= 2]
+
+    for d in DIMS:
+        if raw[d] is None:
+            unknown.add(d)
+    dims = {d: max(raw[d], UNKNOWN_LEVEL) if d in unknown and raw[d] is not None else eff(d) for d in DIMS}
+    mean = sum(WEIGHTS[d] * dims[d] for d in DIMS)
+    score = clamp(max(half_up(mean), max(dims.values()) - 1))
+
+    ranked = sorted(((lv * WEIGHTS[d], lv, d, text) for d in DIMS for lv, text in inputs[d] if lv >= 2),
+                    key=lambda x: (-x[0], -x[1], x[2], x[3]))
+    drivers = ["%s: %s" % (d, text) for _, _, d, text in ranked[:MAX_DRIVERS]]
+    result = {"score": score, "phase": phase, "dims": dims, "drivers": drivers,
+              "unknown": [d for d in DIMS if d in unknown]}
+    if live is not None:
+        result["live"] = live
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def render_md(r):
+    d = r["dims"]
+    lines = ["**Risk %d/5** (%s)" % (r["score"], "final, after review" if r["phase"] == "final" else "pre-review"),
+             "hot %d | complexity %d | config %d | review gap %d" % (
+                 d["hot"], d["complexity"], d["config"], d["reviewGap"])]
+    lines += ["- " + t for t in r["drivers"]] or ["- no notable risk inputs"]
+    live = r.get("live")
+    if live:
+        lines.append("live: %s" % ("%s invocations/day (%s)" % (human(live["perDay"]), live["function"])
+                                   if live["status"] == "ok" else "unknown (%s)" % live.get("reason", "no data")))
+    if r["unknown"]:
+        lines.append("unknown, counted as at least %d: %s%s" % (
+            UNKNOWN_LEVEL, ", ".join(r["unknown"]),
+            " (%s)" % "; ".join(r["errors"]) if r.get("errors") else ""))
+    return "\n".join(lines)
+
+
+def usage_text():
+    with open(__file__, encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
+            if i == 0:
+                continue
+            if not line.startswith("#"):
+                break
+            print(line[2:].rstrip("\n") if line.startswith("# ") else "")
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        print("risk-score: %s (see --help)" % message, file=sys.stderr)
+        sys.exit(2)
+
+
+def parse(argv):
+    p = Parser(prog="risk-score", add_help=False, allow_abbrev=False)
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("-C", dest="dir", default="")
+    p.add_argument("--base", default="")
+    p.add_argument("--range", default="")
+    p.add_argument("--live", action="store_true")
+    p.add_argument("--fanout", default="")
+    p.add_argument("--pr", type=int)
+    p.add_argument("-R", dest="repo", default="")
+    p.add_argument("--md", action="store_true")
+    p.add_argument("files", nargs="*")
+    o = p.parse_args(argv)
+    if o.help:
+        usage_text()
+        sys.exit(0)
+    if o.fanout:
+        o.fanout = os.path.abspath(o.fanout)   # before enter_repo's chdir
+    if o.base and o.range:
+        p.error("--base and --range are mutually exclusive")
+    if o.range:
+        a, _, b = o.range.partition("..")
+        if not a or not b or b.startswith(".") or a.endswith("."):
+            p.error("--range needs A..B (two dots), got " + o.range)
+    if o.repo and o.pr is None:
+        p.error("-R needs --pr")
+    if o.pr is not None and o.pr <= 0:
+        p.error("--pr needs a PR number")
+    return o
+
+
+def main(argv):
+    opts = parse(argv)
+    result = compute(opts)
+    print(render_md(result) if opts.md else json.dumps(result))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

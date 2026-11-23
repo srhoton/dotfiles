@@ -238,4 +238,5 @@ for (let i = 0; i < toVerify.length; i++) {
 for (const f of unverified) actionable.push({ ...f, verified: false })
 
 log(`${actionable.length} actionable, ${refuted.length} refuted, ${informational.length} informational`)
-return { actionable, informational, refuted, reviewersSkipped: skipped, reviewersGated }
+// files: the reviewed list, so risk-score can flag diff files the review never covered.
+return { actionable, informational, refuted, reviewersSkipped: skipped, reviewersGated, files }

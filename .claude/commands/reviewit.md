@@ -34,6 +34,15 @@ Then checkout the PR — **unless `git rev-parse HEAD` already equals the PR's `
 gh pr checkout $ARGUMENTS
 ```
 
+Then compute the pre-review risk score from the PR's diff. It is deterministic (git and regexes, no model):
+
+```bash
+git fetch origin <pr.baseRefName>
+~/.claude/bin/risk-score --base origin/<pr.baseRefName> --md
+```
+
+The fetch plus `origin/` make the base the remote tip, not a stale local branch of the same name. Keep the block as the pre-review score. Add `--live` when the repo is a service or function (a read-only CloudWatch query; if it reports live as unknown, carry on, it never lowers the score). A dimension listed as `unknown` counts as 3, so report it rather than hiding it.
+
 ---
 
 ## Step 2: Run Reviews via the review-fanout Workflow
@@ -46,7 +55,7 @@ Invoke the **Workflow tool** with the saved orchestration script (this slash com
   - `files`: the PR's changed-file list from Step 1
   - `intent`: the PR title and body ("Treat the PR description as the user's requirements")
 
-The workflow runs the five specialist reviewers (functional, code-quality, adr-compliance, performance, data-side-effects) in parallel with schema-validated findings, dedupes by file:line, checks the diff against the defect-class checklist (`~/.claude/knowledge/defect-classes.md`), then adversarially verifies each CRITICAL/HIGH finding with a skeptic agent. It returns `{ actionable, informational, refuted, reviewersSkipped }`.
+The workflow runs the five specialist reviewers (functional, code-quality, adr-compliance, performance, data-side-effects) in parallel with schema-validated findings, dedupes by file:line, checks the diff against the defect-class checklist (`~/.claude/knowledge/defect-classes.md`), then adversarially verifies each CRITICAL/HIGH finding with a skeptic agent. It returns `{ actionable, informational, refuted, reviewersSkipped, reviewersGated, files }`.
 
 - `actionable` findings carry `verified: true/false` — `false` means the skeptic errored or the finding was beyond the verify cap; treat those with extra suspicion, don't drop them.
 - `refuted` findings were disproved with cited evidence — never propose them as PR comments; show them in the terminal summary so the user can spot-check.
@@ -61,6 +70,13 @@ The workflow runs the five specialist reviewers (functional, code-quality, adr-c
 From the workflow's returned structure (or your own aggregation in the fallback case):
 
 0. Run `~/.claude/bin/fanout-report <workflow output file> --repo <repo name>`. It writes the full report (actionable, refuted with refutations, informational, skipped reviewers) to `~/.claude/scratch/<repo>/` and prints the path and counts. Use the report for the steps below instead of re-parsing the output by hand, and give the user its path.
+0b. Compute the final risk score. It adds the review's results (gated or skipped reviewers, actionable findings, refuted ratio) and the PR's state (unresolved threads, human approvals, and a PR head that is no longer the checked-out SHA, which forces the review gap to 5):
+
+    ```bash
+    ~/.claude/bin/risk-score --base origin/<pr.baseRefName> --fanout <workflow output file> --pr $ARGUMENTS -R <owner/repo> --md
+    ```
+
+    If this PR was reviewed in more than one round, pass the LAST round's output file (the output has no resolved flag). Write the block to a file in the scratchpad (`RISK_BLOCK`). Steps 4 and 5 and "Approving" use it. If the score is higher than the pre-review one, say why.
 1. **Actionable** = the returned CRITICAL/HIGH findings that survived verification
 2. **Informational** = MEDIUM and LOW findings
 3. For each actionable finding, prepare an inline comment with:
@@ -85,6 +101,8 @@ Display ALL actionable findings as a numbered list:
 [3] HIGH     | terraform/main.tf:15      | S3 bucket missing encryption configuration  | both
 ```
 
+Show the `RISK_BLOCK` under the list: it goes out in the review body with whatever comments the user accepts, so the user sees it before it is posted.
+
 Then use `AskUserQuestion` with this question:
 - Question: "Which comments would you like to post as inline review comments on PR #$ARGUMENTS?"
 - Options:
@@ -99,9 +117,13 @@ Then use `AskUserQuestion` with this question:
 Write the accepted findings to a JSON file in the scratchpad, as `{"reviewers": "functional-reviewer + code-quality-reviewer + adr-compliance-reviewer + performance-reviewer + data-side-effects-reviewer", "findings": [{"severity", "file", "line", "description", "suggestion"}]}`. Then post them:
 
 ```bash
-~/.claude/bin/pr-review-post $ARGUMENTS <findings.json> -n   # dry run: check the inline/fallback split
-~/.claude/bin/pr-review-post $ARGUMENTS <findings.json>      # posts
+~/.claude/bin/pr-review-post $ARGUMENTS <findings.json> --body-file <risk-body> -n   # dry run: check the inline/fallback split
+~/.claude/bin/pr-review-post $ARGUMENTS <findings.json> --body-file <risk-body>      # posts
 ```
+
+`<risk-body>` is a file in the scratchpad holding the `RISK_BLOCK`, so the score is posted only with the comments the user accepted. If the user accepted no comments ("Skip all"), post nothing, not even the block.
+
+**Label (optional):** only if the repo already has a `risk:N` label for the final score (`gh label list -R <owner/repo> --search risk:`), apply it with `gh pr edit $ARGUMENTS -R <owner/repo> --add-label risk:N --remove-label <any other risk:* label on the PR>`. Never create the label. If it is missing, say so in the summary as a suggested next step.
 
 The script reads the PR diff and posts every finding on a commentable line as **one** review, using the body format below. Findings on lines outside the diff go into **one** conversation comment, so nothing is rejected or lost. If the review POST fails, it retries with every finding in the fallback comment. Report its summary line.
 
@@ -155,7 +177,7 @@ Approve only through `~/.claude/bin/pr-approve`. A hook blocks `gh pr review --a
 When the user says "approve" (or "approve it") after a review:
 
 1. Use the `Reviewed SHA` printed above, which is the head the review covered. Never substitute the PR's current head or re-read it. If this session did not review the PR, there is no reviewed SHA: run the review first.
-2. Write the approval body to a temp file. List the MEDIUM/LOW findings as non-blocking follow-ups, and state the reviewed SHA. Don't pass the body as an argument.
+2. Write the approval body to a temp file. List the MEDIUM/LOW findings as non-blocking follow-ups, state the reviewed SHA, and include the `RISK_BLOCK` from Step 3 (the final score for that SHA). Don't pass the body as an argument. Apply the `risk:N` label as in Step 5 if the repo already has it.
 3. Run it, with the repo slug from `gh repo view --json nameWithOwner -q .nameWithOwner`:
 
 ```bash
