@@ -1,0 +1,3 @@
+Plan: ~/.claude/plans/i-d-like-to-build-imperative-key.md
+Review: one review-fanout round, 0 CRITICAL/HIGH, 12 MEDIUM/LOW, all fixed in one implementer pass, each checked by a revert-and-fail probe.
+Backtest: ~/.claude/scratch/dotfiles/risk-score-backtest-20261123.md (583 PRs, 13 repos); constants not retuned (best alternative +0.015 AUC).
