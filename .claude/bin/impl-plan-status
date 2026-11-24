@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""impl-plan-status: validate an /impl-plan plan.json and score every step's status colour.
+
+The plan is data (skills/impl-plan/plan.schema.json); the model writes its content once and
+this script owns `status`, `statusWhy`, `stale`, `prStates` and `warnings`, so a refresh costs
+no model tokens. impl-plan-render turns the scored plan.json into the HTML page.
+
+Usage: impl-plan-status PLAN.json [--discover] [--write] [--org ORG]
+  --discover   for each step with ticket keys, look through the recent PRs of its existing
+               repos for ones whose title or branch names a key, and print the ones the plan
+               does not link yet. Suggestions only: nothing is ever added to the plan.
+  --write      write status, statusWhy, stale, prStates and warnings back into PLAN.json
+               (atomically). Without it the file is never touched.
+  --org ORG    owner for repo names without one (default: fullbay)
+
+Status rules, applied in this order (the first that matches wins):
+  orange  design gate   designGate.required and not approved. Stays orange even with PRs,
+                        and warns "PR before design approval".
+  green   completed     doneWhen "merged": at least one PR and every PR merged. doneWhen
+                        "manual": done is true (deploys and backfills that have no PR).
+  yellow  PR out        any PR open, or a manual step that has PRs but is not marked done.
+  red     not started   no PRs.
+PRs closed without merging are ignored (with a warning). One `gh api graphql` call per repo
+reads the state of every PR the plan names in it.
+
+If gh fails for a repo (or a named PR does not exist), the steps that need it keep their
+previous status with `stale: true` and the run exits 1. A stale step is never promoted to
+green, and keeps green only if every readable PR is merged now and every unreadable PR was
+previously seen merged (in its stored prStates); otherwise it drops to yellow (red when it
+had no status). Every unreadable PR is
+printed to stderr and listed as a "PR state unknown" warning, whichever step names it.
+Warnings: a yellow or green step with a red or orange dependency; an open question that
+blocks a step that is not red; a PR before design approval (only PRs whose state is known);
+a closed-unmerged PR.
+
+Output (stdout): a change table (step, old -> new, why), the counts, the warnings, and with
+--discover the suggested PRs.
+Exit 0 scored, 1 gh failed for something (stale steps or a failed discovery; the rest is
+still scored and written), 2 invalid plan or usage (names the field), or --write found
+PLAN.json changed since it was read (nothing is written).
+Standard library only. Testing: GH=<command> replaces the gh binary (bin/tests/impl-plan-status.sh).
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from typing import Any
+
+DEFAULT_ORG = "fullbay"
+STATUSES = ("green", "yellow", "orange", "red")
+PR_STATES = ("OPEN", "MERGED", "CLOSED")
+KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[1-9][0-9]*$")
+PR_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)#([1-9][0-9]*)$")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+REPO_RE = re.compile(r"^(?:([A-Za-z0-9][A-Za-z0-9-]*)/)?([A-Za-z0-9._-]+)$")
+DISCOVER_PAGE = 100
+DISCOVER_PAGES = 5
+
+PR_QUERY = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){%s}}"
+DISCOVER_QUERY = (
+    "query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){"
+    f"pullRequests(first:{DISCOVER_PAGE},after:$after,orderBy:{{field:UPDATED_AT,direction:DESC}}){{"
+    "pageInfo{hasNextPage endCursor} nodes{number title headRefName state}}}}"
+)
+
+
+class ValidationError(Exception):
+    """The plan is malformed. The message starts with the field path."""
+
+
+class Failure(Exception):
+    """gh failed or answered with something unexpected."""
+
+
+class Conflict(Exception):
+    """PLAN.json changed on disk between reading it and writing it back."""
+
+
+# ---- validation ----------------------------------------------------------------------
+
+def _fail(path: str, msg: str) -> ValidationError:
+    return ValidationError(f"{path}: {msg}")
+
+
+def _keys(d: Any, path: str, required: tuple[str, ...], optional: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(d, dict):
+        raise _fail(path, "must be an object")
+    for k in required:
+        if k not in d:
+            raise _fail(f"{path}.{k}", "is required")
+    for k in d:
+        if k not in required and k not in optional:
+            raise _fail(f"{path}.{k}", "is not a known field")
+    return d
+
+
+def _str(v: Any, path: str, *, blank: bool = False, pattern: re.Pattern[str] | None = None, what: str = "") -> str:
+    if not isinstance(v, str):
+        raise _fail(path, "must be a string")
+    if not blank and not v.strip():
+        raise _fail(path, "must not be empty")
+    if pattern is not None and not pattern.match(v):
+        raise _fail(path, f"'{v}' is not a valid {what}")
+    return v
+
+
+def _list(v: Any, path: str) -> list[Any]:
+    if not isinstance(v, list):
+        raise _fail(path, "must be an array")
+    return v
+
+
+def _bool(v: Any, path: str) -> bool:
+    if not isinstance(v, bool):
+        raise _fail(path, "must be true or false")
+    return v
+
+
+def _str_list(v: Any, path: str, *, pattern: re.Pattern[str] | None = None, what: str = "") -> list[str]:
+    items = _list(v, path)
+    for i, x in enumerate(items):
+        _str(x, f"{path}[{i}]", pattern=pattern, what=what)
+    if len(set(items)) != len(items):
+        raise _fail(path, "has duplicate entries")
+    return items
+
+
+def validate(doc: Any) -> None:
+    """Raise ValidationError (message starts with the field path) unless doc is a valid plan."""
+    root = _keys(doc, "plan.json", ("plan", "phases", "steps", "questions"), ("warnings",))
+    meta = _keys(root["plan"], "plan", ("title", "slug", "source", "summary"),
+                 ("epics", "decisions", "updatedAt"))
+    _str(meta["title"], "plan.title")
+    _str(meta["slug"], "plan.slug", pattern=SLUG_RE, what="slug (lowercase letters, digits, hyphens)")
+    src = _keys(meta["source"], "plan.source", ("kind", "ref"), ())
+    if src["kind"] not in ("artifact", "tds", "session"):
+        raise _fail("plan.source.kind", "must be artifact, tds or session")
+    _str(src["ref"], "plan.source.ref", blank=True)
+    _str(meta["summary"], "plan.summary")
+    _str_list(meta.get("epics", []), "plan.epics", pattern=KEY_RE, what="Jira key")
+    for i, d in enumerate(_list(meta.get("decisions", []), "plan.decisions")):
+        dd = _keys(d, f"plan.decisions[{i}]", ("title", "detail"), ())
+        _str(dd["title"], f"plan.decisions[{i}].title")
+        _str(dd["detail"], f"plan.decisions[{i}].detail")
+    if "updatedAt" in meta:
+        _str(meta["updatedAt"], "plan.updatedAt")
+
+    phase_ids: set[str] = set()
+    for i, p in enumerate(_list(root["phases"], "phases")):
+        pp = _keys(p, f"phases[{i}]", ("id", "title"), ("note",))
+        pid = _str(pp["id"], f"phases[{i}].id", pattern=ID_RE, what="id")
+        if pid in phase_ids:
+            raise _fail(f"phases[{i}].id", f"duplicate phase id '{pid}'")
+        phase_ids.add(pid)
+        _str(pp["title"], f"phases[{i}].title")
+        if "note" in pp:
+            _str(pp["note"], f"phases[{i}].note", blank=True)
+
+    steps = _list(root["steps"], "steps")
+    step_ids: list[str] = []
+    for i, s in enumerate(steps):
+        sp = f"steps[{i}]"
+        ss = _keys(s, sp, ("id", "phase", "title", "work", "plain", "repos"),
+                   ("dependsOn", "prerequisites", "tickets", "prs", "designGate", "doneWhen", "done",
+                    "statusNote", "status", "statusWhy", "stale", "prStates"))
+        sid = _str(ss["id"], f"{sp}.id", pattern=ID_RE, what="id")
+        if sid in step_ids:
+            raise _fail(f"{sp}.id", f"duplicate step id '{sid}'")
+        step_ids.append(sid)
+        if _str(ss["phase"], f"{sp}.phase") not in phase_ids:
+            raise _fail(f"{sp}.phase", f"unknown phase '{ss['phase']}'")
+        _str(ss["title"], f"{sp}.title")
+        _str(ss["work"], f"{sp}.work")
+        _str(ss["plain"], f"{sp}.plain")
+        seen_repos: set[str] = set()
+        for j, r in enumerate(_list(ss["repos"], f"{sp}.repos")):
+            rr = _keys(r, f"{sp}.repos[{j}]", ("name", "exists"), ())
+            name = _str(rr["name"], f"{sp}.repos[{j}].name", pattern=REPO_RE, what="repo name")
+            _bool(rr["exists"], f"{sp}.repos[{j}].exists")
+            if name in seen_repos:
+                raise _fail(f"{sp}.repos[{j}].name", f"duplicate repo '{name}'")
+            seen_repos.add(name)
+        for j, x in enumerate(_list(ss.get("prerequisites", []), f"{sp}.prerequisites")):
+            _str(x, f"{sp}.prerequisites[{j}]")
+        _str_list(ss.get("tickets", []), f"{sp}.tickets", pattern=KEY_RE, what="Jira key")
+        _str_list(ss.get("prs", []), f"{sp}.prs", pattern=PR_RE, what="PR reference (owner/repo#N)")
+        _str_list(ss.get("dependsOn", []), f"{sp}.dependsOn")
+        if "designGate" in ss:
+            g = _keys(ss["designGate"], f"{sp}.designGate", ("required",), ("reason", "approved"))
+            req = _bool(g["required"], f"{sp}.designGate.required")
+            if req:
+                _str(g.get("reason"), f"{sp}.designGate.reason")
+            elif "reason" in g:
+                _str(g["reason"], f"{sp}.designGate.reason", blank=True)
+            if g.get("approved") is not None:
+                _str(g["approved"], f"{sp}.designGate.approved")
+        if ss.get("doneWhen", "merged") not in ("merged", "manual"):
+            raise _fail(f"{sp}.doneWhen", "must be merged or manual")
+        if "done" in ss:
+            _bool(ss["done"], f"{sp}.done")
+        if "statusNote" in ss:
+            _str(ss["statusNote"], f"{sp}.statusNote", blank=True)
+        if "status" in ss and ss["status"] not in STATUSES:
+            raise _fail(f"{sp}.status", f"must be one of {', '.join(STATUSES)}")
+        if "statusWhy" in ss:
+            _str(ss["statusWhy"], f"{sp}.statusWhy", blank=True)
+        if "stale" in ss:
+            _bool(ss["stale"], f"{sp}.stale")
+        if "prStates" in ss:
+            ps = ss["prStates"]
+            if not isinstance(ps, dict):
+                raise _fail(f"{sp}.prStates", "must be an object")
+            for ref, st in ps.items():
+                if not PR_RE.match(ref) or st not in PR_STATES:
+                    raise _fail(f"{sp}.prStates.{ref}", "must map a PR reference to OPEN, MERGED or CLOSED")
+
+    ids = set(step_ids)
+    for i, s in enumerate(steps):
+        for j, d in enumerate(s.get("dependsOn", [])):
+            if d not in ids:
+                raise _fail(f"steps[{i}].dependsOn[{j}]", f"unknown step '{d}'")
+            if d == s["id"]:
+                raise _fail(f"steps[{i}].dependsOn[{j}]", f"step '{d}' depends on itself")
+    cycle = find_cycle(steps)
+    if cycle:
+        raise _fail("steps[].dependsOn", "dependency cycle: " + " -> ".join(cycle))
+
+    qids: set[str] = set()
+    for i, q in enumerate(_list(root["questions"], "questions")):
+        qp = f"questions[{i}]"
+        qq = _keys(q, qp, ("id", "question", "blocks", "status"), ("owner", "answer"))
+        qid = _str(qq["id"], f"{qp}.id", pattern=ID_RE, what="id")
+        if qid in qids:
+            raise _fail(f"{qp}.id", f"duplicate question id '{qid}'")
+        qids.add(qid)
+        _str(qq["question"], f"{qp}.question")
+        for j, b in enumerate(_str_list(qq["blocks"], f"{qp}.blocks", pattern=ID_RE, what="id")):
+            if b not in ids:
+                raise _fail(f"{qp}.blocks[{j}]", f"unknown step '{b}'")
+        if qq["status"] not in ("open", "resolved"):
+            raise _fail(f"{qp}.status", "must be open or resolved")
+        if "owner" in qq:
+            _str(qq["owner"], f"{qp}.owner", blank=True)
+        if qq["status"] == "resolved":
+            _str(qq.get("answer"), f"{qp}.answer")
+        elif "answer" in qq:
+            _str(qq["answer"], f"{qp}.answer", blank=True)
+    if "warnings" in root:
+        for i, w in enumerate(_list(root["warnings"], "warnings")):
+            _str(w, f"warnings[{i}]", blank=True)
+
+
+def find_cycle(steps: list[dict[str, Any]]) -> list[str]:
+    """A dependency cycle as [a, b, ..., a], or [] when the graph is acyclic (DFS, 3 colours)."""
+    deps = {s["id"]: list(s.get("dependsOn", [])) for s in steps}
+    state: dict[str, int] = {}  # 1 on the current path, 2 finished
+
+    def visit(node: str, path: list[str]) -> list[str]:
+        state[node] = 1
+        path.append(node)
+        for d in deps.get(node, []):
+            if state.get(d) == 1:
+                return path[path.index(d):] + [d]
+            if d not in state:
+                found = visit(d, path)
+                if found:
+                    return found
+        path.pop()
+        state[node] = 2
+        return []
+
+    for s in steps:
+        if s["id"] not in state:
+            found = visit(s["id"], [])
+            if found:
+                return found
+    return []
+
+
+# ---- gh ------------------------------------------------------------------------------
+
+def gh_cmd() -> list[str]:
+    return shlex.split(os.environ.get("GH") or "gh")
+
+
+def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
+    except FileNotFoundError:
+        raise Failure(f"'{cmd[0]}' is not installed or not on PATH") from None
+
+
+def first_line(text: str) -> str:
+    lines = text.strip().splitlines()
+    return lines[0] if lines else ""
+
+
+def graphql(query: str, owner: str, name: str, extra: dict[str, str] | None = None) -> dict[str, Any]:
+    """One `gh api graphql` call; returns the `repository` object. gh exits non-zero when the
+    response carries errors even if part of the data is there, so the body is parsed first."""
+    cmd = [*gh_cmd(), "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}"]
+    for k, v in (extra or {}).items():
+        cmd += ["-f", f"{k}={v}"]
+    proc = run(cmd)
+    try:
+        doc = json.loads(proc.stdout)
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict):
+        raise Failure(f"gh api graphql failed for {owner}/{name}: "
+                      f"{first_line(proc.stderr or proc.stdout) or f'exit {proc.returncode}'}")
+    repo = (doc.get("data") or {}).get("repository")
+    if not isinstance(repo, dict):
+        errors = doc.get("errors") or []
+        msg = errors[0].get("message", "?") if errors and isinstance(errors[0], dict) else "no repository in the response"
+        raise Failure(f"gh api graphql failed for {owner}/{name}: {msg}")
+    return repo
+
+
+def fetch_pr_states(owner: str, name: str, numbers: list[int]) -> tuple[dict[int, str], set[int]]:
+    """({number: OPEN|MERGED|CLOSED}, numbers GitHub does not know), from one call. Raises Failure."""
+    body = " ".join(f"p{n}:pullRequest(number:{n}){{state}}" for n in numbers)
+    repo = graphql(PR_QUERY % body, owner, name)
+    states: dict[int, str] = {}
+    missing: set[int] = set()
+    for n in numbers:
+        node = repo.get(f"p{n}", "absent")
+        if node is None:
+            missing.add(n)
+        elif isinstance(node, dict) and node.get("state") in PR_STATES:
+            states[n] = node["state"]
+        else:
+            raise Failure(f"gh api graphql for {owner}/{name}#{n}: unexpected response")
+    return states, missing
+
+
+def fetch_recent_prs(owner: str, name: str) -> tuple[list[dict[str, Any]], bool]:
+    """(the most recently updated PRs, True when older ones were not looked at). Raises Failure."""
+    nodes: list[dict[str, Any]] = []
+    after = ""
+    for _ in range(DISCOVER_PAGES):
+        repo = graphql(DISCOVER_QUERY, owner, name, {"after": after} if after else None)
+        page = repo.get("pullRequests")
+        if not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+            raise Failure(f"gh api graphql for {owner}/{name}: unexpected pullRequests response")
+        nodes.extend(n for n in page["nodes"] if isinstance(n, dict) and isinstance(n.get("number"), int))
+        info = page.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            return nodes, False
+        after = str(info.get("endCursor") or "")
+        if not after:
+            return nodes, True
+    return nodes, True
+
+
+# ---- scoring -------------------------------------------------------------------------
+
+def split_ref(ref: str) -> tuple[str, str, int]:
+    m = PR_RE.match(ref)
+    assert m is not None  # validated
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def repo_owner_name(name: str, org: str) -> tuple[str, str]:
+    m = REPO_RE.match(name)
+    assert m is not None  # validated
+    return m.group(1) or org, m.group(2)
+
+
+def lookup_states(steps: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, str]]:
+    """({ref: state}, {ref: why it could not be read}). One gh call per repo."""
+    by_repo: dict[tuple[str, str], set[int]] = {}
+    for s in steps:
+        for ref in s.get("prs", []):
+            o, n, num = split_ref(ref)
+            by_repo.setdefault((o, n), set()).add(num)
+    states: dict[str, str] = {}
+    unresolved: dict[str, str] = {}
+    for (o, n), nums in sorted(by_repo.items()):
+        try:
+            got, missing = fetch_pr_states(o, n, sorted(nums))
+        except Failure as e:
+            for num in nums:
+                unresolved[f"{o}/{n}#{num}"] = str(e)
+            continue
+        for num, st in got.items():
+            states[f"{o}/{n}#{num}"] = st
+        for num in missing:
+            unresolved[f"{o}/{n}#{num}"] = f"PR {o}/{n}#{num} not found"
+    return states, unresolved
+
+
+def score_step(step: dict[str, Any], states: dict[str, str], unresolved: dict[str, str],
+               warnings: list[str]) -> tuple[str, str, bool]:
+    """(status, why, stale) for one step by the rules in the module docstring."""
+    sid = step["id"]
+    prs: list[str] = step.get("prs", [])
+    gate = step.get("designGate") or {}
+    if gate.get("required") and not gate.get("approved"):
+        seen = [r for r in prs if states.get(r) in ("OPEN", "MERGED")]
+        if seen:  # an unreadable PR is reported as "PR state unknown" in main, not guessed at here
+            warnings.append(f"{sid}: PR before design approval ({', '.join(seen)})")
+        return "orange", f"design gate not approved: {gate['reason']}", False
+    manual = step.get("doneWhen", "merged") == "manual"
+    if manual and step.get("done"):
+        return "green", "marked done (manual)", False
+    bad = [r for r in prs if r in unresolved]
+    if bad:
+        prev = step.get("status")
+        prev = prev if prev in STATUSES else "red"
+        seen_merged = step.get("prStates", {})
+        readable = [r for r in prs if r not in unresolved]
+        if prev == "green" and (any(states[r] != "MERGED" for r in readable)
+                                or any(seen_merged.get(r) != "MERGED" for r in bad)):
+            prev = "yellow"  # green is kept only if every readable PR is merged now and every unreadable one was last seen merged
+        return prev, f"stale: {unresolved[bad[0]]}", True
+    closed = [r for r in prs if states[r] == "CLOSED"]
+    for r in closed:
+        warnings.append(f"{sid}: {r} was closed without merging; ignored")
+    live = [r for r in prs if states[r] != "CLOSED"]
+    if not live:
+        return "red", ("no live PRs (closed without merging: " + ", ".join(closed) + ")") if closed else "no PRs", False
+    opened = [r for r in live if states[r] == "OPEN"]
+    if opened:
+        return "yellow", "PR open: " + ", ".join(opened), False
+    if manual:
+        return "yellow", "PRs merged (" + ", ".join(live) + ") but the step is not marked done", False
+    return "green", "all PRs merged: " + ", ".join(live), False
+
+
+def dependency_warnings(steps: list[dict[str, Any]], status: dict[str, str]) -> list[str]:
+    out = []
+    for s in steps:
+        if status[s["id"]] in ("yellow", "green"):
+            for d in s.get("dependsOn", []):
+                if status[d] in ("red", "orange"):
+                    out.append(f"{s['id']} is {status[s['id']]} but depends on {d}, which is {status[d]}")
+    return out
+
+
+def question_warnings(questions: list[dict[str, Any]], status: dict[str, str]) -> list[str]:
+    out = []
+    for q in questions:
+        if q["status"] == "open":
+            for b in q["blocks"]:
+                if status[b] != "red":
+                    out.append(f"open question {q['id']} blocks {b}, which is {status[b]}")
+    return out
+
+
+def discover(steps: list[dict[str, Any]], org: str, warnings: list[str]) -> tuple[list[str], bool]:
+    """(suggestion lines, whether a repo could not be searched)."""
+    linked = {r.lower() for s in steps for r in s.get("prs", [])}  # GitHub owner/repo are case-insensitive
+    cache: dict[tuple[str, str], list[dict[str, Any]] | None] = {}
+    failed = False
+    lines: list[str] = []
+    for s in steps:
+        keys = s.get("tickets", [])
+        if not keys:
+            continue
+        patterns = [(k, re.compile(rf"(?<![A-Za-z0-9]){re.escape(k)}(?![0-9])", re.IGNORECASE)) for k in keys]
+        for repo in s["repos"]:
+            if not repo["exists"]:
+                continue
+            o, n = repo_owner_name(repo["name"], org)
+            key = (o.lower(), n.lower())
+            if key not in cache:
+                try:
+                    nodes, cut = fetch_recent_prs(o, n)
+                    cache[key] = nodes
+                    if cut:
+                        warnings.append(f"discovery in {o}/{n} looked only at its {len(nodes)} most recently updated PRs")
+                except Failure as e:
+                    print(f"impl-plan-status: discovery failed: {e}", file=sys.stderr)
+                    warnings.append(f"discovery failed for {o}/{n}: {e}")
+                    cache[key] = None
+                    failed = True
+            for pr in cache[key] or []:
+                ref = f"{o}/{n}#{pr['number']}"
+                if ref.lower() in linked:
+                    continue
+                text = f"{pr.get('title') or ''} {pr.get('headRefName') or ''}"
+                hit = [k for k, rx in patterns if rx.search(text)]
+                if hit:
+                    lines.append(f"step {s['id']}: {ref} [{pr.get('state', '?')}] "
+                                 f"\"{pr.get('title') or ''}\" matches {', '.join(hit)}")
+    return lines, failed
+
+
+def counts_line(status: dict[str, str]) -> str:
+    return " · ".join(f"{sum(1 for v in status.values() if v == c)} {c}" for c in STATUSES)
+
+
+def file_digest(path: str) -> str:
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def write_atomic(path: str, doc: dict[str, Any], expected_digest: str) -> None:
+    """Replace path with doc, unless the file's content is no longer the one that was loaded
+    (raises Conflict and writes nothing)."""
+    fd, tmp = tempfile.mkstemp(prefix=".impl-plan-", suffix=".tmp", dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        shutil.copymode(path, tmp)
+        try:
+            unchanged = file_digest(path) == expected_digest
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            raise Conflict(f"{path} changed since it was read; nothing was written (rerun to score the new content)")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def read_plan(path: str) -> tuple[dict[str, Any], str]:
+    """(the validated plan, the sha256 of the bytes it was parsed from)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        doc = json.loads(raw.decode("utf-8"))
+    except OSError as e:
+        raise ValidationError(f"{path}: cannot read ({e.strerror or e})") from None
+    except ValueError as e:  # includes UnicodeDecodeError and json.JSONDecodeError
+        raise ValidationError(f"{path}: not valid JSON ({e})") from None
+    validate(doc)
+    return doc, hashlib.sha256(raw).hexdigest()
+
+
+def load(path: str) -> dict[str, Any]:
+    return read_plan(path)[0]
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="impl-plan-status", description="Validate and score an /impl-plan plan.json.")
+    p.add_argument("plan", metavar="PLAN.json")
+    p.add_argument("--discover", action="store_true", help="suggest unlinked PRs that name a step's ticket keys")
+    p.add_argument("--write", action="store_true", help="write status, statusWhy, stale, prStates, warnings back")
+    p.add_argument("--org", default=DEFAULT_ORG, help=f"owner for repo names without one (default {DEFAULT_ORG})")
+    args = p.parse_args(argv)
+    try:
+        doc, digest = read_plan(args.plan)
+    except ValidationError as e:
+        print(f"impl-plan-status: {e}", file=sys.stderr)
+        return 2
+    steps: list[dict[str, Any]] = doc["steps"]
+    states, unresolved = lookup_states(steps)
+
+    warnings: list[str] = []
+    for ref, why in sorted(unresolved.items()):
+        print(f"impl-plan-status: PR state unknown: {ref}: {why}", file=sys.stderr)
+        warnings.append(f"PR state unknown: {ref} ({why})")
+    old = {s["id"]: (s.get("status"), bool(s.get("stale"))) for s in steps}
+    scored: dict[str, tuple[str, str, bool]] = {}
+    for s in steps:
+        scored[s["id"]] = score_step(s, states, unresolved, warnings)
+    status = {sid: v[0] for sid, v in scored.items()}
+    for s in steps:
+        if scored[s["id"]][2]:
+            warnings.append(f"{s['id']}: status is stale ({scored[s['id']][1]})")
+    warnings += dependency_warnings(steps, status)
+    warnings += question_warnings(doc["questions"], status)
+
+    suggestions: list[str] = []
+    discovery_failed = False
+    if args.discover:
+        suggestions, discovery_failed = discover(steps, args.org, warnings)
+
+    rows = []
+    for s in steps:
+        sid = s["id"]
+        new_status, why, stale = scored[sid]
+        prev_status, prev_stale = old[sid]
+        if prev_status != new_status or prev_stale != stale:
+            label = f"{prev_status or '(none)'} -> {new_status}" + (" (stale)" if stale else "")
+            rows.append((sid, label, why))
+    if rows:
+        w0 = max(len("STEP"), *(len(r[0]) for r in rows))
+        w1 = max(len("CHANGE"), *(len(r[1]) for r in rows))
+        print(f"{'STEP':<{w0}}  {'CHANGE':<{w1}}  WHY")
+        for r in rows:
+            print(f"{r[0]:<{w0}}  {r[1]:<{w1}}  {r[2]}")
+    else:
+        print("no changes")
+    print(f"status: {counts_line(status)}")
+    if warnings:
+        print("warnings:")
+        for w in warnings:
+            print(f"  - {w}")
+    if args.discover:
+        if suggestions:
+            print("suggested PRs (not linked; confirm each before adding it to a step's prs):")
+            for line in suggestions:
+                print(f"  - {line}")
+        else:
+            print("discover: no unlinked PRs name a step's ticket keys")
+
+    if args.write:
+        for s in steps:
+            new_status, why, stale = scored[s["id"]]
+            s["status"], s["statusWhy"] = new_status, why
+            if stale:
+                s["stale"] = True
+            else:
+                s.pop("stale", None)
+            known = dict(s.get("prStates", {}))
+            for ref in s.get("prs", []):
+                if ref in states:
+                    known[ref] = states[ref]
+            s["prStates"] = {ref: known[ref] for ref in s.get("prs", []) if ref in known}
+        doc["warnings"] = warnings
+        try:
+            write_atomic(args.plan, doc, digest)
+        except Conflict as e:
+            print(f"impl-plan-status: {e}", file=sys.stderr)
+            return 2
+    return 1 if unresolved or discovery_failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
