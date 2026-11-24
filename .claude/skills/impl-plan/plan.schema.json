@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "impl-plan.plan.schema.json",
+  "title": "impl-plan plan.json",
+  "description": "The data behind an /impl-plan page. The model writes the content once; bin/impl-plan-status owns status, statusWhy, stale, prStates and warnings; bin/impl-plan-render turns it into HTML. bin/impl-plan-status enforces this schema plus what JSON Schema cannot say: unique ids, existing phase/dependency/question targets, and no dependency cycles.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["plan", "phases", "steps", "questions"],
+  "properties": {
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "slug", "source", "summary"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1, "description": "A 2-4 word name." },
+        "slug": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$", "description": "Directory name under ~/.claude/scratch/plans/." },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "ref"],
+          "properties": {
+            "kind": { "enum": ["artifact", "tds", "session"] },
+            "ref": { "type": "string", "description": "Artifact URL, TDS path, or empty for the session." }
+          }
+        },
+        "summary": { "type": "string", "minLength": 1 },
+        "epics": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/jiraKey" } },
+        "decisions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title", "detail"],
+            "properties": {
+              "title": { "type": "string", "minLength": 1 },
+              "detail": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "updatedAt": { "type": "string", "minLength": 1, "description": "ISO date the model last changed the content." }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "title": { "type": "string", "minLength": 1 },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "phase", "title", "work", "plain", "repos"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "phase": { "$ref": "#/$defs/id", "description": "A phases[].id." },
+          "title": { "type": "string", "minLength": 1 },
+          "work": { "type": "string", "minLength": 1, "description": "The work. Blank lines split paragraphs, lines starting '- ' make a list, `x` renders as code." },
+          "plain": { "type": "string", "minLength": 1, "description": "The plain-English summary." },
+          "repos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name", "exists"],
+              "properties": {
+                "name": { "type": "string", "pattern": "^([A-Za-z0-9][A-Za-z0-9-]*/)?[A-Za-z0-9._-]+$", "description": "repo or owner/repo; the owner defaults to fullbay." },
+                "exists": { "type": "boolean", "description": "false marks a repo that has to be created (shown with a 'new' chip)." }
+              }
+            }
+          },
+          "dependsOn": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" }, "description": "Step ids; no cycles." },
+          "prerequisites": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+          "tickets": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/jiraKey" } },
+          "prs": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+#[1-9][0-9]*$", "description": "owner/repo#N" } },
+          "designGate": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["required"],
+            "properties": {
+              "required": { "type": "boolean" },
+              "reason": { "type": "string", "description": "One line; required (non-empty) when required is true." },
+              "approved": { "type": ["string", "null"], "description": "Approval date, or null." }
+            },
+            "if": { "properties": { "required": { "const": true } } },
+            "then": { "required": ["reason"], "properties": { "reason": { "minLength": 1 } } }
+          },
+          "doneWhen": { "enum": ["merged", "manual"], "default": "merged" },
+          "done": { "type": "boolean", "default": false, "description": "Only meaningful for doneWhen manual." },
+          "statusNote": { "type": "string" },
+          "status": { "enum": ["green", "yellow", "orange", "red"], "description": "Written only by impl-plan-status." },
+          "statusWhy": { "type": "string", "description": "Written only by impl-plan-status." },
+          "stale": { "type": "boolean", "description": "Written only by impl-plan-status: gh failed, status is the last known one." },
+          "prStates": {
+            "type": "object",
+            "additionalProperties": { "enum": ["OPEN", "MERGED", "CLOSED"] },
+            "description": "Written only by impl-plan-status: the last PR states it read."
+          }
+        }
+      }
+    },
+    "questions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "question", "blocks", "status"],
+        "properties": {
+          "id": { "$ref": "#/$defs/id" },
+          "question": { "type": "string", "minLength": 1 },
+          "blocks": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/id" }, "description": "Step ids this question blocks." },
+          "owner": { "type": "string" },
+          "status": { "enum": ["open", "resolved"] },
+          "answer": { "type": "string", "description": "Required (non-empty) when status is resolved." }
+        },
+        "if": { "properties": { "status": { "const": "resolved" } } },
+        "then": { "required": ["answer"], "properties": { "answer": { "minLength": 1 } } }
+      }
+    },
+    "warnings": { "type": "array", "items": { "type": "string" }, "description": "Written only by impl-plan-status." }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+    "jiraKey": { "type": "string", "pattern": "^[A-Z][A-Z0-9]*-[1-9][0-9]*$" }
+  }
+}

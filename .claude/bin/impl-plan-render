@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""impl-plan-render: turn a scored /impl-plan plan.json into an HTML page.
+
+Usage: impl-plan-render PLAN.json > index.html
+
+The plan must already be scored by `impl-plan-status --write` (every step needs `status`).
+Output on stdout is an HTML fragment for the claude.ai Artifact publisher (it adds the
+doctype/head/body): <title>, inline CSS, a Google Fonts stylesheet and no scripts. The layout and tokens follow the Grow/svo coupling plan artifact. Status colours:
+green --ok (completed), yellow --pr (PR out), orange --gate (design gate), red --risk (not
+started); each is a left border, a soft background and the pill text, and the pill says it in
+words. Every string from the plan is HTML-escaped; backtick spans become <code>.
+
+Exit 0 rendered, 2 unreadable or invalid plan, or a step without a status (names the field).
+Standard library only. Tests: bin/tests/impl-plan-render.sh.
+"""
+
+from __future__ import annotations
+
+import html
+import importlib.machinery
+import importlib.util
+import os
+import re
+import sys
+from typing import Any
+
+JIRA = "https://fullbay.atlassian.net/browse/"
+GITHUB = "https://github.com/"
+STATUS_LABEL = {"green": "Completed", "yellow": "PR out", "orange": "Design gate", "red": "Not started"}
+STATUS_CLASS = {"green": "s-green", "yellow": "s-yellow", "orange": "s-orange", "red": "s-red"}
+PR_STATE_LABEL = {"OPEN": "open", "MERGED": "merged", "CLOSED": "closed"}
+
+CSS = """
+:root{
+  --bg:#f5f7f9; --surface:#ffffff; --ink:#18212c; --muted:#5a6675; --rule:#d9dfe6; --accent:#0d6b70;
+  --ok:#2f6f3a; --ok-soft:#e6f2e8;
+  --pr:#d1a500; --pr-ink:#6f5800; --pr-soft:#fbf4d9;
+  --gate:#b8500a; --gate-soft:#fdeadb;
+  --risk:#b3261e; --risk-soft:#fbe9e7;
+  --display:"Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --body:"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono:"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#11161c; --surface:#18202a; --ink:#e4e9ef; --muted:#9aa6b4; --rule:#2c3643; --accent:#5cc3c8;
+  --ok:#7cc98a; --ok-soft:#18291c;
+  --pr:#e6c04a; --pr-ink:#f0d270; --pr-soft:#2e2812;
+  --gate:#f4a259; --gate-soft:#38220f;
+  --risk:#f08a80; --risk-soft:#331a18; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#11161c; --surface:#18202a; --ink:#e4e9ef; --muted:#9aa6b4; --rule:#2c3643; --accent:#5cc3c8;
+  --ok:#7cc98a; --ok-soft:#18291c;
+  --pr:#e6c04a; --pr-ink:#f0d270; --pr-soft:#2e2812;
+  --gate:#f4a259; --gate-soft:#38220f;
+  --risk:#f08a80; --risk-soft:#331a18; color-scheme:dark}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 var(--body)}
+.wrap{max-width:1080px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:40px 64px;display:flex;flex-direction:column;gap:40px}
+h1,h2,h3{font-family:var(--display);text-wrap:balance;margin:0;line-height:1.15;overflow-wrap:anywhere}
+h1{font-size:2.2rem}
+h2{font-size:1.45rem}
+h3{font-size:1.05rem}
+p{margin:0;max-width:68ch;overflow-wrap:anywhere}
+a{color:inherit;text-decoration-color:var(--muted);text-underline-offset:2px}
+a:hover{text-decoration-color:currentColor}
+a:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px}
+code{font-family:var(--mono);font-size:.86em;background:var(--bg);border:1px solid var(--rule);border-radius:3px;padding:0 .25em;overflow-wrap:anywhere}
+ul{overflow-wrap:anywhere}
+.eyebrow{font:500 .74rem/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);overflow-wrap:anywhere}
+header{display:flex;flex-direction:column;gap:12px}
+.meta{display:flex;flex-wrap:wrap;gap:8px 20px;color:var(--muted);font-size:.9rem}
+section{display:flex;flex-direction:column;gap:16px;min-width:0}
+.decisions{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(240px,100%),1fr));gap:12px;padding:0;margin:0;list-style:none}
+.decisions li{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:12px 14px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.decisions b{font-weight:600}
+.decisions span{color:var(--muted);font-size:.9rem}
+.counts{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;font-size:.95rem}
+.cnt{background:var(--surface);border:1px solid var(--rule);border-left-width:5px;border-radius:6px;padding:4px 12px}
+.cnt b{font-variant-numeric:tabular-nums}
+.sep{color:var(--muted)}
+.cnt.s-green{border-left-color:var(--ok)}
+.cnt.s-yellow{border-left-color:var(--pr)}
+.cnt.s-orange{border-left-color:var(--gate)}
+.cnt.s-red{border-left-color:var(--risk)}
+.legend{display:flex;flex-wrap:wrap;gap:8px 18px;font-size:.88rem;color:var(--muted);align-items:center}
+.sw{display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:middle}
+.sw.s-green{background:var(--ok)}
+.sw.s-yellow{background:var(--pr)}
+.sw.s-orange{background:var(--gate)}
+.sw.s-red{background:var(--risk)}
+.callout{background:var(--gate-soft);border:1px solid var(--gate);border-left-width:5px;border-radius:6px;padding:12px 16px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.callout ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px;font-size:.92rem}
+.phase{display:flex;flex-direction:column;border:1px solid var(--rule);border-radius:6px;overflow:hidden;background:var(--surface)}
+.phase-head{padding:14px 18px;display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 16px;border-bottom:1px solid var(--rule);background:var(--bg)}
+.phase-head p{color:var(--muted);font-size:.92rem}
+.phase-head .prog{font:500 .76rem/1.4 var(--mono);color:var(--muted)}
+.empty{padding:14px 18px;color:var(--muted)}
+.step{display:grid;grid-template-columns:72px minmax(0,1fr);gap:4px 16px;padding:16px 18px;border-top:1px solid var(--rule);scroll-margin-top:12px}
+.phase-head+.step{border-top:0}
+.step:target{outline:2px solid var(--accent);outline-offset:-2px}
+.sid{font:600 .95rem var(--mono);padding-top:2px;display:flex;flex-direction:column;align-items:flex-start;gap:6px;overflow-wrap:anywhere;min-width:0}
+.step.s-green{border-left:5px solid var(--ok);background:var(--ok-soft)}
+.step.s-yellow{border-left:5px solid var(--pr);background:var(--pr-soft)}
+.step.s-orange{border-left:5px solid var(--gate);background:var(--gate-soft)}
+.step.s-red{border-left:5px solid var(--risk);background:var(--risk-soft)}
+.spill{font:600 .64rem/1.6 var(--mono);letter-spacing:.05em;text-transform:uppercase;padding:0 6px;border-radius:999px;border:1px solid;background:var(--surface);white-space:nowrap}
+.s-green .spill{color:var(--ok);border-color:var(--ok)}
+.s-yellow .spill{color:var(--pr-ink);border-color:var(--pr)}
+.s-orange .spill{color:var(--gate);border-color:var(--gate)}
+.s-red .spill{color:var(--risk);border-color:var(--risk)}
+.spill.stale{color:var(--ink);border-style:dashed;border-color:var(--muted)}
+.sbody{display:flex;flex-direction:column;gap:8px;min-width:0}
+.stitle{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;min-width:0}
+.why{color:var(--muted);font-size:.86rem}
+.chips{display:flex;flex-wrap:wrap;gap:6px;min-width:0}
+.chip{font:500 .76rem/1.6 var(--mono);border:1px solid var(--rule);border-radius:999px;padding:0 8px;text-decoration:none;max-width:100%;overflow-wrap:anywhere;background:var(--surface)}
+.chip.new{border-color:var(--ok);color:var(--ok)}
+.chip.gate{background:var(--gate-soft);border-color:var(--gate);color:var(--gate)}
+.chip.prs-open{border-color:var(--pr);color:var(--pr-ink)}
+.chip.prs-merged{border-color:var(--ok);color:var(--ok)}
+.chip.prs-closed{border-color:var(--muted);color:var(--muted);text-decoration:line-through}
+.chip.dep{background:var(--bg)}
+.kv{display:grid;grid-template-columns:110px minmax(0,1fr);gap:4px 12px;font-size:.93rem;margin:0}
+.kv dt{color:var(--muted);font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;padding-top:3px}
+.kv dd{margin:0;min-width:0;overflow-wrap:anywhere}
+.kv dd p+p,.kv dd p+ul,.kv dd ul+p{margin-top:6px}
+.kv ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:4px}
+.plain{font-weight:500}
+.box{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:16px 18px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.qs{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:12px}
+.qs li{display:flex;flex-direction:column;gap:6px;min-width:0;padding-left:12px;border-left:4px solid var(--gate)}
+.qs .qid{font:600 .8rem var(--mono);color:var(--muted)}
+.qs .owner{color:var(--muted);font-size:.86rem}
+details{background:var(--surface);border:1px solid var(--rule);border-radius:6px;padding:10px 14px}
+details summary{cursor:pointer;font-weight:600}
+details .qs{margin-top:12px}
+details .qs li{border-left-color:var(--ok)}
+@media (max-width:560px){
+  .step{grid-template-columns:minmax(0,1fr)}
+  .sid{flex-direction:row;align-items:center;flex-wrap:wrap}
+  .kv{grid-template-columns:minmax(0,1fr)}
+  .kv dt{padding-top:6px}
+  h1{font-size:1.75rem}
+  .wrap{padding-block:24px 48px;gap:32px}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+"""
+
+
+def _load_validator() -> Any:
+    """The validator in impl-plan-status (one source of truth for the plan shape)."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "impl-plan-status")
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("impl_plan_status", path)
+    spec = importlib.util.spec_from_loader("impl_plan_status", loader)
+    assert spec is not None
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def esc(text: Any) -> str:
+    return html.escape(str(text), quote=True)
+
+
+def inline(text: str) -> str:
+    """Escaped text with `backtick` spans as <code>."""
+    out = esc(text)
+    return re.sub(r"`([^`\n]+)`", lambda m: f"<code>{m.group(1)}</code>", out)
+
+
+def rich(text: str) -> str:
+    """Paragraphs on blank lines; consecutive "- " or "* " lines become a list."""
+    blocks: list[str] = []
+    for chunk in re.split(r"\n\s*\n", text.strip()):
+        lines = [ln for ln in chunk.splitlines() if ln.strip()]
+        para: list[str] = []
+        items: list[str] = []
+        for ln in lines:
+            m = re.match(r"^\s*[-*]\s+(.*)$", ln)
+            if m:
+                _flush_para(para, blocks)
+                items.append(m.group(1))
+            else:
+                _flush_items(items, blocks)
+                para.append(ln)
+        _flush_para(para, blocks)
+        _flush_items(items, blocks)
+    return "".join(blocks)
+
+
+def _flush_para(para: list[str], blocks: list[str]) -> None:
+    if para:
+        blocks.append("<p>" + "<br>".join(inline(x.strip()) for x in para) + "</p>")
+        para.clear()
+
+
+def _flush_items(items: list[str], blocks: list[str]) -> None:
+    if items:
+        blocks.append("<ul>" + "".join(f"<li>{inline(x)}</li>" for x in items) + "</ul>")
+        items.clear()
+
+
+def ticket_chip(key: str) -> str:
+    return f'<a class="chip t" href="{esc(JIRA + key)}">{esc(key)}</a>'
+
+
+def pr_chip(ref: str, state: str | None) -> str:
+    owner_repo, num = ref.split("#")
+    cls = f" prs-{state.lower()}" if state else ""
+    label = f" · {PR_STATE_LABEL[state]}" if state else ""
+    return f'<a class="chip pr{cls}" href="{esc(f"{GITHUB}{owner_repo}/pull/{num}")}">{esc(ref)}{label}</a>'
+
+
+def render_step(s: dict[str, Any], open_qs: dict[str, list[str]]) -> str:
+    sid = s["id"]
+    status = s["status"]
+    cls = STATUS_CLASS[status]
+    gate = s.get("designGate") or {}
+    pr_states = s.get("prStates", {})
+    chips = [ticket_chip(k) for k in s.get("tickets", [])]
+    chips += [pr_chip(r, pr_states.get(r)) for r in s.get("prs", [])]
+    if gate.get("required"):
+        chips.append('<span class="chip gate">design gate'
+                     + (f" approved {esc(gate['approved'])}" if gate.get("approved") else " not approved") + "</span>")
+    pills = f'<span class="spill">{STATUS_LABEL[status]}</span>'
+    if s.get("stale"):
+        pills += '<span class="spill stale">stale</span>'
+    rows = [("Work", rich(s["work"]))]
+    repos = []
+    for r in s["repos"]:
+        new = '' if r["exists"] else ' <span class="chip new">new</span>'
+        repos.append(f'<span class="chip">{esc(r["name"])}</span>{new}')
+    rows.append(("Repos", '<div class="chips">' + "".join(repos) + "</div>" if repos else "None"))
+    rows.append(("Plain English", f'<p class="plain">{inline(s["plain"])}</p>'))
+    if s.get("dependsOn"):
+        links = "".join(f'<a class="chip dep" href="#step-{esc(d)}">{esc(d)}</a>' for d in s["dependsOn"])
+        rows.append(("Depends on", f'<div class="chips">{links}</div>'))
+    if s.get("prerequisites"):
+        rows.append(("Prerequisites", "<ul>" + "".join(f"<li>{inline(x)}</li>" for x in s["prerequisites"]) + "</ul>"))
+    if gate.get("required"):
+        verdict = f"approved {gate['approved']}" if gate.get("approved") else "not approved"
+        rows.append(("Design gate", f"<p>{inline(gate['reason'])} ({esc(verdict)})</p>"))
+    if open_qs.get(sid):
+        links = "".join(f'<a class="chip dep" href="#q-{esc(q)}">{esc(q)}</a>' for q in open_qs[sid])
+        rows.append(("Blocked by", f'<div class="chips">{links}</div>'))
+    if s.get("statusNote"):
+        rows.append(("Note", f"<p>{inline(s['statusNote'])}</p>"))
+    kv = "".join(f"<dt>{esc(k)}</dt><dd>{v}</dd>" for k, v in rows)
+    why = f'<p class="why">{inline(s["statusWhy"])}</p>' if s.get("statusWhy") else ""
+    return (f'<div class="step {cls}" id="step-{esc(sid)}"><div class="sid">{esc(sid)}{pills}</div>'
+            f'<div class="sbody"><div class="stitle"><h3>{inline(s["title"])}</h3>'
+            f'<div class="chips">{"".join(chips)}</div></div>{why}<dl class="kv">{kv}</dl></div></div>')
+
+
+def render_question(q: dict[str, Any], resolved: bool) -> str:
+    blocks = "".join(f'<a class="chip dep" href="#step-{esc(b)}">{esc(b)}</a>' for b in q["blocks"])
+    extra = f'<p><b>Answer:</b> {inline(q["answer"])}</p>' if resolved else ""
+    owner = f'<span class="owner">Owner: {esc(q["owner"])}</span>' if q.get("owner") else ""
+    blocked = f'<div class="chips"><span class="owner">Blocks:</span>{blocks}</div>' if blocks else ""
+    return (f'<li id="q-{esc(q["id"])}"><span class="qid">{esc(q["id"])}</span><p>{inline(q["question"])}</p>'
+            f'{extra}{blocked}{owner}</li>')
+
+
+def render(doc: dict[str, Any]) -> str:
+    meta = doc["plan"]
+    steps: list[dict[str, Any]] = doc["steps"]
+    questions: list[dict[str, Any]] = doc["questions"]
+    open_qs: dict[str, list[str]] = {}
+    for q in questions:
+        if q["status"] == "open":
+            for b in q["blocks"]:
+                open_qs.setdefault(b, []).append(q["id"])
+
+    src = meta["source"]
+    eyebrow = " · ".join(x for x in (
+        "Implementation plan",
+        f"updated {meta['updatedAt']}" if meta.get("updatedAt") else "",
+        f"source: {src['kind']}" + (f" {src['ref']}" if src["ref"] else "")) if x)
+    epics = "".join(f"<span>Epic {ticket_chip(k)}</span>" for k in meta.get("epics", []))
+    head = (f'<header><span class="eyebrow">{esc(eyebrow)}</span><h1>{inline(meta["title"])}</h1>'
+            f'<p>{inline(meta["summary"])}</p>' + (f'<div class="meta">{epics}</div>' if epics else "") + "</header>")
+
+    decisions = ""
+    if meta.get("decisions"):
+        items = "".join(f"<li><b>{inline(d['title'])}</b><span>{inline(d['detail'])}</span></li>" for d in meta["decisions"])
+        decisions = f'<section><h2>What is decided</h2><ul class="decisions">{items}</ul></section>'
+
+    counts = {c: sum(1 for s in steps if s["status"] == c) for c in STATUS_CLASS}
+    strip = '<span class="sep">·</span>'.join(
+        f'<span class="cnt {STATUS_CLASS[c]}"><b>{n}</b> {c}</span>' for c, n in counts.items())
+    legend = "".join(f'<span><i class="sw {STATUS_CLASS[c]}"></i>{c.capitalize()}: {label}</span>' for c, label in (
+        ("green", "completed"), ("yellow", "PR out, not finished"),
+        ("orange", "design gate, needs a design and review before code"), ("red", "not started")))
+    warns = doc.get("warnings") or []
+    callout = ""
+    if warns:
+        callout = ('<aside class="callout" role="note" aria-label="Warnings"><b>Warnings</b><ul>'
+                   + "".join(f"<li>{inline(w)}</li>" for w in warns) + "</ul></aside>")
+    status_sec = (f'<section><h2>Where it stands</h2><div class="counts" role="status">{strip}</div>'
+                  f'<div class="legend" role="note" aria-label="Status colour key">{legend}</div>{callout}</section>')
+
+    phases = []
+    for ph in doc["phases"]:
+        mine = [s for s in steps if s["phase"] == ph["id"]]
+        done = sum(1 for s in mine if s["status"] == "green")
+        body = "".join(render_step(s, open_qs) for s in mine) or '<div class="empty">No steps in this phase.</div>'
+        note = f"<p>{inline(ph['note'])}</p>" if ph.get("note") else ""
+        phases.append(f'<div class="phase" id="phase-{esc(ph["id"])}"><div class="phase-head"><h3>{inline(ph["title"])}</h3>'
+                      f'{note}<span class="prog">{done} of {len(mine)} completed</span></div>{body}</div>')
+    path = ('<section><h2>Implementation path</h2><p>Each step names its tickets and PRs, the repos, what changes, and '
+            'what it means in plain terms. The pill and the coloured edge show its status.</p>'
+            + "".join(phases) + "</section>")
+
+    openq = [q for q in questions if q["status"] == "open"]
+    doneq = [q for q in questions if q["status"] == "resolved"]
+    qhtml = '<section><h2>Open questions</h2>'
+    qhtml += (f'<div class="box"><ul class="qs">{"".join(render_question(q, False) for q in openq)}</ul></div>'
+              if openq else "<p>No open questions.</p>")
+    if doneq:
+        qhtml += (f'<details><summary>Resolved ({len(doneq)})</summary><ul class="qs">'
+                  f'{"".join(render_question(q, True) for q in doneq)}</ul></details>')
+    qhtml += "</section>"
+
+    return (
+        # A fragment, not a document: the claude.ai Artifact publisher supplies the doctype,
+        # html, head and body (with charset and viewport-fit=cover). Keep <title> first.
+        f"<title>{esc(meta['title'])}</title>\n"
+        '<meta name="claude:viewport-fit-sides" content="cover">'
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700'
+        '&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">'
+        f"<style>{CSS}</style>\n"
+        f'<div class="wrap">\n{head}\n{decisions}\n{status_sec}\n{path}\n{qhtml}\n</div>\n')
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1 or argv[0].startswith("-"):
+        print("usage: impl-plan-render PLAN.json > index.html", file=sys.stderr)
+        return 2
+    mod = _load_validator()
+    try:
+        doc = mod.load(argv[0])
+        for i, s in enumerate(doc["steps"]):
+            if "status" not in s:
+                raise mod.ValidationError(f"steps[{i}].status: is missing; run impl-plan-status --write first")
+    except mod.ValidationError as e:
+        print(f"impl-plan-render: {e}", file=sys.stderr)
+        return 2
+    sys.stdout.write(render(doc))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
