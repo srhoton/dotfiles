@@ -1,0 +1,3 @@
+Plan: ~/.claude/plans/i-d-like-to-build-imperative-key.md
+Corpus: Grow/svo artifact (19 steps, colours match), CRM build plan (56 steps, colours match; 20 greens rely on manual done), VMRS TDS end to end (published, refresh round trip "no changes").
+Review: 1 fanout round, 0 CRITICAL/HIGH, 9 MEDIUM/LOW fixed, each with a revert-and-fail probe; stale-green tightened in a follow-up.
