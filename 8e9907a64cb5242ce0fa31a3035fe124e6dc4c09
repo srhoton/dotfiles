@@ -1,0 +1,6 @@
+Evidence: 312 review-fanout journals since 2026-11-01. HIGH+ findings,
+and those found only by that reviewer: functional 39/26, adr 22/18,
+dse 22/14, perf 6/4, quality 15/4 (one of the 4 was an ESLint error
+that repo-gate already catches). Quality had 1,487 LOW and 427 MEDIUM.
+Tests: all 27 bin/ and hooks/ test scripts pass. The new hook test
+fails 4 cases against a copy with quality back in the Opus set.
