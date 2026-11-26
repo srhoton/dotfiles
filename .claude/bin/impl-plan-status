@@ -48,25 +48,25 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import shutil
-import subprocess
 import sys
 import tempfile
 from typing import Any
 
+# The gh/GraphQL pieces (gh_cmd, run, graphql, fetch_pr_states, split_ref, PR_RE, Failure) live in
+# lib/gh_prs.py, shared with pr-status.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+from gh_prs import PR_RE, PR_STATES, Failure, fetch_pr_states, graphql, split_ref  # noqa: E402
+
 DEFAULT_ORG = "fullbay"
 STATUSES = ("green", "yellow", "orange", "red")
-PR_STATES = ("OPEN", "MERGED", "CLOSED")
 KEY_RE = re.compile(r"^[A-Z][A-Z0-9]*-[1-9][0-9]*$")
-PR_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)#([1-9][0-9]*)$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 REPO_RE = re.compile(r"^(?:([A-Za-z0-9][A-Za-z0-9-]*)/)?([A-Za-z0-9._-]+)$")
 DISCOVER_PAGE = 100
 DISCOVER_PAGES = 5
 
-PR_QUERY = "query($owner:String!,$name:String!){repository(owner:$owner,name:$name){%s}}"
 DISCOVER_QUERY = (
     "query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){"
     f"pullRequests(first:{DISCOVER_PAGE},after:$after,orderBy:{{field:UPDATED_AT,direction:DESC}}){{"
@@ -76,10 +76,6 @@ DISCOVER_QUERY = (
 
 class ValidationError(Exception):
     """The plan is malformed. The message starts with the field path."""
-
-
-class Failure(Exception):
-    """gh failed or answered with something unexpected."""
 
 
 class Conflict(Exception):
@@ -289,61 +285,6 @@ def find_cycle(steps: list[dict[str, Any]]) -> list[str]:
 
 # ---- gh ------------------------------------------------------------------------------
 
-def gh_cmd() -> list[str]:
-    return shlex.split(os.environ.get("GH") or "gh")
-
-
-def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", check=False)
-    except FileNotFoundError:
-        raise Failure(f"'{cmd[0]}' is not installed or not on PATH") from None
-
-
-def first_line(text: str) -> str:
-    lines = text.strip().splitlines()
-    return lines[0] if lines else ""
-
-
-def graphql(query: str, owner: str, name: str, extra: dict[str, str] | None = None) -> dict[str, Any]:
-    """One `gh api graphql` call; returns the `repository` object. gh exits non-zero when the
-    response carries errors even if part of the data is there, so the body is parsed first."""
-    cmd = [*gh_cmd(), "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}"]
-    for k, v in (extra or {}).items():
-        cmd += ["-f", f"{k}={v}"]
-    proc = run(cmd)
-    try:
-        doc = json.loads(proc.stdout)
-    except ValueError:
-        doc = None
-    if not isinstance(doc, dict):
-        raise Failure(f"gh api graphql failed for {owner}/{name}: "
-                      f"{first_line(proc.stderr or proc.stdout) or f'exit {proc.returncode}'}")
-    repo = (doc.get("data") or {}).get("repository")
-    if not isinstance(repo, dict):
-        errors = doc.get("errors") or []
-        msg = errors[0].get("message", "?") if errors and isinstance(errors[0], dict) else "no repository in the response"
-        raise Failure(f"gh api graphql failed for {owner}/{name}: {msg}")
-    return repo
-
-
-def fetch_pr_states(owner: str, name: str, numbers: list[int]) -> tuple[dict[int, str], set[int]]:
-    """({number: OPEN|MERGED|CLOSED}, numbers GitHub does not know), from one call. Raises Failure."""
-    body = " ".join(f"p{n}:pullRequest(number:{n}){{state}}" for n in numbers)
-    repo = graphql(PR_QUERY % body, owner, name)
-    states: dict[int, str] = {}
-    missing: set[int] = set()
-    for n in numbers:
-        node = repo.get(f"p{n}", "absent")
-        if node is None:
-            missing.add(n)
-        elif isinstance(node, dict) and node.get("state") in PR_STATES:
-            states[n] = node["state"]
-        else:
-            raise Failure(f"gh api graphql for {owner}/{name}#{n}: unexpected response")
-    return states, missing
-
-
 def fetch_recent_prs(owner: str, name: str) -> tuple[list[dict[str, Any]], bool]:
     """(the most recently updated PRs, True when older ones were not looked at). Raises Failure."""
     nodes: list[dict[str, Any]] = []
@@ -364,12 +305,6 @@ def fetch_recent_prs(owner: str, name: str) -> tuple[list[dict[str, Any]], bool]
 
 
 # ---- scoring -------------------------------------------------------------------------
-
-def split_ref(ref: str) -> tuple[str, str, int]:
-    m = PR_RE.match(ref)
-    assert m is not None  # validated
-    return m.group(1), m.group(2), int(m.group(3))
-
 
 def repo_owner_name(name: str, org: str) -> tuple[str, str]:
     m = REPO_RE.match(name)
