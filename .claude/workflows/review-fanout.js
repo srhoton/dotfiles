@@ -37,7 +37,8 @@ const scopeNote = parsedArgs.scopeNote ||
   '(2) do not explore sibling repos or spawn further agents; ' +
   '(3) if evidence outside that scope seems needed, report the gap as a LOW finding instead of expanding scope.'
 
-// Reviews and verification always run on Opus, whatever the session model is.
+// Reviews and verification run on Opus, whatever the session model is, except a reviewer that sets its own
+// `model` in REVIEWERS (code quality runs on Sonnet). The verifier always uses REVIEW_MODEL.
 // Hooks don't see agent() calls inside a workflow, so the model is set here rather than left to frontmatter.
 const REVIEW_MODEL = 'opus'
 
@@ -101,6 +102,7 @@ const REVIEWERS = [
   {
     key: 'quality',
     agentType: 'code-quality-reviewer',
+    model: 'sonnet',
     prompt: header + 'Review ONLY the changed files listed above for code quality issues.',
   },
   {
@@ -177,7 +179,7 @@ const selected = REVIEWERS.filter(r => {
 
 // Barrier is intentional: dedup below needs the full finding set from all selected reviewers.
 const reviews = await parallel(selected.map(r => () =>
-  agent(r.prompt, { label: `review:${r.key}`, phase: 'Review', agentType: r.agentType, model: REVIEW_MODEL, schema: FINDINGS_SCHEMA })
+  agent(r.prompt, { label: `review:${r.key}`, phase: 'Review', agentType: r.agentType, model: r.model || REVIEW_MODEL, schema: FINDINGS_SCHEMA })
     .then(res => res && res.findings.map(f => ({ ...f, source: r.key })))
 ))
 const skipped = selected.filter((r, i) => !reviews[i]).map(r => r.key)

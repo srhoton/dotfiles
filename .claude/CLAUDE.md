@@ -171,7 +171,7 @@ Adhere to the following guidelines when using tools:
   - **`haiku`** — pure lookups and transcription with no judgment: locating files or symbols, listing matches, counting rows or items, copying or reformatting already-written content into Jira, Confluence, or GitHub. Bulk Jira writes (5 or more in one step) are built as a list in the main loop and applied by one `model: haiku` agent that returns one result line per operation.
   - **`sonnet`** — the default for `Explore` and other read-only research that must read and then summarize or classify: mapping a contract, impact or drift audits, inventorying a repo's conventions.
   - **Omit `model` (inherit Opus)** — design, adversarial critique, root-cause triage, fix design, and orchestration. `Plan` agents always inherit.
-  - **Code writing goes to a Sonnet-pinned agent**: the `implementer` agent (`/deliver` Phase 2, the `/review` fix loop, any approved plan). Don't write that code in the main loop. The reviewers are pinned to Opus.
+  - **Code writing goes to a Sonnet-pinned agent**: the `implementer` agent (`/deliver` Phase 2, the `/review` fix loop, any approved plan). Don't write that code in the main loop. The reviewers are pinned to Opus, except `code-quality-reviewer`, which is pinned to Sonnet.
   - When unsure between tiers, take the higher one; a wrong answer from a cheaper model costs more than it saves. Pinned custom agents (`model:` in their frontmatter: the implementer, the reviewers, `finding-verifier`, `premise-verifier`) keep their own model; never pass `model` to override it. `hooks/guard-agent-model.sh` blocks an override.
 
 ### Thinking Depth

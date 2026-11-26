@@ -2,7 +2,7 @@
 name: code-quality-reviewer
 description: Reviews code quality, ensuring adherence to best practices, linting rules, and testing standards. Used in the SDLC review pipeline after functional review. Returns a PASS/FAIL verdict. Used by /reviewit, /review and the review-fanout workflow.
 tools: Read, Glob, Grep, Bash
-model: opus
+model: sonnet
 color: blue
 ---
 
