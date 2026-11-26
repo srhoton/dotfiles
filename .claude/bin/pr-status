@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""pr-status: one aligned status row per pull request, from one GraphQL call per repository.
+
+Usage: pr-status [--org ORG] [--json] REF...
+  REF      repo:N, repo#N, owner/repo:N or owner/repo#N (the owner defaults to --org)
+  --org    owner for refs without one (default: fullbay)
+  --json   print a JSON array (one object per REF, in input order) instead of the table
+
+Columns: ref, state (OPEN, DRAFT, MERGED, CLOSED), reviewDecision (APPROVED, CHANGES_REQUESTED,
+REVIEW_REQUIRED or -), checks rollup of the head commit (SUCCESS, FAILURE, PENDING or -),
+mergeable (MERGEABLE, CONFLICTING, UNKNOWN), head sha (7), base branch, updatedAt date. The
+table has a header row and ends with a counts line such as
+`3 open (1 approved), 2 merged, 0 closed, 1 unreadable` (drafts count as open).
+
+The PR numbers of a repository are batched into a single `gh api graphql` call (one alias each);
+a call that fails with an HTTP 5xx is retried once. A PR that does not exist, a repo gh cannot
+read, or a gh failure gives `UNREADABLE <first error line>` for each affected ref; the other
+repos still print.
+
+Exit 0 every ref read, 1 at least one unreadable, 2 bad usage. Read-only: only GraphQL queries
+are sent. Standard library only. Testing: GH=<command> replaces the gh binary
+(bin/tests/pr-status.sh).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from typing import Any
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "lib"))
+from gh_prs import Failure, fetch_prs  # noqa: E402
+
+DEFAULT_ORG = "fullbay"
+RETRIES = 1
+REF_RE = re.compile(r"^(?:([A-Za-z0-9][A-Za-z0-9-]*)/)?([A-Za-z0-9._-]+)[:#]([1-9][0-9]*)$")
+FIELDS = ("state isDraft reviewDecision mergeable headRefOid baseRefName updatedAt "
+          "commits(last:1){nodes{commit{statusCheckRollup{state}}}}")
+CHECKS = {"SUCCESS": "SUCCESS", "FAILURE": "FAILURE", "ERROR": "FAILURE",
+          "PENDING": "PENDING", "EXPECTED": "PENDING"}
+COLUMNS = ("REF", "STATE", "REVIEW", "CHECKS", "MERGEABLE", "HEAD", "BASE", "UPDATED")
+
+
+class UsageError(Exception):
+    pass
+
+
+def parse_ref(text: str, org: str) -> tuple[str, str, int]:
+    m = REF_RE.match(text)
+    if m is None:
+        raise UsageError(f"not a PR reference (want repo:N, repo#N, owner/repo:N or owner/repo#N): {text}")
+    return m.group(1) or org, m.group(2), int(m.group(3))
+
+
+def checks_of(node: dict[str, Any]) -> str | None:
+    commits = (node.get("commits") or {}).get("nodes") or []
+    if not commits or not isinstance(commits[0], dict):
+        return None
+    rollup = ((commits[0].get("commit") or {}).get("statusCheckRollup")) or {}
+    return CHECKS.get(rollup.get("state") or "")
+
+
+def describe(owner: str, name: str, number: int, node: dict[str, Any]) -> dict[str, Any]:
+    state = node.get("state")
+    if state not in ("OPEN", "MERGED", "CLOSED"):
+        raise Failure(f"unexpected state {state!r}")
+    if state == "OPEN" and node.get("isDraft"):
+        state = "DRAFT"
+    return {
+        "ref": f"{owner}/{name}#{number}", "owner": owner, "repo": name, "number": number,
+        "state": state,
+        "reviewDecision": node.get("reviewDecision") or None,
+        "checks": checks_of(node),
+        "mergeable": node.get("mergeable") or "UNKNOWN",
+        "headSha": node.get("headRefOid") or "",
+        "baseRef": node.get("baseRefName") or "",
+        "updatedAt": node.get("updatedAt") or "",
+    }
+
+
+def unreadable(owner: str, name: str, number: int, why: str) -> dict[str, Any]:
+    return {"ref": f"{owner}/{name}#{number}", "owner": owner, "repo": name, "number": number,
+            "state": "UNREADABLE", "error": why}
+
+
+def collect(refs: list[tuple[str, str, int]]) -> list[dict[str, Any]]:
+    """One result per ref, in input order. One gh call per repo (GitHub names are case-insensitive)."""
+    by_repo: dict[tuple[str, str], list[int]] = {}
+    spelling: dict[tuple[str, str], tuple[str, str]] = {}
+    for o, n, num in refs:
+        key = (o.lower(), n.lower())
+        spelling.setdefault(key, (o, n))
+        if num not in by_repo.setdefault(key, []):
+            by_repo[key].append(num)
+    found: dict[tuple[str, str, int], dict[str, Any]] = {}
+    for key, nums in by_repo.items():
+        o, n = spelling[key]
+        try:
+            nodes, missing = fetch_prs(o, n, nums, FIELDS, retries=RETRIES)
+        except Failure as e:
+            for num in nums:
+                found[(*key, num)] = {"error": str(e)}
+            continue
+        for num in nums:
+            if num in missing:
+                found[(*key, num)] = {"error": f"PR {o}/{n}#{num} not found"}
+                continue
+            try:
+                found[(*key, num)] = {"node": nodes[num]}
+            except KeyError:
+                found[(*key, num)] = {"error": f"gh api graphql for {o}/{n}#{num}: no answer"}
+    out = []
+    for o, n, num in refs:
+        hit = found[(o.lower(), n.lower(), num)]
+        if "error" in hit:
+            out.append(unreadable(o, n, num, hit["error"]))
+            continue
+        try:
+            out.append(describe(o, n, num, hit["node"]))
+        except Failure as e:
+            out.append(unreadable(o, n, num, f"gh api graphql for {o}/{n}#{num}: {e}"))
+    return out
+
+
+def counts_line(rows: list[dict[str, Any]]) -> str:
+    def n(*states: str) -> int:
+        return sum(1 for r in rows if r["state"] in states)
+    approved = sum(1 for r in rows if r["state"] in ("OPEN", "DRAFT") and r["reviewDecision"] == "APPROVED")
+    drafts = n("DRAFT")
+    detail = f"{approved} approved" + (f", {drafts} draft" if drafts else "")
+    return (f"{n('OPEN', 'DRAFT')} open ({detail}), {n('MERGED')} merged, {n('CLOSED')} closed, "
+            f"{n('UNREADABLE')} unreadable")
+
+
+def table(rows: list[dict[str, Any]]) -> list[str]:
+    """Header plus one row per result. An unreadable row is [ref, UNREADABLE, message]: the message
+    runs on past the state column and does not widen any column."""
+    grid: list[list[str]] = []
+    for r in rows:
+        if r["state"] == "UNREADABLE":
+            grid.append([r["ref"], r["state"], r["error"]])
+        else:
+            grid.append([r["ref"], r["state"], r["reviewDecision"] or "-", r["checks"] or "-", r["mergeable"],
+                         r["headSha"][:7] or "-", r["baseRef"] or "-", r["updatedAt"][:10] or "-"])
+    widths = [len(h) for h in COLUMNS]
+    for cells in grid:
+        for i, c in enumerate(cells[: 2 if len(cells) == 3 else len(cells)]):
+            widths[i] = max(widths[i], len(c))
+    lines = []
+    for cells in [list(COLUMNS), *grid]:
+        padded = [f"{c:<{widths[i]}}" for i, c in enumerate(cells[:-1])] + [cells[-1]]
+        lines.append("  ".join(padded).rstrip())
+    return lines
+
+
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(
+        prog="pr-status", description="One status row per pull request (one GraphQL call per repository).",
+        epilog="REF is repo:N, repo#N, owner/repo:N or owner/repo#N. Exit 0 all read, 1 some unreadable, 2 usage.")
+    p.add_argument("refs", nargs="+", metavar="REF")
+    p.add_argument("--org", default=DEFAULT_ORG, help=f"owner for refs without one (default {DEFAULT_ORG})")
+    p.add_argument("--json", action="store_true", help="print a JSON array instead of the table")
+    args = p.parse_args(argv)  # exits 2 on bad usage, 0 on -h
+    try:
+        refs = [parse_ref(r, args.org) for r in args.refs]
+    except UsageError as e:
+        p.error(str(e))
+    rows = collect(refs)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        print("\n".join(table(rows)))
+        print(counts_line(rows))
+    return 1 if any(r["state"] == "UNREADABLE" for r in rows) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
