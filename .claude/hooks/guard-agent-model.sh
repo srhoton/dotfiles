@@ -2,10 +2,11 @@
 #
 # guard-agent-model.sh - PreToolUse(Agent|Task) hook for Claude Code
 #
-# Keeps the model split fixed: the code-writing agents run on Sonnet and the
-# reviewers run on Opus. Each agent pins its model in frontmatter, but the Agent
-# tool's `model` parameter overrides frontmatter, so this hook blocks a call that
-# passes a different model for one of those agents.
+# Keeps the model split fixed: the code-writing agents and the code-quality
+# reviewer run on Sonnet, and the other reviewers run on Opus. Each agent pins
+# its model in frontmatter, but the Agent tool's `model` parameter overrides
+# frontmatter, so this hook blocks a call that passes a different model for one
+# of those agents.
 #
 # Calls with no `model`, and agent types not listed here, pass through.
 # agent() calls inside a Workflow don't reach hooks; workflows/review-fanout.js
@@ -21,10 +22,10 @@ printf '%s' "$INPUT" | python3 -c "
 import json, sys
 
 SONNET = {
-    'implementer',
+    'implementer', 'code-quality-reviewer',
 }
 OPUS = {
-    'functional-reviewer', 'code-quality-reviewer', 'adr-compliance-reviewer',
+    'functional-reviewer', 'adr-compliance-reviewer',
     'performance-reviewer', 'data-side-effects-reviewer', 'finding-verifier',
 }
 
@@ -42,7 +43,12 @@ want = 'sonnet' if agent in SONNET else 'opus' if agent in OPUS else None
 if want is None or want in model:
     sys.exit(0)
 
-role = 'writes code and is pinned to Sonnet' if want == 'sonnet' else 'is a reviewer and is pinned to Opus'
+if want == 'opus':
+    role = 'is a reviewer and is pinned to Opus'
+elif agent == 'implementer':
+    role = 'writes code and is pinned to Sonnet'
+else:
+    role = 'is a cost-tuned reviewer and is pinned to Sonnet'
 print(
     f\"BLOCKED: {agent} {role}; this call passed model '{model}'.\n\"
     'Re-dispatch without the model parameter so the agent frontmatter decides.',
