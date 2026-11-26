@@ -1,0 +1,5 @@
+Tests: pr-status 83, impl-plan-status 261, impl-plan-render 111, and
+all other bin suites pass. Five hand-applied mutations were all caught.
+Live check: 10 real PRs across 5 repos plus 1 nonexistent PR matched
+`gh pr view` on state, review decision, head SHA and base (6 calls,
+5.4s, exit 1 for the unreadable PR).
